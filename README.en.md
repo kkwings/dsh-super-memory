@@ -68,15 +68,34 @@ collapsed ⑥ diagnostics section.
 Requires **Node ≥ 22.15** (session logs are multi-frame zstd; older Node cannot decode them).
 
 ```bash
-npm test                                    # panel static checks, no session log needed
+npm test                                    # unit tests + panel static checks, no session log needed
 node scripts/selftest.mjs <session.v4.jsonl.zstd>
 node scripts/harness.mjs  <session.v4.jsonl.zstd> [tmp workspace]
 node scripts/inspect.mjs  "<workspace>" "<an old topic>"
 ```
 
-`harness.mjs` boots the host half against a fake Cordis context and a real session log, and asserts
-ingest idempotency, hit/miss cost, toggle effects, the panel API contract (including the CSRF guard
-and path-traversal rejection) and `history_read` cleanliness.
+`npm test` exits non-zero on failure (it is a real check, not a printout). `harness.mjs` boots the host half
+against a fake Cordis context and a real session log, and asserts ingest idempotency, hit/miss cost, toggle
+effects, the panel API contract (including the CSRF guard and path-traversal rejection), workspace isolation
+and `history_read` cleanliness.
+
+## Privacy
+
+- **Local only, nothing leaves the machine**: no network calls, no model calls, no telemetry. `lib/` pulls in
+  no HTTP client (`node:http(s)`, `net`, `dns`, `tls` are absent); the only "network" traffic is your browser
+  talking to the plugin's own routes on `127.0.0.1` when you click a button in the settings panel.
+- **What is stored**: conversation text only — your questions and the assistant's answer text. **No** reasoning
+  blocks, no tool calls, no tool results, no system-injected content. Long answers are split into chunks.
+- **Where**: `<workspace>/.dsh-compaction-memory/` (per workspace) plus two small global files (settings and a
+  capped diagnostics log). Nothing is written anywhere else, and the original DSH session logs are **never**
+  touched.
+- **When verbatim history is read**: only when you explicitly ask for it (`history_read`); day-to-day turns do
+  not read raw history.
+- **Accidental commit risk**: the memory directory lives inside *your* project folder. If that workspace is a
+  git repository, the settings panel (section ④) detects it and offers a one-click button that adds the ignore
+  rule to that project's `.gitignore`. The plugin's own `.gitignore` cannot cover your project.
+- **Deleting**: removing `<workspace>/.dsh-compaction-memory/` clears that project's memory completely; the
+  panel can also delete per session (7-day protection period by default, configurable) and empty the recycle bin.
 
 ## License
 
