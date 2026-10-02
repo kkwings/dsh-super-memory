@@ -57,7 +57,7 @@ if (missing.length === 0 && unused.length === 0) ok('类名双向一致');
 /* ③ API 路径 */
 console.log('\n③ API 路径（client.js ↔ routes.js）');
 const paths = new Set([...client.matchAll(/\bapi\(\s*[`']([^`'?${]+)/g)].map((m) => m[1].trim()));
-const declared = new Set([...routes.matchAll(/'(\/api\/dsh-super-memory\/[a-z/]*?)'/g)].map((m) => m[1]));
+const declared = new Set([...routes.matchAll(/'(\/api\/dsh-super-memory\/[a-z/-]*?)'/g)].map((m) => m[1]));
 const missingPaths = [...paths].filter((p) => !declared.has(`/api/dsh-super-memory${p}`));
 console.log(`  客户端请求 ${paths.size} 条：${[...paths].sort().join(', ')}`);
 if (missingPaths.length > 0) fail(`路由里找不到：${missingPaths.join(', ')}`);
@@ -68,6 +68,22 @@ console.log('\n④ 功能板块');
 for (const no of ['①', '②', '③']) {
   if (client.includes(`no: '${no}'`)) ok(`板块 ${no} 在位`);
   else fail(`缺少板块 ${no}`);
+}
+
+/* ⑤ 源码级回归：数字框精度
+ * 曾经真实出过的 bug：NumberRow 无条件 Math.floor(parsed)，于是「命中阈值 0.28」与
+ * 「会话累计上限 0.02」只要点进输入框再点走就被抹成 0（阈值归零→每轮都注入；
+ * 上限归零→整条注入通路被关掉，而用户看不出发生了什么）。这里守住这条路径。 */
+console.log('\n⑤ 数字框精度（源码级回归守卫）');
+const numberRowSrc = client.slice(client.indexOf('function NumberRow'), client.indexOf('function Card'));
+if (/let next = Math\.floor\(parsed\)/.test(numberRowSrc)) {
+  fail('NumberRow 仍在无条件取整（0.28 / 0.02 会被抹成 0）');
+} else if (!/decimalsOf\(|toFixed\(/.test(numberRowSrc)) {
+  fail('NumberRow 没有按 step 处理小数');
+} else if (!/step: 0\.01/.test(client) || !/step: 0\.005/.test(client)) {
+  fail('小数参数没有声明 step（minScore 0.01 / sessionBudgetRatio 0.005）');
+} else {
+  ok('NumberRow 按 step 保留小数，且两个小数参数都声明了 step');
 }
 
 console.log(problems === 0 ? '\n全部通过。\n' : `\n发现 ${problems} 处问题。\n`);

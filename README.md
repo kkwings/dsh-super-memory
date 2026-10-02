@@ -154,27 +154,32 @@ Remove-Item Env:ELECTRON_RUN_AS_NODE
 
 需要 **Node ≥ 22.15**（原始会话日志是多帧 zstd，用到 `zstdDecompressSync`；低版本跑自检脚本会直接报"不支持 zstd"）。
 DSH 自带的 node 在 `<DSH 安装目录>/resources/runtime/primary-runtime/dependencies/node/bin/node.exe`，
-系统里装了新版 node 也可以直接 `node`。`npm test` 跑的是第 3 条（不需要会话日志）。
+系统里装了新版 node 也可以直接 `node`。
+
+**`npm test` 会真的报错**（退出码非 0），不是"打印给人看"：它跑 ① 单元测试（纯函数，含历次真实
+bug 的回归检查）与 ② 面板静态自检（设置键 / CSS 类名 / API 路径 / 功能板块 / 数字框精度）。
+其余脚本用真实会话日志做端到端验证：
 
 ```bash
-# 1) 纯离线：用真实会话日志跑通「压缩入库 → 检索 → 总览 → 注入样例」
+# 0) 单元测试 + 面板自检（不需要会话日志，`npm test` 就是这两条）
+node scripts/unit.mjs
+node scripts/panel-check.mjs
+
+# 1) 纯离线：用真实会话日志跑通「压缩入库 → 检索 → 总览 → 注入样例」+ minScore 标定表
 node scripts/selftest.mjs <session.v4.jsonl.zstd>
 
 # 2) 宿主半边联调：假 cordis ctx + 真实日志，跑通入库/总览/命中/未命中/开关/面板 API/history_read
-#    含 ③b 回归：inbox 事件一到即召回、同一提问落库后文本逐字不变、未命中不回退
+#    含 ③b 回归（inbox 事件一到即召回、同一提问落库后文本逐字不变、未命中不回退）
+#    与 ④b 安全断言（写操作来源校验：无来源标记/非 JSON → 403）
 node scripts/harness.mjs <session.v4.jsonl.zstd> [临时工作区]
 
-# 3) 面板静态自检（不开浏览器）：设置键是否都存在且可编辑、CSS 类名双向一致、
-#    API 路径在 routes.js 里都有分支、三个功能板块是否齐全；也是 `npm test`
-node scripts/panel-check.mjs
-
-# 4) 验收证据导出：库条目统计、总览预览、试检索命中、最近打分日志
+# 3) 验收证据导出：库条目统计、总览预览、试检索命中、最近打分日志
 node scripts/inspect.mjs "<工作区>" "<一个旧话题>"
 
-# 5) 时序排障：压缩事件、投影里还剩哪些用户消息、每份运行上下文快照的字符/token
+# 4) 时序排障：压缩事件、投影里还剩哪些用户消息、每份运行上下文快照的字符/token
 node scripts/compactions.mjs <sessionId> [fromSeq toSeq | --snap | --raw <seq>]
 
-# 6) L2 抽取完整度审核：日志里"应当收进来的文字"vs 插件实际入库字符数
+# 5) L2 抽取完整度审核：日志里"应当收进来的文字"vs 插件实际入库字符数
 node scripts/shadow-audit.mjs <sessionId> <fromSeq> <toSeq> [插件记账的rawChars]
 ```
 
@@ -185,6 +190,9 @@ Windows 上路径形如 `C:\Users\<你>\.dsh\sessions\...`）。
 
 - **成本机制**：DSH 的运行时上下文按「快照有变化才追加一条消息」处理，所以注入块**变了**就会追加快照（内容 = 全部运行时上下文分节，通常几百字符）。本插件因此：总览在窗口内保持稳定（不churn）、命中块指纹去重、同一轮内结果稳定、未命中返回空串。这是 DSH 的既有机制，不是本插件引入的开销。
 - **压缩时 0 模型调用**：入库只用 `compaction/summary` 里现成的摘要文本 + 本地字符 bigram 规则提词，不做任何模型提炼。
-- **L2 兜底依赖 `shadowedRange`**：取自当前会话的事件流（`session.snapshotEvents()`），不依赖读取压缩日志文件；取不到就自动降级为只做 L1，不报错。
+- **L2 兜底依赖 `shadowedRange`**：取自当前会话的事件流（`session.snapshotEvents()`），不依赖读取压缩日志文件；**取不到就不入库**（不会退化成"把整个会话当原文"）。
+- **会话累计额度不会自动重置**：`sessionBudgetRatio`（默认窗口 2%）是**整个会话**的成本红线，只累加、不重置，用尽后"提问时注入"会停（压缩后总览不受此限）。面板 ⑥ 会显示「已用 X / 上限 Y」并在用尽时给出明确提示——想恢复就重启 DSH 或调大上限。
+- **记忆目录在用户项目里**：如果工作区本身是 git 仓库，记忆文件（对话原文）有被提交的风险。面板 ④ 会检测到并给一个「帮我加忽略规则」按钮，把它写进该项目的 `.gitignore`。
+- **总览是"目录"不是"全文"**：同一个标题只保留一条（标题在同一会话里会反复出现），新一轮的内容优先；被挤掉的早期内容仍可通过提问时的检索找回。
 - **失败静默**：检索不到、插件内部出错都不影响正常回答（全部路径都包了 try/catch，只写诊断日志）。
 - 检索只用**纯本地词法**（BM25 + 中文字符 bigram），不引入任何模型依赖；查询改写 / 本地向量检索属于未实现的路线图，**没有对应的配置项**，免得留下"改了没用"的空旋钮。

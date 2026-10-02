@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node scripts/panel-check.mjs"
+    "test": "node scripts/unit.mjs && node scripts/panel-check.mjs"
   },
   "keywords": [
     "dsh",
