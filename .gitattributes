@@ -1,0 +1,15 @@
+# 统一换行：仓库里存 LF，检出时按平台处理（Windows 上就不会每次提交都报 CRLF 警告）
+* text=auto eol=lf
+
+# 明确的文本类型
+*.js  text
+*.mjs text
+*.json text
+*.md  text
+*.yml text
+*.svg text
+
+# 二进制（如将来加入截图）
+*.png binary
+*.jpg binary
+*.webp binary

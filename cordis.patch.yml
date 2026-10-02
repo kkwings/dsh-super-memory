@@ -1,0 +1,12 @@
+# dsh-super-memory bundle patch.
+#
+# 插入宿主半边一行：它注册 systemPrompt 运行时上下文块（压缩后总览 + 命中召回）、
+# session/event 上的压缩入库监听、history_read 工具，以及 /api/dsh-super-memory/*
+# 面板路由。浏览器半边（exports "./client"）在「设置 → 超级记忆」注册一个分节。
+#
+# 全部可调项都在插件自己的设置文件里（默认在 DSH 配置目录，可用环境变量
+# DSH_SUPER_MEMORY_HOME 改到别的盘），由面板「设置 → 超级记忆」读写，
+# **不需要**改这里，也不改 DSH 核心行为。
+- insert:
+    - id: dsh-super-memory
+      name: dsh-super-memory

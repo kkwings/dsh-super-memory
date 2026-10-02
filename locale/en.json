@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Super Memory",
+    "description": "Cross-compaction memory: ingest what a compaction drops (zero model calls), inject a compact outline after each compaction, and recall locally only on a hit. A miss costs nothing."
+  }
+}

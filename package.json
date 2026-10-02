@@ -1,0 +1,79 @@
+{
+  "name": "dsh-super-memory",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "跨压缩记忆：同一个超长会话被压缩多次后，早前问过/定过的事仍能被检索到并作为参考注入。压缩时入库（0 模型调用），提问时本地检索、命中才注入。",
+  "main": "./lib/host.js",
+  "exports": {
+    ".": "./lib/host.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "locale",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node scripts/panel-check.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "harness",
+    "cordis",
+    "plugin",
+    "memory",
+    "context",
+    "compaction",
+    "cross-compaction",
+    "long-conversation",
+    "recall",
+    "retrieval"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "kkwings",
+    "url": "https://github.com/kkwings"
+  },
+  "homepage": "https://github.com/kkwings/dsh-super-memory#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kkwings/dsh-super-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kkwings/dsh-super-memory/issues"
+  },
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "超级记忆",
+    "description": "跨压缩记忆：压缩时入库，压缩后给一份目录级总览，提问时本地检索、命中才注入参考。未命中不花 token。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-client-ui-settings-general": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0"
+  },
+  "engines": {
+    "node": ">=22.15"
+  }
+}

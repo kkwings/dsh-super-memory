@@ -1,0 +1,15 @@
+# 记忆库（按工作区生成，属于用户数据，不要提交）
+.dsh-compaction-memory/
+.dsh-test-workspace/
+dsh-super-memory-selftest/
+
+# 依赖与临时产物
+node_modules/
+*.log
+*.tmp
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
