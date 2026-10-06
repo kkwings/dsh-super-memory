@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { decompressFrames } from '../lib/zstd.js';
+import { DEFAULTS } from '../lib/config.js';
 import { summaryRecords, rawRecords } from '../lib/ingest.js';
 import { MemoryIndex, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
@@ -25,10 +26,9 @@ const header = events[0];
 const sessionId = header.id ?? 'test-session';
 const session = { id: sessionId, header: { cwd: workdir }, snapshotEvents: () => events };
 
-const settings = {
-  ingestSummary: true, ingestRawText: true, includeToolResults: false,
-  maxRawCharsPerCompaction: 400000,
-};
+// 跟随插件**真实默认值**（只覆盖与本脚本无关的项）：写死默认值会让"测试通过"
+// 与"插件真实行为"脱节——工具结果入库就是这么被漏掉的。
+const settings = { ...DEFAULTS };
 
 const root = storeRoot(workdir, '.dsh-compaction-memory');
 console.log('store root:', root);

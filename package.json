@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "dsh-super-memory",
   "version": "0.1.0",
   "type": "module",
@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node scripts/unit.mjs && node scripts/panel-check.mjs"
+    "test": "node scripts/unit.mjs && node scripts/panel-check.mjs && node scripts/panel-render.mjs"
   },
   "keywords": [
     "dsh",
@@ -64,14 +64,17 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings-general"
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0",
-    "@deepseek-ai/dsh-client-ui-settings-general": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0"
+    "@deepseek-ai/dsh-client-ui-conversation": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-client-ui-settings-general": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-llm": ">=0.1.7-rc.2 <0.2.0 || >=0.2.0-rc.1 <0.3.0-0"
   },
   "engines": {
     "node": ">=22.15",

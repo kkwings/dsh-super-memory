@@ -1,4 +1,4 @@
-# dsh-super-memory (Super Memory)
+﻿# dsh-super-memory (Super Memory)
 
 A **cross-compaction memory** plugin for [DSH (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness).
 
@@ -81,11 +81,11 @@ and `history_read` cleanliness.
 
 ## Privacy
 
-- **Local only, nothing leaves the machine**: no network calls, no model calls, no telemetry. `lib/` pulls in
+- **Local only by default, nothing leaves the machine**: no network calls, no model calls, no telemetry. `lib/` pulls in
   no HTTP client (`node:http(s)`, `net`, `dns`, `tls` are absent); the only "network" traffic is your browser
   talking to the plugin's own routes on `127.0.0.1` when you click a button in the settings panel.
-- **What is stored**: conversation text only — your questions and the assistant's answer text. **No** reasoning
-  blocks, no tool calls, no tool results, no system-injected content. Long answers are split into chunks.
+- **What is stored**: conversation text (your questions and the assistant's answer text) plus **read-class tool results** (ead/grep/glob/web_fetch/history_read) — turn it off with `includeToolResults`. **No** reasoning blocks, no shell or other tool output, no system-injected content.
+- **Optional model assist (off by default)**: after you enable it in section ⑦, the plugin may call the provider **you** configured through DSH's `ctx.llm` — for keyword expansion at compaction time and for query rewriting when you click the ✕ miss button. Leave it off and the plugin stays fully local.
 - **Where**: `<workspace>/.dsh-compaction-memory/` (per workspace) plus two small global files (settings and a
   capped diagnostics log). Nothing is written anywhere else, and the original DSH session logs are **never**
   touched.

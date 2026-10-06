@@ -17,6 +17,34 @@ process.env.DSH_HOME = home;
 
 const { apply } = await import('../lib/host.js');
 const { decompressFrames } = await import('../lib/zstd.js');
+const { mergeKeywords, parseJsonArray, parseJsonObject } = await import('../lib/llm.js');
+const { diagnoseMiss } = await import('../lib/diagnose.js');
+const { toolRecords } = await import('../lib/ingest.js');
+
+/**
+ * 假模型服务：由测试用例在 `apply()` **之前**设置，用来跑失败矩阵。
+ * 始终存在（DSH 里 llm 一定在），靠 `behavior.mode` 切换返回内容；
+ * "完全没有 llm 服务"那种机器由 `UNAVAILABLE` 闸门覆盖（见 unit.mjs）。
+ */
+const behavior = { mode: 'off', calls: 0 };
+const fakeLlm = {
+  async listProviders() { return [{ provider: 'fake-provider', model: 'fake-model' }]; },
+  async *stream() {
+    behavior.calls += 1;
+    if (behavior.mode === 'hang') { await new Promise((resolve) => setTimeout(resolve, 3000)); return; }
+    if (behavior.mode === 'no-adapter') {
+      yield { type: 'finish', kind: 'error', failure: { code: 'NO_ADAPTER', message: '提供方未注册' } };
+      return;
+    }
+    if (behavior.mode === 'garbage') {
+      yield { type: 'text-delta', index: 0, text: '抱歉，我不能返回 JSON。' };
+      yield { type: 'finish', kind: 'done' };
+      return;
+    }
+    yield { type: 'text-delta', index: 0, text: '{"0": ["跨压缩记忆怎么装", "记忆兜底"], "1": ["注入成本上限"]}' };
+    yield { type: 'finish', kind: 'done' };
+  },
+};
 
 /* ── 假的 cordis 上下文 ─────────────────────────────────────────────────── */
 function makeCtx() {
@@ -34,6 +62,17 @@ function makeCtx() {
     systemPrompt: { context(entry) { contexts.set(entry.name, entry); return () => {}; } },
     tools: { register(tool) { tools.set(tool.name, tool); return () => {}; } },
     webServer: { register(route) { routes.push(route); return () => {}; } },
+    /**
+     * 可选服务注入：DSH 用 `ctx.inject(['llm'], cb)` 让插件"有就用、没有就降级"。
+     * 这里把它实现成"有假 llm 才回调"，从而能在同一个进程里测出
+     * "模型不可用 / 返回垃圾 / 超时"时插件是否仍与旧版本表现一致。
+     */
+    inject(deps, callback) {
+      if (Array.isArray(deps) && deps.includes('llm') && fakeLlm !== null) {
+        try { callback({ llm: fakeLlm, inject: () => () => {} }); } catch { /* 忽略 */ }
+      }
+      return () => {};
+    },
     _handlers: handlers,
     _contexts: contexts,
     _tools: tools,
@@ -431,4 +470,69 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
   const stillThere = afterPurge.body.value.entries.some((item) => item.id === entry);
   console.log(`保留 1 天后自动清理 → 该条目还在吗（应为 false）: ${stillThere}`);
   await put({ trashAutoPurgeDays: 7 });
+}
+
+/* ── 22) 模型辅助失败矩阵（方案 §10）：四种情形下插件都必须照常工作 ────────
+ * 已核实的官方实现细节：`session/event` 监听器是**观测者**，DSH 不 await 返回值
+ * （只挂 .catch 记日志），所以入库里 await 模型调用不会阻塞宿主。 */
+{
+  const modelSessionId = `session-llm-${process.pid}`;
+  const source = compactions[0];
+  const modelSession = {
+    id: modelSessionId,
+    header: { cwd: workdir },
+    snapshotEvents: () => events,
+    requestContext: () => ({ contextWindow: 1000000 }),
+  };
+  const countBlocks = () => readRecords(root, modelSessionId).length;
+  const keywordsOf = () => readRecords(root, modelSessionId).flatMap((r) => r.keywords ?? []);
+  const emitFor = (id) => emit(modelSession, { ...source, data: { ...source.data, compactionId: id } });
+  const settle = () => new Promise((r) => setTimeout(r, 80));
+
+  await put({
+    llmAssistEnabled: true, llmIngestExpand: true,
+    llmIngestProvider: 'fake-provider', llmIngestModel: 'fake-model',
+    llmIngestTimeoutMs: 3000, llmIngestBatchBlocks: 5, llmDailyCallCap: 50,
+  });
+
+  behavior.mode = 'ok';
+  const before = countBlocks();
+  emitFor('llm-ok');
+  await settle();
+  await settle();
+  const afterOk = countBlocks();
+  const words = keywordsOf().map(String);
+  console.log(`模型正常 → 新增块 ${afterOk - before} 条（应 > 0）；关键词出现模型生成的词（应为 true）: ${words.some((k) => k.includes('跨压缩记忆') || k.includes('注入成本'))}`);
+
+  behavior.mode = 'garbage';
+  emitFor('llm-garbage');
+  await settle();
+  console.log(`模型返回垃圾 → 库里有块（应为 true）: ${countBlocks() > 0}；未写入坏词（应为 true）: ${!keywordsOf().map(String).some((k) => k.includes('抱歉'))}`);
+
+  behavior.mode = 'no-adapter';
+  emitFor('llm-no-adapter');
+  await settle();
+  console.log(`提供方未注册（NO_ADAPTER）→ 库里有块、插件不崩（应为 true）: ${countBlocks() > 0}`);
+
+  behavior.mode = 'hang';
+  await put({ llmIngestTimeoutMs: 1 });
+  emitFor('llm-timeout');
+  await new Promise((r) => setTimeout(r, 200));
+  console.log(`模型不回应 + 超时 1ms → 插件照常工作（应为 true）: ${countBlocks() > 0}`);
+
+  await put({ llmAssistEnabled: false, llmIngestTimeoutMs: 3000 });
+  const callsBefore = behavior.calls;
+  emitFor('llm-off');
+  await settle();
+  console.log(`总开关关掉 → 模型调用次数增量（应为 0）: ${behavior.calls - callsBefore}`);
+
+  // 面板接口：诊断（含改写）与配对记账
+  const diag = await call('POST', '/api/dsh-super-memory/diagnose', { workspace: workdir, session: modelSessionId, query: '跨压缩记忆怎么装', limit: 5 });
+  const diagValue = diag.body?.value ?? {};
+  console.log(`/diagnose → ${diag.status}；判定=${diagValue.verdict}；候选 ${(diagValue.candidates ?? []).length} 条（应 > 0）；含改写字段=${diagValue.assist !== undefined}`);
+  const pair = await call('POST', '/api/dsh-super-memory/pair', { workspace: workdir, session: modelSessionId, query: '跨压缩记忆怎么装', fp: (diagValue.candidates ?? [])[0]?.fp ?? '', verdict: 'hit', score: 0.9, title: 't' });
+  const pairsFile = path.join(root, '_pairs.jsonl');
+  console.log(`/pair → ${pair.status}；_pairs.jsonl 已写入（应为 true）: ${fs.existsSync(pairsFile) && fs.readFileSync(pairsFile, 'utf8').includes('"verdict":"hit"')}`);
+  const searchAfter = await call('POST', '/api/dsh-super-memory/diagnose', { workspace: workdir, session: modelSessionId, query: '注入成本上限', limit: 3 });
+  console.log(`配对记录不参与检索（应 true，_pairs 不是记忆块）: ${(searchAfter.body?.value?.candidates ?? []).every((c) => c.fp !== '_pairs')}`);
 }
