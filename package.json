@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-super-memory",
   "version": "0.1.0",
   "type": "module",
@@ -64,8 +64,7 @@
     "client": {
       "platform": "web",
       "inject": [
-        "@deepseek-ai/dsh-client-ui-settings-general",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-settings-general"
       ]
     }
   },
