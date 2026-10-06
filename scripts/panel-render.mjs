@@ -258,7 +258,7 @@ for (const [label, needle] of [
 // ⑦ 模型辅助：用户明确要求**默认展开**（不再折叠）——正文应直接渲染出来
 check('⑦ 默认展开（能看到隐私提示与测试连接）', text.includes('会被发送到') && text.includes('测试连接'),
   '用户已确认不要折叠：可选功能的入口要一眼可见');
-check('⑦ 展开后仍显示当前状态', text.includes('当前：'), `找不到「当前：」`);
+check('⑦ 展开后显示模型服务状态', text.includes('模型服务：'), `找不到「模型服务：」`);
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
 
