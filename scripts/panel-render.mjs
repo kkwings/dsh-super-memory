@@ -255,10 +255,10 @@ for (const [label, needle] of [
 ]) {
   check(`渲染树里含${label}`, text.includes(needle), `找不到「${needle}」`);
 }
-// ⑦ 模型辅助默认折叠：正文（隐私提示、测试连接、今日用量）不该出现在初始渲染里
-check('⑦ 模型辅助默认折叠（正文不渲染）', !text.includes('会被发送到') && !text.includes('测试连接'),
-  '默认展开会把一堆模型设置摊在最上面');
-check('⑦ 折叠时仍显示当前状态', text.includes('当前：'), `找不到「当前：」`);
+// ⑦ 模型辅助：用户明确要求**默认展开**（不再折叠）——正文应直接渲染出来
+check('⑦ 默认展开（能看到隐私提示与测试连接）', text.includes('会被发送到') && text.includes('测试连接'),
+  '用户已确认不要折叠：可选功能的入口要一眼可见');
+check('⑦ 展开后仍显示当前状态', text.includes('当前：'), `找不到「当前：」`);
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
 
