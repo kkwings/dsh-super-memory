@@ -63,13 +63,7 @@ const css = client.slice(cssStart, cssEnd);
 const code = client.slice(0, cssStart) + client.slice(cssEnd);
 const defined = new Set([...css.matchAll(/\.(dsm-[a-z0-9-]+)/g)].map((m) => m[1]));
 // 用到的地方不止 className：也有 'dsm-cost dsm-cost-free' 这种拼在变量里的。
-// 但 `id=` / `list=`（例如 <datalist id="dsm-provider-list">）**不是类名、不需要样式**，
-// 所以先剔除这两类属性值再统计，否则会误报"用到但没定义"。
-const codeForClasses = code
-  .replace(/\bid:\s*'dsm-[a-z0-9-]+'/g, '')
-  .replace(/\blist:\s*'dsm-[a-z0-9-]+'/g, '')
-  .replace(/id="dsm-[a-z0-9-]+"/g, '');
-const used = new Set([...codeForClasses.matchAll(/(dsm-[a-z0-9-]+)/g)].map((m) => m[1]));
+const used = new Set([...code.matchAll(/(dsm-[a-z0-9-]+)/g)].map((m) => m[1]));
 const missing = [...used].filter((c) => !defined.has(c));
 const unused = [...defined].filter((c) => !used.has(c));
 console.log(`  CSS 定义 ${defined.size} 个类 / 代码用到 ${used.size} 个`);

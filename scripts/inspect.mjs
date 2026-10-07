@@ -18,7 +18,6 @@ const { storeRoot, listSessionFiles, readRecords } = await import('../lib/store.
 const { MemoryIndex, retrieveTwoTier } = await import('../lib/retrieval.js');
 const { buildRecap } = await import('../lib/recap.js');
 const { formatRecall } = await import('../lib/recall.js');
-const { estimateTokens } = await import('../lib/text.js');
 
 const root = storeRoot(workspace, '.dsh-compaction-memory');
 console.log(`工作区: ${workspace}`);
@@ -85,5 +84,3 @@ if (fs.existsSync(diagPath)) {
 } else {
   console.log('  （没有诊断日志）');
 }
-
-void estimateTokens;
