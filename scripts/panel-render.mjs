@@ -92,7 +92,7 @@ const settingsPayload = {
     settings: {
       enabled: true, injectRecap: true, injectRecall: true, ingestSummary: true, ingestRawText: true,
       includeToolResults: true, toolResultNames: 'read, grep', toolResultMaxChars: 4000, toolResultBudgetChars: 120000,
-      compactionRecapMaxTokens: 300, maxTokensPerTurn: 500, maxItems: 2, maxCharsPerItem: 300,
+      compactionRecapMaxTokens: 300, maxTokensPerTurn: 700, maxItems: 2, maxCharsPerItem: 300,
       recapPersist: true, stickyRecall: true, minScore: 0.28, dedupe: true,
       observationTurns: 3, cooldownTurns: 1, preferSummaryChunks: true, storeDir: '.dsh-compaction-memory',
       trashEnabled: true, protectRecentDays: 7, trashAutoPurgeEnabled: true, trashAutoPurgeDays: 7,
@@ -556,6 +556,30 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
     '收起就该收起：只留那行统计');
 }
 
+
+/* ── 断言：⑦ 在 off 档位下要把"设置文件里还记着哪套型号"说出来（2026-10-08）────
+ * 修的是什么：`llmMode:'off'` 时面板**不显示**提供方/型号下拉（它们只在 custom 下有意义），
+ * 但设置文件里的旧字段（`llmIngest*`）可能还留着上次配的型号 —— 而用户一改选
+ * 「调用指定模型」，宿主就会把它当作回落值重新用上。不说这一句，用户会以为早配好的型号没了。
+ * 两条断言都要能失败：文案删掉 → 第一条红；无条件拼上这句话 → 第二条（空配置时不该出现）红。 */
+{
+  const originalValue = settingsPayload.value;
+  const renderWith = async (settings) => {
+    settingsPayload.value = { ...originalValue, settings: { ...originalValue.settings, ...settings } };
+    const tree = await render(false, true);
+    return tree === null ? '' : textOf(tree);
+  };
+  const offWithLegacy = await renderWith({ llmMode: 'off', llmAssistEnabled: false, llmIngestProvider: 'zai', llmIngestModel: 'glm-5.3-flash' });
+  check('⑦ off + 旧字段非空 → 提示"设置文件里还记着 zai / glm-5.3-flash，改选「调用指定模型」会重新用上"',
+    offWithLegacy.includes('设置文件里还记着 zai / glm-5.3-flash，改选「调用指定模型」会重新用上'),
+    `实际：${(offWithLegacy.match(/当前：纯本地[^。]*。[^。]*。?/) ?? ['(没渲染)'])[0]}`);
+  check('⑦ off 时确实不显示提供方/型号下拉（所以只能靠上面那句话告知）',
+    !offWithLegacy.includes('下拉里是你在「设置 → 模型」里配好的提供方'), 'off 档位下不该出现提供方下拉');
+  const offWithoutLegacy = await renderWith({ llmMode: 'off', llmAssistEnabled: false, llmIngestProvider: '', llmIngestModel: '', llmRecallProvider: '', llmRecallModel: '' });
+  check('⑦ off 且什么都没配过 → 不出现"还记着"那句话（不能无条件拼）',
+    !offWithoutLegacy.includes('设置文件里还记着'), '空配置下不该出现"还记着…"');
+  settingsPayload.value = originalValue;
+}
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
 

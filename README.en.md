@@ -15,7 +15,7 @@ After a very long session has been compacted a few times, things you asked or de
 | --- | --- | --- | --- |
 | ① | **On compaction** | Ingest what is being dropped: a summary layer (reusing the summary DSH already wrote, split by section) and a raw-conversation layer (your questions + the assistant's answer text), plus **the file/search results the model read** (`read`, `grep`, `glob`, `web_fetch`, `history_read`). | **0 model calls** |
 | ② | **After compaction** | Inject a directory-level outline of "what this session was about" (topic — conclusion). Nothing worth keeping means nothing is injected. | ≤ **300 tokens per compaction**, adaptive, **may be 0** |
-| ③ | **On every question** | Score the local store first; inject a reference **only on a hit**. | hit ≤ **500 tokens/turn** (≤2 items, ≤300 chars each); **miss = 0 tokens** |
+| ③ | **On every question** | Score the local store first; inject a reference **only on a hit**. | hit ≤ **700 tokens/turn** (≤2 items, ≤300 chars each); **miss = 0 tokens** |
 
 **Does not**:
 
@@ -54,7 +54,7 @@ All limits are **single-shot ceilings**, not quotas:
 | Item | Number |
 | --- | --- |
 | Post-compaction outline | ≤ 300 tokens per compaction, may be 0 |
-| Per-turn injection | ≤ 500 tokens, ≤ 2 items, ≤ 300 chars each (≥ 50 chars per item) |
+| Per-turn injection | ≤ 700 tokens, ≤ 2 items, ≤ 300 chars each (≥ 50 chars per item). 700 is what actually fits two full CJK items **plus the header** (2×≈255 + ≈105); at 500 the budget loop drops the second item, i.e. only one is ever injected |
 | Measured single injection | 128 / 167 / 458 tokens |
 | Ingest expansion | first **600 chars** of each block, **8 blocks** per batch, **output cap 240 tokens** (bad format = whole batch dropped, original keywords kept) |
 | Query rewrite | output cap 120 tokens |
@@ -96,7 +96,7 @@ plugin_manager  action: install_bundle  target: dsh-super-memory
 
 Then **restart the DSH client** (host plugin code is cached in the process). Success = a "超级记忆 / Super Memory" section in Settings and a `history_read` tool. To uninstall: `plugin_manager action: remove_bundle target: dsh-super-memory` — the memory directory and the global files are **not** removed automatically.
 
-Day to day you only need three sentences: it stores what compaction drops, it hands back only the relevant passages (≤ 500 tokens/turn, **nothing at all when nothing matches**), and if you think it forgot something you just click **✕** under the answer. All tuning lives behind the collapsed "参数设置" button; everything applies immediately, no restart.
+Day to day you only need three sentences: it stores what compaction drops, it hands back only the relevant passages (≤ 700 tokens/turn, **nothing at all when nothing matches**), and if you think it forgot something you just click **✕** under the answer. All tuning lives behind the collapsed "参数设置" button; everything applies immediately, no restart.
 
 > The panel UI text is Chinese only; plugin metadata (title/description) ships in both languages.
 

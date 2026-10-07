@@ -14,14 +14,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { DEFAULTS, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo } from '../lib/config.js';
+import { DEFAULTS, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo } from '../lib/config.js';
 import {
-  MARKER, estimateTokens, extractTitle, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
+  MARKER, containment, estimateTokens, extractTitle, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords } from '../lib/ingest.js';
 import { MemoryIndex, localTopScore, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
-import { formatRecall, itemText, questionTextOf, queryTextOf, selectFreshHits } from '../lib/recall.js';
+import {
+  NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, questionTextOf, queryTextOf, selectFreshHits,
+} from '../lib/recall.js';
 import { mergeUsage } from '../lib/llm.js';
 import { STRONG_HIT_RATIO, strongHitScore } from '../lib/routes.js';
 import { shouldExpand } from '../lib/host.js';
@@ -405,6 +407,162 @@ console.log('\n=== 12. 同一轮里不注入近重复的块（真实浪费：约
     && String(longRound.built.lines[0]).startsWith('- ') && String(longRound.built.text).includes(longRound.built.lines[0]),
     `lines=${JSON.stringify(longRound.built.lines)}`);
   eq('fps 与 lines 一一对应', longRound.built.fps.length, longRound.built.lines.length);
+}
+
+console.log('\n=== 13. ⑦ 模型档位：off 时旧字段非空，改选「调用指定模型」不许清空 ===');
+{
+  // 真实场景（2026-10-08 用户实测）：设置文件里 `llmMode:'off'`，但旧字段
+  // （`llmIngestProvider/llmIngestModel`）还留着上次配好的型号。改前的两个坑：
+  //   ① 面板在 off 下不显示型号下拉 → 用户完全看不到这套配置还在；
+  //   ② 一改选「调用指定模型」，`applyLlmMode` 从**空的** `llmProvider/llmModel` 派生
+  //      → 把旧字段静默清空（下拉里刚出现就变空）。
+  // 这一节钉死"回落 + off 不清空"，两条都是能红的（删掉修复即失败）。
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-llm-'));
+  const file = path.join(temp, 'dsh-super-memory.settings.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1, llmMode: 'off', llmIngestProvider: 'zhipu-glm', llmIngestModel: 'glm-5.3-flash',
+  }), 'utf8');
+  const store = new SettingsStore({ path: file });
+  const loaded = store.get().settings;
+  eq('① 读回来的 llmMode 仍是 off', loaded.llmMode, 'off');
+  eq('① 旧字段原样保留（面板据此提示"设置里还记着 …"）',
+    `${loaded.llmIngestProvider} / ${loaded.llmIngestModel}`, 'zhipu-glm / glm-5.3-flash');
+
+  const custom = store.update({ llmMode: 'custom' }).settings;
+  eq('② 切成 custom：provider 回落到旧字段（不是从空的 llmProvider 派生）', custom.llmIngestProvider, 'zhipu-glm');
+  eq('② 切成 custom：model 同理', custom.llmIngestModel, 'glm-5.3-flash');
+  eq('② 检索那一对一起派生', `${custom.llmRecallProvider}/${custom.llmRecallModel}`, 'zhipu-glm/glm-5.3-flash');
+  eq('② 回落**不回写**新字段（llmProvider 仍为空 —— 用户没做过这个选择）', custom.llmProvider, '');
+  eq('② 模式真的生效：辅助开关打开', custom.llmAssistEnabled, true);
+
+  const off = store.update({ llmMode: 'off' }).settings;
+  eq('③ off 不再清空旧字段（清掉就再也找不回来）',
+    `${off.llmIngestProvider}/${off.llmIngestModel}`, 'zhipu-glm/glm-5.3-flash');
+  eq('③ off 仍然真的不调用模型（三个开关压回 false）', off.llmAssistEnabled, false);
+  const again = store.update({ llmMode: 'custom' }).settings;
+  eq('③ 再切回 custom 仍保留 zhipu-glm / glm-5.3-flash',
+    `${again.llmIngestProvider} / ${again.llmIngestModel}`, 'zhipu-glm / glm-5.3-flash');
+  eq('③ 落盘后仍是它（重启后也记得）',
+    `${JSON.parse(fs.readFileSync(file, 'utf8')).llmIngestProvider}`, 'zhipu-glm');
+
+  // 对照两条：回落不会无中生有；main 仍然必须清空（否则"跟随主模型"会错调自定义模型）
+  const bare = normalizeSettings({ llmMode: 'custom' }, DEFAULTS, { deriveMode: true });
+  eq('（对照）从没配过型号时 custom 仍是空串 —— 回落不会无中生有',
+    `${bare.llmIngestProvider}/${bare.llmIngestModel}`, '/');
+  const main = normalizeSettings(
+    { llmMode: 'main', llmIngestProvider: 'zhipu-glm', llmIngestModel: 'glm-5.3-flash' },
+    DEFAULTS, { deriveMode: true },
+  );
+  eq('（对照）main 仍清空 provider/model（空的语义是"跟随当前会话主模型"）',
+    `${main.llmIngestProvider}/${main.llmIngestModel}`, '/');
+  fs.rmSync(temp, { recursive: true, force: true });
+}
+
+console.log('\n=== 14. 「≤2 条」必须真的放得下（单轮上限 500 → 700）===');
+{
+  // 中文下"2 条 × 每条 300 字符" ≈ 510 token，再加 HEADER 就超过旧的 500：
+  // `formatRecall` 的预算循环会先 `pop()` 掉第二条 —— 于是"≤2 条"从来没生效过
+  // （实测症状：命中时无论多相关都只看到一条）。这一节用**两条满额中文块**钉死它。
+  const filler = (start, count) => Array.from({ length: count }, (_, i) => String.fromCharCode(start + i)).join('');
+  const records = [
+    makeRecord({
+      layer: 'summary', title: 'A 单轮预算', compactionId: 'c1',
+      text: `结论：单轮注入上限必须放得下两条满额的中文块。${filler(0x4e00, 280)}`,
+    }),
+    makeRecord({
+      layer: 'summary', title: 'B 两条上限', compactionId: 'c2',
+      text: `结论：每条的字符上限与单轮 token 上限要同时满足。${filler(0x5e00, 280)}`,
+    }),
+  ];
+  const ranked = new MemoryIndex(records).search('单轮注入上限与两条上限', { limit: 6 })
+    .map((hit) => ({ ...hit, fp: String(hit.record.fp ?? '') }))
+    .sort((a, b) => b.score - a.score);
+  check('两块都被检索到（前提成立）', ranked.length >= 2, `实际候选=${ranked.length}`);
+  const selected = selectFreshHits(ranked, {
+    dedupe: true, maxCharsPerItem: DEFAULTS.maxCharsPerItem, injectedFps: new Set(), injectedTexts: [],
+  });
+  eq('两块内容不同 → 都被留下（前提成立，不是去重砍掉的）', selected.fresh.length, 2);
+  const limits = {
+    maxItems: DEFAULTS.maxItems,
+    maxCharsPerItem: DEFAULTS.maxCharsPerItem,
+    maxTokensPerTurn: DEFAULTS.maxTokensPerTurn,
+  };
+  const two = formatRecall(selected.fresh, limits);
+  eq('默认上限下真的注入 2 条（改前恒为 1 条）', two.items, 2);
+  check('两条都是满额 300 字符（否则这条断言不成立）',
+    two.lines.every((line) => line.length - 2 === 300), `实际=${two.lines.map((line) => line.length - 2).join(',')}`);
+  check('总注入不超过默认单轮上限', two.tokens <= DEFAULTS.maxTokensPerTurn, `实际=${two.tokens} token`);
+  eq('默认单轮上限就是 700（改回 500 会让上面两条立刻变红）', DEFAULTS.maxTokensPerTurn, 700);
+  // **能失败的验证**：把上限改回 500 → 第二条 100% 被预算砍掉。
+  const oldCap = formatRecall(selected.fresh, { ...limits, maxTokensPerTurn: 500 });
+  eq('（能失败的验证）上限改回 500 → 只剩 1 条', oldCap.items, 1);
+  // 把预算提到足够大，量一次"两条满额块 + HEADER"的真实总量：它必须落在 (500, 700]
+  // 区间里 —— 这正是"500 装不下、700 才放得下"的量化依据。
+  const full = formatRecall(selected.fresh, { ...limits, maxTokensPerTurn: 4000 });
+  check('（能失败的验证）两条满额块 + HEADER 的总量在 500 与 700 之间',
+    full.tokens > 500 && full.tokens <= 700, `合计≈${full.tokens} token`);
+  console.log(`  量化：两条满额块 + HEADER ≈ ${full.tokens} token（旧上限 500 下只剩 ${oldCap.items} 条 / 新上限 700 下 ${two.items} 条）`);
+}
+
+console.log('\n=== 15. 「✕」的 boost 与同轮召回不许重复投喂同一段历史 ===');
+{
+  // 真机形状：boost = 固定说明段 + `（原始记忆文件：…）` + 资料（每段 `【对话】标题\n正文前 600 字符`）。
+  // 召回那边的候选是**同一批块**（✕ 刚按这句话找过），于是同一段历史会被投喂两遍。
+  // 修法：召回筛选把 boost 文本当成"已经注入过的文本"，重叠的块丢掉；boost 本身**一个字不动**。
+  const filler = (start, count) => Array.from({ length: count }, (_, i) => String.fromCharCode(start + i)).join('');
+  const boostedText = `结论：单轮注入上限从 500 提到 700，因为两条满额中文块装不进 500。${filler(0x4e00, 280)}`;
+  /** boost 里的一段资料：与宿主 `routes.js` 的构造逐字同形（标题一行 + 正文前 600 字符）。 */
+  const para = (title, body) => `【对话】${title}\n${body.replace(/\s+/g, ' ').trim().slice(0, 600)}`;
+  // 真机的 boost 是 **1250–1925 字符**（说明段 + 最多 3 段资料 × 600 字符）：这里照同样体量造，
+  // 否则"用 Jaccard 还是包含度"这条口径断言会因为 boost 太小而失真。
+  const material = [
+    para('单轮注入上限', boostedText),
+    para('成本红线', `结论：整场会话的插件开销约 6 万 token，占比约 0.01%。${filler(0x6000, 280)}`),
+    para('入库口径', `结论：思考过程永不入库，工具结果只收只读类工具的原文。${filler(0x7000, 280)}`),
+  ].join('\n\n');
+  const boostText = '⟦mem-hist⟧【本次会话更早（已被压缩）的参考 · 用户点了「✕」后由辅助模型找到】\n'
+    + '请在回答正文里**明确告诉用户**：你从本会话"已压缩的历史"里找到了哪些相关内容，'
+    + '并引用其中 1–3 句关键原文，再结合用户新增的条件回答。\n'
+    + `（原始记忆文件：E:\\x\\session-1.jsonl）\n\n${material}`;
+  const records = [
+    makeRecord({ layer: 'summary', title: '单轮注入上限', text: boostedText, compactionId: 'c1' }),
+    makeRecord({
+      layer: 'summary', title: '晚饭菜单', compactionId: 'c2',
+      text: `结论：晚上做番茄炒蛋与青椒肉丝，米饭多煮一点，别放太多盐。${filler(0x5e00, 60)}`,
+    }),
+  ];
+  const ranked = new MemoryIndex(records).search('单轮注入上限与晚饭菜单', { limit: 6 })
+    .map((hit) => ({ ...hit, fp: String(hit.record.fp ?? '') }))
+    .sort((a, b) => b.score - a.score);
+  check('两块都被检索到（前提成立）', ranked.length >= 2, `实际候选=${ranked.length}`);
+  const common = { dedupe: true, maxCharsPerItem: DEFAULTS.maxCharsPerItem, injectedFps: new Set(), injectedTexts: [] };
+
+  const withBoost = selectFreshHits(ranked, { ...common, boostText });
+  check('与 boost 重叠的那条被丢掉（reason=boost-overlap）',
+    withBoost.dropped.some((item) => item.reason === 'boost-overlap'), JSON.stringify(withBoost.dropped));
+  eq('不相关的那块照旧注入', withBoost.fresh.length, 1);
+  eq('留下的确实是不相关的那块', withBoost.fresh[0].title, '晚饭菜单');
+  const built = formatRecall(withBoost.fresh, {
+    maxItems: DEFAULTS.maxItems, maxCharsPerItem: DEFAULTS.maxCharsPerItem, maxTokensPerTurn: DEFAULTS.maxTokensPerTurn,
+  });
+  check('注入文本里没有再出现 boost 那段的正文（不重复投喂）',
+    !built.text.includes('单轮注入上限从 500 提到 700'), `注入=${built.text.slice(0, 120)}`);
+  check('boost 文本一个字都没被动过（用户点 ✕ 得到的那段必须完整保留）',
+    boostText.includes('（原始记忆文件：') && boostText.endsWith(material) && boostText.includes(boostedText.slice(0, 600)),
+    `boost 长度=${boostText.length}`);
+
+  // 对照：没有 boost 时两块都注入 —— 证明上面那条不是恒真
+  const withoutBoost = selectFreshHits(ranked, common);
+  eq('（对照）不传 boostText → 两块都在', withoutBoost.fresh.length, 2);
+
+  // 判据本身：Jaccard 在"尺寸差一个数量级"时够不到阈值，只有包含度能挡住（这就是实现口径）
+  const line = itemText(records[0], DEFAULTS.maxCharsPerItem);
+  const sim = jaccard(tokenSet(line), tokenSet(boostText));
+  const cover = containment(tokenSet(line), tokenSet(boostText));
+  check('（口径）Jaccard 远低于阈值、包含度高于阈值 —— 用 Jaccard 等于没做',
+    sim < NEAR_DUPLICATE_SIMILARITY && cover >= NEAR_DUPLICATE_SIMILARITY,
+    `jaccard=${sim.toFixed(3)} containment=${cover.toFixed(3)} 阈值=${NEAR_DUPLICATE_SIMILARITY}`);
+  console.log(`  口径：boost ${boostText.length} 字符 / 候选行 300 字符 → Jaccard=${sim.toFixed(3)}（够不到 ${NEAR_DUPLICATE_SIMILARITY}）、包含度=${cover.toFixed(3)}`);
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);

@@ -334,7 +334,9 @@ await put({ compactionRecapMaxTokens: 0 });
 await probe('总览上限调 0');
 await put({ compactionRecapMaxTokens: 300, maxTokensPerTurn: 0 });
 await probe('单轮上限调 0');
-await put({ maxTokensPerTurn: 500 });
+// 恢复成**当前默认值**（700，2026-10-08 从 500 提上来：中文下"2 条 × 300 字符 + HEADER"
+// 装不进 500，预算循环会先 pop() 掉第二条 → "≤2 条"从来没生效过）。
+await put({ maxTokensPerTurn: 700 });
 // 「会话累计上限」(sessionBudgetRatio) 已按用户决定删除：不再有"累计用尽就停止注入"
 // 这条路，注入量只受**单次**口径约束（上面三条探针就是全部闸门）。
 
@@ -345,10 +347,10 @@ const capProbe = async (label, patch) => {
   const built = result.body.value.wouldInject;
   console.log(`   ${label}: ${built.text.length} 字符 / ${built.tokens} token / ${built.items} 条`);
 };
-await capProbe('默认（2 条 / 300 字符 / 500 token）');
+await capProbe('默认（2 条 / 300 字符 / 700 token）');
 await capProbe('每条 80 字符', { maxCharsPerItem: 80 });
 await capProbe('单轮 120 token', { maxTokensPerTurn: 120 });
-await put({ maxCharsPerItem: 300, maxItems: 2, maxTokensPerTurn: 500 });
+await put({ maxCharsPerItem: 300, maxItems: 2, maxTokensPerTurn: 700 });
 
 console.log('\n=== 面板 API ===');
 const settingsGet = await call('GET', '/api/dsh-super-memory/settings');
@@ -736,6 +738,60 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
   expect('改写结果可用（严格 JSON 数组）', weak.body?.value?.assist?.rewrite?.ok === true, `实际=${JSON.stringify(weak.body?.value?.assist?.rewrite ?? null)}`);
   await put({ llmAssistEnabled: false, llmIngestExpand: false });
   console.log(`  ㉓ 段累计：通过 ${d23Passed} 条，失败 ${d23Failed} 条。`);
+}
+
+/* ── 25) 「✕」的 boost 与同轮召回去重（2026-10-08）──────────────────────────
+ * ㉓ 最后那次 `/diagnose` 带了 `boost:true` —— 它已经把资料排进 strongSessionId 的
+ * **下一轮**（`state.nextTurnBoost`，诊断里能看到 `boost-queued`）。本节就检查那一轮：
+ *   · boost 要**逐字完整**注入（长度 = `boost-queued.injectedChars`，一个字都不能少）；
+ *   · 同一轮召回里，凡是内容已经被 boost 覆盖的块必须丢掉（诊断字段 `boostDedupDropped`），
+ *     绝不允许同一段历史被投喂两遍；**绝不反过来砍 boost**。
+ * 能失败：把 `runRecall` 里传的 `boostText` 去掉 → `boostDedupDropped` 恒为 0、这段立刻红。 */
+{
+  let d25Passed = 0;
+  let d25Failed = 0;
+  const expect = (label, condition, detail = '') => {
+    if (condition) { d25Passed += 1; console.log(`  ✓ ${label}`); return; }
+    d25Failed += 1; process.exitCode = 1;
+    console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
+  };
+  console.log('\n=== ㉕ ✕ 的 boost 与同轮召回不重复投喂 ===');
+  const diagFile25 = path.join(home, 'dsh-super-memory.diag.jsonl');
+  const readDiag25 = () => (fs.existsSync(diagFile25) ? fs.readFileSync(diagFile25, 'utf8').split('\n') : []).map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  const queued = [...readDiag25()].reverse().find((entry) => entry.event === 'boost-queued') ?? null;
+  expect('㉓ 的 ✕ 确实排了 boost（前提）', queued !== null && queued.session === `session-strong-${process.pid}`,
+    JSON.stringify(queued));
+
+  const before25 = readDiag25().length;
+  // 用与 ✕ 同一句话提问、并复用同一个会话 id（状态按"工作区 + 会话 id"取）：
+  // 召回到的就是刚被 boost 找到的那批块（真实场景正是如此）。
+  const boostedOut = injected(sessionWithQuestion('跨压缩记忆怎么装', seqCursor++, `session-strong-${process.pid}`));
+  const events25 = readDiag25().slice(before25);
+  const recallEvent = events25.find((entry) => entry.event === 'recall') ?? null;
+
+  expect('注入文本里带上了 boost（用户点 ✕ 得到的那段）',
+    boostedOut.includes('用户点了「✕」后由辅助模型找到'), `注入 ${boostedOut.length} 字符`);
+  // boost 完整性：注入文本里 boost 那一段的字符数必须**逐字**等于排队时记下的长度
+  // （含 `⟦mem-hist⟧` 标记 —— 它是 boost 文本的第一个字符序列）
+  const boostHead = '⟦mem-hist⟧【本次会话更早（已被压缩）的参考 · 用户点了「✕」后由辅助模型找到】';
+  const boostBody = boostedOut.split(boostHead)[1] ?? '';
+  expect('boost 逐字完整（字符数和 boost-queued 记下的完全一致）',
+    queued !== null && boostBody !== '' && boostBody.length + boostHead.length === queued.injectedChars,
+    `实际 ${boostBody === '' ? 0 : boostBody.length + boostHead.length} / 排队时 ${queued?.injectedChars}`);
+  expect('召回诊断写出了 boostDedupDropped（本轮可观测字段）',
+    recallEvent !== null && Number.isSafeInteger(recallEvent.boostDedupDropped), JSON.stringify(recallEvent));
+  expect('与 boost 重叠的召回块被丢掉（boostDedupDropped ≥ 1）',
+    recallEvent !== null && recallEvent.boostDedupDropped >= 1, `实际=${recallEvent?.boostDedupDropped}`);
+  // 不重复投喂：boost 资料正文的那一段不该在召回里再出现一次
+  const materialBody = (boostBody.split('\n\n')[1] ?? '').split('\n')[1] ?? '';
+  const phrase = materialBody.slice(10, 60);
+  const occurrences = phrase === '' ? 0 : boostedOut.split(phrase).length - 1;
+  expect('boost 的正文没有被召回再投喂一遍（该片段只出现 1 次）', occurrences === 1,
+    `出现 ${occurrences} 次；片段=${JSON.stringify(phrase.slice(0, 24))}…`);
+  console.log(`   boost ${queued?.injectedChars} 字符（资料 ${queued?.chars}）· boostDedupDropped=${recallEvent?.boostDedupDropped} · reason=${recallEvent?.reason} · 召回注入 ${recallEvent?.injectedChars} 字符`);
+  console.log(`  ㉕ 段累计：通过 ${d25Passed} 条，失败 ${d25Failed} 条。`);
 }
 
 /* ── 24) 工具结果块不参与关键词扩写（A 项，2026-10-07 的"最大的一刀"）──────

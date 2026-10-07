@@ -21,7 +21,7 @@ const { formatRecall } = await import('../lib/recall.js');
 // DSH_SUPER_MEMORY_HOME 把全局数据目录挪到别的盘（例：E:\DSH-data\dsh-super-memory），
 // 这里若自己拼 `$DSH_HOME/...`，在那种机器上就永远打印"（没有诊断日志）"，
 // 而面板 ⑥ 读得到 —— 排查时最容易被这个假象带偏。
-const { dataHomeInfo, defaultDiagPath } = await import('../lib/config.js');
+const { dataHomeInfo, defaultDiagPath, DEFAULTS } = await import('../lib/config.js');
 
 const root = storeRoot(workspace, '.dsh-compaction-memory');
 console.log(`工作区: ${workspace}`);
@@ -63,8 +63,14 @@ if (biggest !== undefined) {
 
   if (query !== '') {
     const index = new MemoryIndex(biggest.records);
-    const found = retrieveTwoTier(index, query, { minScore: 0.28, maxItems: 2, preferSummaryChunks: true });
-    const built = formatRecall(found.hits, { maxItems: 2, maxCharsPerItem: 300, maxTokensPerTurn: 500 });
+    const found = retrieveTwoTier(index, query, { minScore: DEFAULTS.minScore, maxItems: DEFAULTS.maxItems, preferSummaryChunks: DEFAULTS.preferSummaryChunks });
+    // 上限**跟随默认值**（别写死）：写死的那份数字会随着改默认值悄悄过期，
+    // 于是"验收预览"看到的注入量与线上不一致（单轮上限 500 → 700 就是这么发生的）。
+    const built = formatRecall(found.hits, {
+      maxItems: DEFAULTS.maxItems,
+      maxCharsPerItem: DEFAULTS.maxCharsPerItem,
+      maxTokensPerTurn: DEFAULTS.maxTokensPerTurn,
+    });
     console.log(`\n=== 试检索「${query}」===`);
     console.log(`tier=${found.tier}  L1 top=${found.summaryTop.toFixed(3)}  L2 top=${found.rawTop.toFixed(3)}`);
     console.log(built.text === '' ? '（未命中 → 不注入，0 token）' : `${built.text}\n—— ${built.tokens} token / ${built.items} 条 / ${built.text.length} 字符`);
