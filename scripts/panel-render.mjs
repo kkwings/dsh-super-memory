@@ -259,6 +259,12 @@ for (const [label, needle] of [
 check('⑦ 默认展开（能看到隐私提示与测试连接）', text.includes('会被发送到') && text.includes('测试连接'),
   '用户已确认不要折叠：可选功能的入口要一眼可见');
 check('⑦ 展开后显示模型服务状态', text.includes('模型服务：'), `找不到「模型服务：」`);
+// 用户明确要求：**只让用户选一次**（要不要调用大模型），不许再拆成"入库/检索"两套
+check('⑦ 只选一次：出现「使用方式」', text.includes('使用方式'), `找不到「使用方式」`);
+check('⑦ 不再出现两套字段（入库用 / 检索用）', !text.includes('入库用 provider') && !text.includes('检索用 provider'),
+  '把实现结构暴露成用户决策是设计错误：用户只需回答"要不要调用大模型"');
+check('⑦ 三种选择都在', text.includes('不调用大模型') && text.includes('调用主模型') && text.includes('调用指定模型'),
+  '三选一：不调用 / 主模型 / 指定模型');
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
 
