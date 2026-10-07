@@ -66,7 +66,15 @@ const ReactStub = {
   useEffect(fn) { hookIndex += 1; try { fn(); } catch { /* 桩里效应失败不影响结构断言 */ } },
   useCallback(fn) { hookIndex += 1; return fn; },
   useMemo(fn) { hookIndex += 1; return fn(); },
-  useRef(value) { hookIndex += 1; return { current: value }; },
+  // ⚠️ `useRef` **必须像真 React 一样跨渲染复用同一个对象**（按槽位缓存）。
+  // 每次渲染都新建一个 {current} 的话，凡是"只在首次渲染记一个值"的组件（例如
+  // MissTail 的 mountedAt 用于判断陈旧结果）在测试里就会每次都被重置 ——
+  // 结果就是"实测的陈旧判定"和"真机行为"不一致（这正是把 pending 结果误判为陈旧的原因）。
+  useRef(value) {
+    const slot = `${currentComponent}#ref${hookIndex++}`;
+    if (!hookStore.has(slot)) hookStore.set(slot, { current: value });
+    return hookStore.get(slot);
+  },
   Component: class Component {
     constructor(props) { this.props = props; this.state = {}; }
     setState(next) { this.state = { ...this.state, ...next }; pendingUpdate = true; }
@@ -89,10 +97,10 @@ const settingsPayload = {
       observationTurns: 3, cooldownTurns: 1, preferSummaryChunks: true, storeDir: '.dsh-compaction-memory',
       trashEnabled: true, protectRecentDays: 7, trashAutoPurgeEnabled: true, trashAutoPurgeDays: 7,
       logScores: true, backfillOnStart: true, includePrune: false, maxRawCharsPerCompaction: 400000,
-      llmAssistEnabled: true, llmIngestExpand: true, llmIngestProvider: '', llmIngestModel: '',
-      llmIngestTimeoutMs: 8000, llmIngestBatchBlocks: 5, llmIngestBlockChars: 600, llmIngestMaxTokens: 300,
+      llmAssistEnabled: true, llmIngestExpand: true, llmIngestProvider: 'zai', llmIngestModel: 'glm-5.3-flash',
+      llmIngestTimeoutMs: 8000, llmIngestBatchBlocks: 8, llmIngestBlockChars: 600, llmIngestMaxTokens: 240,
       llmRecallRewrite: true, llmRecallRerank: false, llmRecallProvider: '', llmRecallModel: '',
-      llmRecallTimeoutMs: 4000, llmRewriteMaxTokens: 120, llmDailyCallCap: 0, llmCacheEnabled: true,
+      llmRecallTimeoutMs: 8000, llmRewriteMaxTokens: 120, llmDailyCallCap: 0, llmCacheEnabled: true,
     },
   },
 };
@@ -103,7 +111,10 @@ const overviewPayload = {
     build: 'v0.1.0',
     totals: { libraryBytes: 30687, trashBytes: 0 },
     llm: {
-      enabled: true, serviceAvailable: true, usage: { date: '2026-10-06', calls: 3, cap: 200, remaining: 197 },
+      enabled: true, serviceAvailable: true,
+      // usage 现在带 token 估算（E 项）：面板要把它显示出来，字段名必须与 host 的
+      // `usage()` 完全一致（calls / inTokensEst / outTokensEst），否则显示成 0。
+      usage: { date: '2026-10-06', calls: 3, cap: 200, remaining: 197, inTokensEst: 5120, outTokensEst: 860 },
       cooldownUntil: null, lastFailure: null, lastRoute: { provider: 'deepseek-official', model: 'deepseek-v4-flash' },
     },
     workspaces: [{
@@ -162,15 +173,17 @@ check('模块能加载（工厂返回 { inject, apply }）', typeof moduleExport
 
 let renderPanel = null;
 let renderMiss = null;
+let renderMissTail = null;
 const registered = [];
 const ctx = {
   effect: (fn) => { try { fn(); } catch { /* 忽略 */ } return () => {}; },
   slots: {
     inject: (name, cb) => { registered.push(name); try { cb(); } catch { /* 忽略 */ } return () => {}; },
     register: (slot, render) => {
-      // 按槽位分别捕获：面板与会话内按钮是两个不同的渲染函数
+      // 按槽位分别捕获：面板 / 会话内按钮 / 会话内结果块是三个不同的渲染函数
       if (slot?.name === 'settings.section') renderPanel = render;
       else if (slot?.name === 'conversation.chat.assistant-actions') renderMiss = render;
+      else if (slot?.name === 'conversation.chat.turnTail') renderMissTail = render;
       return () => {};
     },
   },
@@ -180,6 +193,7 @@ check('注册了 settings.section 槽位', registered.includes('settings.section
 check('注册了 conversation.chat.assistant-actions 槽位', registered.includes('conversation.chat.assistant-actions'));
 check('拿到了面板渲染函数', typeof renderPanel === 'function');
 check('拿到了会话内按钮渲染函数', typeof renderMiss === 'function');
+check('拿到了会话内结果块渲染函数（turnTail）', typeof renderMissTail === 'function');
 
 /* ── 最小渲染器需要的文本提取（放在断言之前）────────────────────────── */
 function textOf(node, depth = 0) {
@@ -254,13 +268,22 @@ check('板块顺序正确（①→⑦）', (() => {
 for (const [label, needle] of [
   ['工具结果开关相关文案', '工具结果'],
   ['未命中诊断门槛提示或入口', '压缩'],
+  ['每批块数的新口径（15 块 ≈ 2 次调用）', '一次压缩 15 块 ≈ 2 次调用'],
+  ['✕ 路径超时上限的说明（8 秒是上限）', '8 秒是上限'],
 ]) {
   check(`渲染树里含${label}`, text.includes(needle), `找不到「${needle}」`);
 }
+// 会话内结果块（turnTail）：从没在浏览器之外渲染过，这里至少确认它在"无结果"时不渲染
+check('turnTail 无结果时不渲染任何内容',
+  textOf(resolveTree(withComponent('missTail', () => renderMissTail({ sessionId: 'session-x' })))).trim() === '', '');
 // ⑦ 模型辅助：用户明确要求**默认展开**（不再折叠）——正文应直接渲染出来
 check('⑦ 默认展开（能看到隐私提示与使用方式）', text.includes('会被发送到') && text.includes('使用方式'),
   '用户已确认不要折叠：可选功能的入口要一眼可见；「测试连接」只在选"调用指定模型"时出现');
 check('⑦ 展开后显示模型服务状态', text.includes('模型服务：'), `找不到「模型服务：」`);
+// E 项：今日 token 估算要真的显示出来（字段名对不上就会显示成 0）
+check('⑦ 显示今日 token 估算（输入/输出）',
+  text.includes('今日估算用量：输入 ≈5120 token') && text.includes('输出 ≈860 token'),
+  `实际：${(text.match(/今日估算用量：[^（]*/) ?? ['(没渲染)'])[0]}`);
 // 用户明确要求：**只让用户选一次**（要不要调用大模型），不许再拆成"入库/检索"两套
 check('⑦ 只选一次：出现「使用方式」', text.includes('使用方式'), `找不到「使用方式」`);
 check('⑦ 不再出现两套字段（入库用 / 检索用）', !text.includes('入库用 provider') && !text.includes('检索用 provider'),
@@ -308,20 +331,92 @@ console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
   // diagnostics 里有这个会话且 knownCompactions>0 → 应渲染出按钮
   const compacted = { ok: true, value: { runtime: [{ sessionId: 'session-x', workspace: 'E:\\w', knownCompactions: 2, hits: 1, misses: 2, lastQuery: '之前那个问题' }] } };
   const fresh = { ok: true, value: { runtime: [{ sessionId: 'session-x', workspace: 'E:\\w', knownCompactions: 0, hits: 0, misses: 0, lastQuery: '' }] } };
-  const render = async (payload) => {
-    globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => payload });
+  let last = null;
+  /** 多等几个微任务：点 ✕ 之后的结果是跨 fetch/await 才发布的。 */
+  const tick = async (times = 4) => { for (let i = 0; i < times; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); };
+  /**
+   * 渲染一次（会等几轮微任务，让 effect 里的 fetch 落地）并把解析后的树留在 `last`。
+   * fetch 桩**按 URL 分派**（宿主就是这样：/diagnostics 与 /settings 是两个接口）——
+   * 全都回同一个 payload 会让"模型名"这类跨接口的读取永远读到 undefined。
+   */
+  const renderNode = async (payload) => {
+    globalThis.fetch = async (url) => ({
+      ok: true, status: 200,
+      json: async () => (String(url).includes('/settings') ? settingsPayload : payload),
+    });
     hookStore.clear();
     hookIndex = 0; currentComponent = 'miss';
     let out = resolveTree(withComponent('miss', () => renderMiss({ sessionId: 'session-x' })));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await tick();
     hookIndex = 0; currentComponent = 'miss';
     out = resolveTree(withComponent('miss', () => renderMiss({ sessionId: 'session-x' })));
+    await tick();
+    last = out;
     return textOf(out);
   };
+  const render = async (payload) => renderNode(payload);
   const withHistory = await render(compacted);
   const without = await render(fresh);
   check('压缩过的会话 → 出现「未命中诊断」按钮（图标 ✕）', withHistory.includes('✕'), `实际文本：${withHistory.slice(0, 60)}`);
   check('没压缩过的会话 → 完全不渲染按钮', without.trim() === '', `实际文本：${without.slice(0, 60)}`);
+
+  /* ── 点 ✕ 之后的两种状态：先「检索中」，再用结果替换 ─────────────────────
+   * 用户要求：点了要**立刻**在会话里看到一行「xxx（辅助模型）检索中，请稍后…」，
+   * 检索完成后再替换成"找到/没找到"那两种文案。这条断言必须能失败：
+   * 若 pending 不渲染（或渲染了按钮），下面的 ✗ 会直接报出来。 */
+  const findClickable = (node, out = []) => {
+    if (node === null || node === undefined || typeof node !== 'object') return out;
+    if (node.type === 'button' && typeof node.props?.onClick === 'function') out.push(node);
+    const children = node.props?.children;
+    for (const child of Array.isArray(children) ? children : [children]) findClickable(child, out);
+    return out;
+  };
+
+  await renderNode(compacted);
+  const clickable = findClickable(last);
+  check('拿到了 ✕ 按钮的点击处理', clickable.length > 0, `按钮数=${clickable.length}`);
+  // 挂起 /diagnose 的响应：点下去之后**只能**看到"检索中"这一行
+  let release = null;
+  globalThis.fetch = (url) => {
+    const target = String(url);
+    // ⚠️ 必须排除 `/diagnostics`：它里面也含 `/diagnose` 这个子串，
+    // 只写 includes('/diagnose') 会把诊断探测一起挂起（实测踩过）。
+    if (target.includes('/diagnose') && !target.includes('/diagnostics')) {
+      return new Promise((resolve) => {
+        release = () => resolve({
+          ok: true, status: 200,
+          json: async () => ({ ok: true, value: { verdict: 'above-threshold', found: true, boosting: true, chars: 120, model: 'glm-5.3-flash', material: '【对话】标题\n正文', file: 'E:\\w\\excerpt.md' } }),
+        });
+      });
+    }
+    const body = target.includes('/settings') ? settingsPayload
+      : target.includes('/diagnostics') ? compacted : { ok: true, value: {} };
+    return Promise.resolve({ ok: true, status: 200, json: async () => body });
+  };
+  // 点之前先睡一下、并**重新取一次**按钮：上一次渲染拿到的那个元素带着旧的闭包
+  // （busy/note 是旧的）。
+  await new Promise((resolve) => setTimeout(resolve, 3));
+  const liveButton = findClickable(last).find((node) => (textOf(node.props.children) ?? '').includes('✕'));
+  check('点下去之前能拿到当前的 ✕ 按钮元素', liveButton !== undefined, `按钮数=${findClickable(last).length}`);
+  (liveButton ?? clickable[0]).props.onClick();
+  check('点下 ✕ 后立刻拿到"检索中"状态', release !== null, 'onClick 没有发起 /diagnose 请求');
+  hookIndex = 0; currentComponent = 'missTail';
+  const pendingTree = resolveTree(withComponent('missTail', () => renderMissTail({ sessionId: 'session-x' })));
+  const pendingText = textOf(pendingTree);
+  check('"检索中"显示配置里的模型名', pendingText.includes('glm-5.3-flash（辅助模型）检索中，请稍后…'),
+    `实际文本：${pendingText.slice(0, 80)}`);
+  check('"检索中"状态不显示任何按钮（结果没出来不该给操作）',
+    !pendingText.includes('知道了') && !pendingText.includes('打开原文'), `实际文本：${pendingText.slice(0, 80)}`);
+  // 放行 → 同一块被最终结果替换
+  if (release !== null) release();
+  await tick();
+  hookIndex = 0; currentComponent = 'missTail';
+  const doneTree = resolveTree(withComponent('missTail', () => renderMissTail({ sessionId: 'session-x' })));
+  const doneText = textOf(doneTree);
+  check('结果回来后替换成"找到相关内容"', doneText.includes('找到相关内容'), `实际文本：${doneText.slice(0, 80)}`);
+  check('找到时保留「打开原文」与「知道了」两个按钮',
+    doneText.includes('打开原文') && doneText.includes('知道了'), `实际文本：${doneText.slice(0, 120)}`);
+  check('结果显示的模型名与"检索中"一致', doneText.includes('glm-5.3-flash'), `实际文本：${doneText.slice(0, 80)}`);
 }
 
 if (failures > 0) process.exit(1);

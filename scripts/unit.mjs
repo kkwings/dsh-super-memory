@@ -19,9 +19,12 @@ import {
   MARKER, estimateTokens, extractTitle, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords } from '../lib/ingest.js';
-import { MemoryIndex, retrieveTwoTier } from '../lib/retrieval.js';
+import { MemoryIndex, localTopScore, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import { formatRecall, questionTextOf, queryTextOf } from '../lib/recall.js';
+import { mergeUsage } from '../lib/llm.js';
+import { STRONG_HIT_RATIO, strongHitScore } from '../lib/routes.js';
+import { shouldExpand } from '../lib/host.js';
 import {
   makeRecord, moveToTrash, readRecords, removeTrashEntry, storeRoot,
 } from '../lib/store.js';
@@ -226,6 +229,90 @@ console.log('\n=== 7. 全局数据目录 ===');
   eq('设了环境变量 → 来源是 env', after.source, 'env');
   eq('解析到环境变量指定的目录', resolveDataHome(), process.env.DSH_SUPER_MEMORY_HOME);
   delete process.env.DSH_SUPER_MEMORY_HOME;
+}
+
+console.log('\n=== 8. 今日用量记账（token 与调用次数）===');
+{
+  // 跨日重置与旧文件兼容都在这条纯函数里；它坏了的表现是"日上限或账目悄悄不对"
+  const day = '2026-10-07';
+  const fresh = mergeUsage({}, day, 1, 1234, 56);
+  eq('第一次调用写下日期', fresh.date, day);
+  eq('第一次调用记为 1 次', fresh.calls, 1);
+  eq('输入 token 估算被记下', fresh.inTokensEst, 1234);
+  eq('输出 token 估算被记下', fresh.outTokensEst, 56);
+  const grown = mergeUsage(fresh, day, 1, 100, 10);
+  eq('同日累加调用次数', grown.calls, 2);
+  eq('同日累加输入 token', grown.inTokensEst, 1334);
+  eq('同日累加输出 token', grown.outTokensEst, 66);
+  const nextDay = mergeUsage(grown, '2026-10-08', 1, 5, 5);
+  eq('跨日重置调用次数（与 date 的重置口径一致）', nextDay.calls, 1);
+  eq('跨日重置输入 token', nextDay.inTokensEst, 5);
+  eq('跨日重置输出 token', nextDay.outTokensEst, 5);
+  // 旧版本写的用量文件只有 {date, calls}：不能变成 NaN 写回磁盘
+  const legacy = mergeUsage({ date: day, calls: 7 }, day, 1, 11, 3);
+  eq('旧文件（只有 calls）也能续写次数', legacy.calls, 8);
+  eq('旧文件缺失的 token 字段从 0 起算', legacy.inTokensEst, 11);
+  check('不会写出 NaN/Infinity', Number.isFinite(legacy.inTokensEst) && Number.isFinite(legacy.outTokensEst));
+  const damaged = mergeUsage({ date: day, calls: 'x', inTokensEst: null }, day, 1, Number.NaN, -5);
+  eq('损坏的记录按 0 处理', damaged.calls, 1);
+  eq('负值/NaN 不写进账本', damaged.inTokensEst + damaged.outTokensEst, 0);
+}
+
+console.log('\n=== 9. 扩写候选的筛选（A 项：工具结果块不花钱扩写）===');
+{
+  // 这条判据坏了的后果：**钱又花回工具结果上**（实测占扩写输入的 61%）。
+  const long = 'x'.repeat(200);
+  check('非工具块、够长 → 送去扩写', shouldExpand({ text: long }) === true);
+  check('工具结果块 → 不送去扩写（哪怕很长）', shouldExpand({ text: long, src: 'tool' }) === false);
+  check('工具结果块即使很短也不送', shouldExpand({ text: '短', src: 'tool' }) === false);
+  check('对话块太短（标题类）→ 不送', shouldExpand({ text: 'x'.repeat(119) }) === false);
+  check('正好 120 字符 → 送（边界与实现一致）', shouldExpand({ text: 'x'.repeat(120) }) === true);
+  check('没有 text 字段也不抛错', shouldExpand({}) === false && shouldExpand(null) === false);
+  // 入库行为**不受影响**：工具结果照样生成记录（这里用最小的假 record 验字段口径）
+  const fakeTool = makeRecord({ layer: 'raw', title: '工具 read：host.js', text: long, src: 'tool', tool: 'read', compactionId: 'c1' });
+  check('工具结果照旧是 L2 记录（入库不动）', fakeTool.layer === 'raw' && fakeTool.src === 'tool');
+  check('工具结果记录仍然被"不扩写"判定挡住', shouldExpand(fakeTool) === false, '');
+}
+
+console.log('\n=== 10. 成本默认值（B/C 项：不许悄悄回到改前）===');
+{
+  // 这几条是 2026-10-07 用户决定"再砍一刀"的具体数字：谁把它们改回去，
+  // 面板提示（"15 块 ≈ 2 次调用"、"8 秒是上限"）会先跟代码对不上，测试也直接红。
+  eq('每批块数默认 8（原 5）', DEFAULTS.llmIngestBatchBlocks, 8);
+  eq('扩写输出上限默认 240（原 300）', DEFAULTS.llmIngestMaxTokens, 240);
+  eq('✕ 路径检索超时默认 8000（原 4000）', DEFAULTS.llmRecallTimeoutMs, 8000);
+  eq('每块送多少字符仍是 600（上一刀，保持不变）', DEFAULTS.llmIngestBlockChars, 600);
+  // 范围与夹紧不变：越界仍然被拒/被夹
+  eq('每批块数上限仍是 50', typeof validatePatch({ llmIngestBatchBlocks: 51 }, DEFAULTS), 'string');
+  eq('扩写输出上限 8001 仍被拒', typeof validatePatch({ llmIngestMaxTokens: 8001 }, DEFAULTS), 'string');
+  eq('检索超时 300001 仍被拒', typeof validatePatch({ llmRecallTimeoutMs: 300001 }, DEFAULTS), 'string');
+  eq('normalizeSettings 把 0 夹到下限 1', normalizeSettings({ llmIngestBatchBlocks: 0 }, DEFAULTS).llmIngestBatchBlocks, 1);
+}
+
+console.log('\n=== 11. 「强命中跳过改写」的门槛 ===');
+{
+  // 这条判据坏了的后果：要么"本来找得到也要花钱改写"（浪费），
+  // 要么"本地已经很确定还去改写/或干脆不查了"（降智）。
+  check('默认 minScore=0.28 → 分数线是 1.5×（浮点误差内）', Math.abs(strongHitScore(0.28) - 0.42) < 1e-9, `实际=${strongHitScore(0.28)}`);
+  eq('倍数是 1.5（与注释、报告里的标定一致）', STRONG_HIT_RATIO, 1.5);
+  eq('阈值被设成 0 时有下限（0 → 0，不会"任何候选都算强命中"）', strongHitScore(0), 0);
+  eq('负数阈值也不产生负分数线', strongHitScore(-1), 0);
+  check('非数字阈值退化为 0（而不是 NaN 让所有比较都为假）', strongHitScore(undefined) === 0 && Number.isFinite(strongHitScore('x')));
+  // 本地最高分：诊断候选里的最大值（不是"第一条"，虽然检索已经排好序）
+  eq('取候选里的最高分', localTopScore([{ score: 0.1 }, { score: 0.9 }, { score: 0.3 }]), 0.9);
+  eq('空候选 → 0', localTopScore([]), 0);
+  eq('字段缺失/非数字一律忽略', localTopScore([{}, { score: 'x' }, { score: Number.NaN }]), 0);
+  eq('非数组输入不抛错', localTopScore(null), 0);
+  // 端到端口径：真实语料上"本地已命中"的查询，其最高分必然 ≥ 分数线
+  const records = [
+    makeRecord({ layer: 'summary', title: '命中阈值是怎么定的', text: '结论：命中阈值定为 0.28，因为相关与不相关分数分得很开，实测能分开。', compactionId: 'c1' }),
+    makeRecord({ layer: 'raw', title: '天气闲聊', text: '今天天气不错，适合出门散步，顺便买点水果回来。', compactionId: 'c1' }),
+  ];
+  const index = new MemoryIndex(records);
+  const best = localTopScore(index.search('命中阈值是怎么定的', { limit: 5 }).map((hit) => ({ score: hit.score })));
+  check('相关查询的最高分 ≥ 默认分数线（该跳过改写）', best >= strongHitScore(0.28), `实际最高分=${best.toFixed(3)}`);
+  const miss = localTopScore(index.search('明天北京天气预报怎么样', { limit: 5 }).map((hit) => ({ score: hit.score })));
+  check('不相关查询的最高分 < 分数线（不该跳过改写）', miss < strongHitScore(0.28), `实际最高分=${miss.toFixed(3)}`);
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);

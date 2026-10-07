@@ -26,12 +26,16 @@ const { toolRecords } = await import('../lib/ingest.js');
  * 始终存在（DSH 里 llm 一定在），靠 `behavior.mode` 切换返回内容；
  * "完全没有 llm 服务"那种机器由 `UNAVAILABLE` 闸门覆盖（见 unit.mjs）。
  */
-const behavior = { mode: 'off', calls: 0 };
+const behavior = { mode: 'off', calls: 0, rewriteCalls: 0 };
 const fakeLlm = {
   async listProviders() { return [{ provider: 'fake-provider', model: 'fake-model' }]; },
   async *stream(input) {
     behavior.calls += 1;
     behavior.lastInput = input;
+    // 查询改写走的是同一条 stream 通道，但**期望的输出形状不同**（JSON 数组 vs JSON 对象）：
+    // 按系统提示词区分开，才能分别测"改写被调用/被跳过"（见 ㉓）。
+    const isRewrite = typeof input.system === 'string' && input.system.includes('改写成');
+    if (isRewrite) behavior.rewriteCalls += 1;
     if (behavior.mode === 'hang') { await new Promise((resolve) => setTimeout(resolve, 3000)); return; }
     if (behavior.mode === 'no-adapter') {
       yield { type: 'finish', kind: 'error', failure: { code: 'NO_ADAPTER', message: '提供方未注册' } };
@@ -39,6 +43,12 @@ const fakeLlm = {
     }
     if (behavior.mode === 'garbage') {
       yield { type: 'text-delta', index: 0, text: '抱歉，我不能返回 JSON。' };
+      yield { type: 'finish', kind: 'done' };
+      return;
+    }
+    if (isRewrite) {
+      // 改写要求严格 JSON 数组；给几个与库内容无关的词，便于观察"改写路径确实跑了"
+      yield { type: 'text-delta', index: 0, text: '["跨压缩记忆", "注入成本", "改写"]' };
       yield { type: 'finish', kind: 'done' };
       return;
     }
@@ -651,4 +661,191 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
   console.log(`/pair → ${pair.status}；_pairs.jsonl 已写入（应为 true）: ${fs.existsSync(pairsFile) && fs.readFileSync(pairsFile, 'utf8').includes('"verdict":"hit"')}`);
   const searchAfter = await call('POST', '/api/dsh-super-memory/diagnose', { workspace: workdir, session: modelSessionId, query: '注入成本上限', limit: 3 });
   console.log(`配对记录不参与检索（应 true，_pairs 不是记忆块）: ${(searchAfter.body?.value?.candidates ?? []).every((c) => c.fp !== '_pairs')}`);
+}
+
+/* ── 23) 本地已强命中 → 跳过查询改写（D 项，2026-10-07）─────────────────────
+ * 判据是"**改写调用的次数**"：宿主里那个门槛只要没生效，这个数就不可能是 0。
+ * 反向用例（本地没有强命中）必须仍然调用一次 —— 否则就是"为省 token 降智"。
+ * 事件 `rewrite-skipped` 的存在与否也一并验：用户要能在诊断日志里看到原因。
+ * 这里的断言会**真的让进程退出码变 1**（不是只打印一行）——否则"能失败"就是空话。 */
+{
+  let d23Passed = 0;
+  let d23Failed = 0;
+  const expect = (label, condition, detail = '') => {
+    if (condition) { d23Passed += 1; console.log(`  ✓ ${label}`); return; }
+    d23Failed += 1; process.exitCode = 1;
+    console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
+  };
+  console.log('\n=== ㉓ 本地已强命中 → 跳过查询改写 ===');
+  const strongSessionId = `session-strong-${process.pid}`;
+  const source = compactions[0];
+  const strongSession = {
+    id: strongSessionId,
+    header: { cwd: workdir },
+    snapshotEvents: () => events,
+    requestContext: () => ({ contextWindow: 1000000 }),
+  };
+  const strongDiagFile = path.join(home, 'dsh-super-memory.diag.jsonl');
+  const readDiag = () => (fs.existsSync(strongDiagFile) ? fs.readFileSync(strongDiagFile, 'utf8').split('\n') : []).map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  // 清掉今日用量：上一段（㉒）用 `llmDailyCallCap: 50` 打过一轮入库，额度已经用光，
+  // 不清的话这里所有调用都会被 DAILY_CAP 挡掉（表现为"改写没被调用"的假红）。
+  fs.rmSync(path.join(home, 'dsh-super-memory.llm-usage.json'), { force: true });
+
+  await put({
+    // ⚠️ 必须走 `llmMode`（面板的唯一入口）：只塞 llmAssistEnabled/llmIngestExpand
+    // 会被 `applyLlmMode` 在 mode='off' 时重新压回 false —— 实测踩过，表现为
+    // "扩写一次都没发生"，而不会报任何错。
+    llmMode: 'custom', llmProvider: 'fake-provider', llmModel: 'fake-model',
+    llmIngestExpand: false,
+  });
+  behavior.mode = 'ok';
+  behavior.rewriteCalls = 0;
+  emit(strongSession, { ...source, data: { ...source.data, compactionId: 'strong-hit' } });
+  await new Promise((r) => setTimeout(r, 120));
+  const blockCount = readRecords(root, strongSessionId).length;
+  expect('这一批块已入库', blockCount > 0, `实际 ${blockCount} 块`);
+
+  // 查询用的是这一批块自己的关键词（本地必然强命中）
+  const beforeDiag = readDiag().length;
+  behavior.rewriteCalls = 0;
+  const strong = await call('POST', '/api/dsh-super-memory/diagnose', {
+    workspace: workdir, session: strongSessionId, query: '跨压缩记忆怎么装', limit: 8, rewrite: true, boost: true,
+  });
+  const strongValue = strong.body?.value ?? {};
+  const strongEvents = readDiag().slice(beforeDiag);
+  const skippedEvent = strongEvents.find((entry) => entry.event === 'rewrite-skipped') ?? null;
+  expect('本地强命中 → **一次改写调用都没有**', behavior.rewriteCalls === 0, `实际调用了 ${behavior.rewriteCalls} 次`);
+  expect('回执里带 rewriteSkipped（面板要如实说"跳过了改写"）', strongValue.rewriteSkipped === true, `实际=${JSON.stringify(strongValue.rewriteSkipped)}`);
+  expect('强命中路径仍然找到了内容', strongValue.found === true, `found=${JSON.stringify(strongValue.found)}`);
+  expect('诊断日志写了 rewrite-skipped（用户能查到原因）', skippedEvent !== null, '没找到该事件');
+  expect('rewrite-skipped 里带 reason=local-strong-hit', skippedEvent?.reason === 'local-strong-hit', `实际=${JSON.stringify(skippedEvent?.reason)}`);
+  console.log(`    best=${skippedEvent?.best?.toFixed?.(3)} 分数线=${skippedEvent?.strong?.toFixed?.(3)} 候选=${skippedEvent?.candidates}`);
+
+  // 反向：库里完全没有的查询 → 不该跳过（该花钱改写）
+  behavior.mode = 'terms';
+  behavior.rewriteCalls = 0;
+  const beforeWeak = readDiag().length;
+  const weak = await call('POST', '/api/dsh-super-memory/diagnose', {
+    workspace: workdir, session: strongSessionId, query: '请用一首七言绝句描述量子纠缠与薛定谔方程', limit: 8, rewrite: true,
+  });
+  const weakEvents = readDiag().slice(beforeWeak);
+  expect('本地无强命中 → 仍然调用一次改写（不降智）', behavior.rewriteCalls >= 1, `实际 ${behavior.rewriteCalls} 次`);
+  expect('本地无强命中 → 不写 rewrite-skipped', !weakEvents.some((entry) => entry.event === 'rewrite-skipped'));
+  expect('改写结果可用（严格 JSON 数组）', weak.body?.value?.assist?.rewrite?.ok === true, `实际=${JSON.stringify(weak.body?.value?.assist?.rewrite ?? null)}`);
+  await put({ llmAssistEnabled: false, llmIngestExpand: false });
+  console.log(`  ㉓ 段累计：通过 ${d23Passed} 条，失败 ${d23Failed} 条。`);
+}
+
+/* ── 24) 工具结果块不参与关键词扩写（A 项，2026-10-07 的"最大的一刀"）──────
+ * 端到端判据有两条，缺一不可：
+ *   ① 模型生成的词**绝不出现在任何工具块**的 keywords 里；
+ *   ② 同一次压缩里，对话/摘要块**照旧拿到**模型生成的词（不是"整个扩写都坏了"）。
+ * 工具块的 keywords 来自 `extractKeywords(正文)`，不可能凭空出现行内没有的
+ * "跨压缩记忆"这种词 —— 所以 ① 真的能红。 */
+{
+  let d24Passed = 0;
+  let d24Failed = 0;
+  const expect = (label, condition, detail = '') => {
+    if (condition) { d24Passed += 1; console.log(`  ✓ ${label}`); return; }
+    d24Failed += 1; process.exitCode = 1;
+    console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
+  };
+  console.log('\n=== ㉔ 工具结果块不扩写（钱不花在工具结果上）===');
+  const mixId = `session-mix-${process.pid}`;
+  const toolText = `host.js 的完整源码片段：${'导出函数 apply(ctx) { 注册工具与上下文 }；'.repeat(40)}`;
+  const mixNow = Date.now();
+  // 事件形状照抄真实日志（tool/call 的 arguments 是 **JSON 字符串**，tool/result 的
+  // 工具名要靠 callId 回到 tool/call 里找）—— 写错形状会让工具块根本不入库，
+  // 那样"工具块里没有模型词"就变成一条永远为真的假绿。
+  const toolEvents = [
+    {
+      type: 'user/message', seq: 41, time: mixNow,
+      // 提问超过 120 字符（扩写候选的阈值）——短提问不会进候选名单，
+      // 那样这条用例就测不到"非工具块照旧拿到模型词"。
+      data: {
+        content: [{ type: 'text', text: '读一下 host.js 里的扩写筛选逻辑，然后总结给我：我想确认工具结果块到底还会不会被送去扩写关键词，以及这一刀省下来的调用次数与输入字符数大概是多少。' }],
+        source: { kind: 'user' }, role: 'user', id: 'q-mix-1',
+      },
+    },
+    {
+      type: 'assistant/message', seq: 42, time: mixNow,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '好的，我先读文件。' }] } },
+    },
+    {
+      type: 'tool/call', seq: 43, time: mixNow,
+      data: { callId: 'c-tool-1', name: 'read', arguments: JSON.stringify({ file_path: 'E:\\w\\host.js' }) },
+    },
+    {
+      type: 'tool/result', seq: 44, time: mixNow,
+      data: { message: { role: 'tool', toolCallId: 'c-tool-1', source: { kind: 'tool', callId: 'c-tool-1' }, content: [{ type: 'text', text: toolText }] } },
+    },
+  ];
+  const mixSession = {
+    id: mixId,
+    header: { cwd: workdir },
+    snapshotEvents: () => toolEvents,
+    requestContext: () => ({ contextWindow: 1000000 }),
+  };
+  const mixDiagFile = path.join(home, 'dsh-super-memory.diag.jsonl');
+  const readMixDiag = () => (fs.existsSync(mixDiagFile) ? fs.readFileSync(mixDiagFile, 'utf8').split('\n') : []).map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter(Boolean);
+  // 同上：清掉今日用量，避免被上一段用光的额度挡住（DAILY_CAP 会让扩写一次都不发生）
+  fs.rmSync(path.join(home, 'dsh-super-memory.llm-usage.json'), { force: true });
+
+  await put({
+    // 同上：走 llmMode，模式一开就是"入库扩写 + ✕ 改写"两个时机同时可用
+    llmMode: 'custom', llmProvider: 'fake-provider', llmModel: 'fake-model',
+    ingestSummary: true, ingestRawText: true,
+    llmIngestBatchBlocks: 8, llmDailyCallCap: 0,
+  });
+  behavior.mode = 'ok';
+  const beforeMixDiag = readMixDiag().length;
+  const summaryText = '# 结论\n跨压缩记忆插件的关键词扩写只对对话块生效，工具结果块一律跳过。'
+    + '这一段要足够长才会进入扩写候选名单（阈值 120 字符），所以这里再补几句说明：'
+    + '工具结果靠文件名与标题就能检索到，给它生成"用户可能怎么问"纯属噪声，而且它的体量是对话正文的三倍多。';
+  emit(mixSession, {
+    type: 'compaction/summary',
+    seq: 50,
+    time: Date.now(),
+    data: {
+      compactionId: 'mix-expand',
+      turn: 1,
+      shadowedRange: { start: 41, end: 44 },
+      shadowedTokenCount: 1234,
+      summary: [{ type: 'text', text: summaryText }],
+    },
+  });
+  await new Promise((r) => setTimeout(r, 150));
+  const mixRecords = readRecords(root, mixId);
+  const toolBlocks = mixRecords.filter((record) => record.src === 'tool');
+  const nonToolBlocks = mixRecords.filter((record) => record.src !== 'tool');
+  const modelWords = (record) => (record.keywords ?? []).map(String).filter((word) => word.includes('跨压缩记忆'));
+  const expandEvents = readMixDiag().slice(beforeMixDiag).filter((entry) => entry.event === 'llm-expand');
+  const lastExpand = expandEvents[expandEvents.length - 1] ?? null;
+  // 每次压缩的**真实候选口径**（宿主自己算的）：非工具 且 ≥120 字符。
+  // 这个数必须等于"非工具块里够长的那些"——把工具块算进去它就会变大（回归可测）。
+  const expectedTargets = nonToolBlocks.filter((record) => record.text.length >= 120).length;
+
+  expect('工具结果确实入库了（入库行为不变）', toolBlocks.length > 0, `实际 ${toolBlocks.length} 块`);
+  expect('工具块里没有模型生成的词', toolBlocks.every((record) => modelWords(record).length === 0),
+    `命中 ${toolBlocks.flatMap(modelWords).join(',')}`);
+  expect('同一次压缩里的对话/摘要块拿到了模型生成的词（扩写整体没坏）',
+    nonToolBlocks.some((record) => modelWords(record).length > 0),
+    `非工具块 ${nonToolBlocks.length} 块，都没拿到`);
+  expect('llm-expand 的候选数=非工具且够长的块数（工具块不在里面）',
+    lastExpand !== null && lastExpand.candidates === expectedTargets,
+    `candidates=${lastExpand?.candidates} 期望=${expectedTargets}（工具块 ${toolBlocks.length} 块）`);
+  expect('llm-expand 诊断记下了被跳过的工具块数', lastExpand !== null && lastExpand.skippedTool === toolBlocks.length,
+    `实际 skippedTool=${JSON.stringify(lastExpand?.skippedTool)}，工具块 ${toolBlocks.length}`);
+  // **最关键的一条**：调用次数按"筛完的候选"算 —— 把工具块算进去，这个数会直接变大
+  expect('调用次数只按筛完的候选算（ceil(候选/每批)）',
+    lastExpand !== null && lastExpand.calls === Math.max(1, Math.ceil(expectedTargets / 8)),
+    `calls=${lastExpand?.calls} 期望=${Math.max(1, Math.ceil(expectedTargets / 8))}`);
+  console.log(`    块 ${mixRecords.length}（工具 ${toolBlocks.length} / 非工具 ${nonToolBlocks.length}）· `
+    + `扩写候选 ${lastExpand?.candidates} · 跳过工具 ${lastExpand?.skippedTool} · 调用 ${lastExpand?.calls}`);
+  await put({ llmAssistEnabled: false, llmIngestExpand: false });
+  console.log(`  ㉔ 段累计：通过 ${d24Passed} 条，失败 ${d24Failed} 条。`);
 }
