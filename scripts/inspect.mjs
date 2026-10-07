@@ -8,7 +8,6 @@
  *   node scripts/inspect.mjs "<工作区绝对路径>" "早前定过的某个结论"
  */
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 const workspace = process.argv[2] ?? process.cwd();
@@ -18,6 +17,11 @@ const { storeRoot, listSessionFiles, readRecords } = await import('../lib/store.
 const { MemoryIndex, retrieveTwoTier } = await import('../lib/retrieval.js');
 const { buildRecap } = await import('../lib/recap.js');
 const { formatRecall } = await import('../lib/recall.js');
+// 诊断日志的路径**必须与生产代码同源**（`lib/config.js`）：用户可以用
+// DSH_SUPER_MEMORY_HOME 把全局数据目录挪到别的盘（例：E:\DSH-data\dsh-super-memory），
+// 这里若自己拼 `$DSH_HOME/...`，在那种机器上就永远打印"（没有诊断日志）"，
+// 而面板 ⑥ 读得到 —— 排查时最容易被这个假象带偏。
+const { dataHomeInfo, defaultDiagPath } = await import('../lib/config.js');
 
 const root = storeRoot(workspace, '.dsh-compaction-memory');
 console.log(`工作区: ${workspace}`);
@@ -67,9 +71,10 @@ if (biggest !== undefined) {
   }
 }
 
-/* 诊断日志 */
-const diagPath = path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'dsh-super-memory.diag.jsonl');
-console.log(`\n=== 打分日志（最近 12 条，${diagPath}）===`);
+/* 诊断日志（路径与生产代码同源：DSH_SUPER_MEMORY_HOME > $DSH_HOME > ~/.dsh） */
+const diagPath = defaultDiagPath();
+const home = dataHomeInfo();
+console.log(`\n=== 打分日志（最近 12 条，${diagPath}；数据目录来源=${home.source}）===`);
 if (fs.existsSync(diagPath)) {
   for (const line of fs.readFileSync(diagPath, 'utf8').split('\n').filter(Boolean).slice(-12)) {
     const entry = JSON.parse(line);

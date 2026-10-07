@@ -372,15 +372,18 @@ check('⑦ 不再出现两套字段（入库用 / 检索用）', !text.includes(
 check('⑦ 三种选择都在', text.includes('不调用大模型') && text.includes('调用主模型') && text.includes('调用指定模型'),
   '三选一：不调用 / 主模型 / 指定模型');
 
-/* ── 渲染器：默认态（参数设置收起）与展开态（等于用户点了「参数设置」）────────
+/* ── 渲染器：默认态（参数设置与⑥都收起）与展开态 ───────────────────────────
  * 2026-10-07 精简改版：面向调参的项全部收进**默认折叠**的「参数设置」，
- * 所以「同一棵树渲染两次」成为默认断言姿势：
- *   · `render()`        —— 用户打开面板看到的首屏（不展开）；
- *   · `render(true)`    —— 点开「参数设置」之后（所有设置项都必须在，一个都不能少）。
- * 桩 React 不会点按钮，所以展开态是**直接往 hook 槽位里种**（见下OPEN_ADVANCED_SLOT）。
+ * 所以「同一棵树渲染多次」成为默认断言姿势：
+ *   · `render()`                  —— 用户打开面板看到的首屏（两个都收起）；
+ *   · `render(true)`              —— 点开「参数设置」之后（所有设置项都必须在，一个都不能少）；
+ *   · `render(false, true, true)` —— 点开 ⑥「诊断与路径」之后（排障行/日志/路径/恢复默认设置）。
+ *   两个开关**必须互相独立**（2026-10-07 修：早先 ⑥ 与「参数设置」共用一个状态，
+ *   展开 ⑥ 会把页面最底部的整块参数区一起摊开）。
+ * 桩 React 不会点按钮，所以展开态是**直接往 hook 槽位里种**（见下 slots 表）。
  * `openLlm=false` 用来验证「⑦ 收起时统计照样在」——⑦ 自身也有一个折叠按钮。 */
 const STABLE_PASSES = 8;
-async function render(openAdvanced = false, openLlm = true) {
+async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   const panelKey = [...hookStore.keys()].find((key) => key.startsWith('root<PanelBoundary>.0<Panel>#'));
   if (panelKey === undefined) {
     check('面板的 hook 槽位存在（展开态可渲染）', false, '找不到 Panel 的 hook 槽位');
@@ -388,28 +391,33 @@ async function render(openAdvanced = false, openLlm = true) {
   }
   const base = panelKey.slice(0, panelKey.lastIndexOf('#'));
   /* 把面板自己的所有 hook 槽位重置成初始值（= 一组全新的 useState），
-   * 再按需要种 `openAdvanced` / `openLlm`。**不要清空整个 hookStore** —— 别的组件的
-   * 槽位（会话内按钮 / 结果块）不受影响。
+   * 再按需要种 `openAdvanced` / `openDiag` / `openLlm`。**不要清空整个 hookStore** ——
+   * 别的组件的槽位（会话内按钮 / 结果块）不受影响。
    *
    * 槽位顺序就是 Panel 里 `React.useState` 的出现顺序：
-   *   0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced …
+   *   0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced · 6 openDiag …
    * 其中 `detail`（记忆明细）在真机上只有 `loadBlocks()` 成功返回才会是完整对象，
    * 桩渲染里可能残留半成品 → 一并清成 null，让两次渲染都走"没有明细"的正常路径。 */
-  const initialSlots = [null, null, null, {}, null, false, true, false, null, null, null, null, null, null, null, null, true, false, '', ''];
+  const initialSlots = [null, null, null, {}, null, false, false, true, false, null, null, null, null, null, null, null, null, true, false, '', ''];
   for (const key of [...hookStore.keys()]) {
     if (key.startsWith(base)) hookStore.delete(key);
   }
   initialSlots.forEach((value, index) => hookStore.set(`${base}#${index}`, value));
   /* ⚠️ 槽位下标是**数组下标**，不是"第几个 useState"。实际顺序（与 lib/client.js 里
-   * `React.useState` 的出现顺序一致，加字段时请同步更新这张表）：
-   *   0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced · 6 openLibrary
-   *   7 confirmZero · 8 pending · 9 confirmDelete · 10 confirmTrashDelete · 11 confirmPurge
-   *   12 query · 13 search · 14 llmTest · 15 llmTestBusy · 16 openLlm · 17 error · 18 notice
-   *   19 llmProviders
-   * （off-by-one 踩过两次：把 `detail` 种成 true 会让面板去读 `detail.blocks.length` 而崩；
-   * 把 `openLlm` 的槽位号写成 6 会去改 `openLibrary`，于是"收起 ⑦"的断言形同虚设。） */
-  if (openAdvanced) hookStore.set(`${base}#5`, true);
-  hookStore.set(`${base}#16`, openLlm);
+   * `React.useState` 的出现顺序一致，加字段时请同步更新这张表）： */
+  const SLOTS = {
+    settings: 0, overview: 1, diag: 2, trash: 3, detail: 4,
+    openAdvanced: 5, openDiag: 6, openLibrary: 7, confirmZero: 8, pending: 9,
+    confirmDelete: 10, confirmTrashDelete: 11, confirmPurge: 12, query: 13, search: 14,
+    llmTest: 15, llmTestBusy: 16, openLlm: 17, error: 18, notice: 19, llmProviders: 20,
+  };
+  /* （off-by-one 踩过两次：把 `detail` 种成 true 会让面板去读 `detail.blocks.length` 而崩；
+   * 把 `openLlm` 的槽位号写成 6 会去改 `openLibrary`，于是"收起 ⑦"的断言形同虚设。
+   * 2026-10-07 拆开 ⑥ 之后新增 `openDiag`（= 6），它之后的所有槽位整体后移一位：
+   * `openLibrary` 6→7、`openLlm` 16→17、`llmProviders` 19→20 —— 上表是当前准确值。） */
+  if (openAdvanced) hookStore.set(`${base}#${SLOTS.openAdvanced}`, true);
+  if (openDiag) hookStore.set(`${base}#${SLOTS.openDiag}`, true);
+  hookStore.set(`${base}#${SLOTS.openLlm}`, openLlm);
   let out = null;
   for (let pass = 0; pass < STABLE_PASSES; pass += 1) {
     hookIndex = 0;
@@ -434,9 +442,6 @@ async function render(openAdvanced = false, openLlm = true) {
 {
   const advancedTree = await render(true);
   const advancedText = advancedTree === null ? '' : textOf(advancedTree);
-  check('参数设置展开后能看到「本会话已注入 ≈167 token（不设上限）」',
-    advancedText.includes('本会话已注入 ≈167 token（不设上限）'),
-    '注入计数没渲染出来 —— 面板读的字段名可能与 routes.js 返回的不一致');
   check('参数设置展开后不再出现「额度：N / M」「已用尽」这类已删除的额度文案',
     !advancedText.includes('额度：') && !advancedText.includes('已用尽') && !advancedText.includes('额度已关闭'),
     '累计上限已删除，面板不应再显示额度/用尽提示');
@@ -473,7 +478,6 @@ async function render(openAdvanced = false, openLlm = true) {
     ['trashEnabled 删除先进回收站', '删除先进回收站'],
     ['trashAutoPurgeEnabled 回收站自动清空', '回收站自动清空'],
     ['trashAutoPurgeDays 回收站保留天数', '回收站保留天数'],
-    ['storeDir 记忆目录', '记忆目录'],
     ['llmIngestTimeoutMs 入库调用超时', '入库调用超时'],
     ['llmIngestBatchBlocks 每批块数', '每批块数'],
     ['llmIngestBlockChars 每块送多少字符', '每块送多少字符'],
@@ -488,15 +492,53 @@ async function render(openAdvanced = false, openLlm = true) {
   // 这两句以前写在界面上当"设计论证"，精简后仍应保留**可操作的事实**（该去哪个菜单改）。
   check('参数设置展开后仍说明"思考强度去哪设"', advancedText.includes('到「设置 → 模型」里对该型号设置'),
     '用户会来问"推理强度怎么调不动"，这句是唯一的路标');
-  check('参数设置展开后仍显示路径信息（全局数据目录 / 设置文件）',
-    advancedText.includes('全局数据目录：') && advancedText.includes('设置文件：'),
-    '排障需要真实路径，不能只剩抽象说明');
   /* 顶部文案 2026-10-07 按用户钦定版改写后**删掉了"不联网"**：
    * 这条事实改由 ⑦ 展开态的隐私提示承担 —— 它必须仍在，因为它是市场审查要看的边界声明。
    * （断言写在展开态里：那句话本来就只随 ⑦ 展开显示。） */
   check('⑦ 展开态仍有边界声明（不访问互联网 / 不自己连网 / 不存密钥）',
     advancedText.includes('不访问互联网') && advancedText.includes('不自己连网') && advancedText.includes('不存密钥'),
     '顶部已不再写"不联网"，这条事实必须在 ⑦ 的隐私提示里仍然可见');
+  /* 两个开关**必须互相独立**：展开「参数设置」不该把 ⑥ 的诊断内容一起摊开 */
+  check('展开「参数设置」不会连带展开 ⑥ 的诊断内容（本会话已注入 / 全局数据目录 / 恢复默认设置）',
+    !advancedText.includes('本会话已注入') && !advancedText.includes('全局数据目录：') && !advancedText.includes('恢复默认设置'),
+    '参数设置只该管它自己那一块');
+}
+
+/* ── 断言：⑥「诊断与路径」有**自己的**展开开关（2026-10-07 修）───────────────
+ * 修的是什么：早先 ⑥ 的「展开」和顶部「参数设置」共用 `openAdvanced`，
+ * 点 ⑥ 的展开会把页面最底部的整块参数区一起摊开（用户：反直觉）。
+ * 这里的几条断言就是"两个状态真的分开了"的守卫：
+ *   · ⑥ 展开 → 它自己的内容（排障行 / 打分日志 / 记忆目录 / 全局数据目录 / 恢复默认设置）都在；
+ *   · ⑥ 展开 → 参数设置的调参项一个都不出现；
+ *   · 默认态（两个都收起）→ 两边的内容都不出现。 */
+{
+  const diagTree = await render(false, true, true);
+  const diagText = diagTree === null ? '' : textOf(diagTree);
+  check('⑥ 展开后能看到「本会话已注入 ≈167 token（不设上限）」',
+    diagText.includes('本会话已注入 ≈167 token（不设上限）'),
+    '注入计数没渲染出来 —— 面板读的字段名可能与 routes.js 返回的不一致');
+  check('⑥ 展开后能看到本进程排障行（命中 / 未命中 / 估算注入）',
+    diagText.includes('本进程：命中'), '找不到 ⑥ 的排障行');
+  check('⑥ 展开后仍显示路径信息（全局数据目录 / 设置文件）',
+    diagText.includes('全局数据目录：') && diagText.includes('设置文件：'),
+    '排障需要真实路径，不能只剩抽象说明');
+  check('⑥ 展开后有 storeDir「记忆目录」输入框与「恢复默认设置」按钮',
+    diagText.includes('记忆目录') && diagText.includes('恢复默认设置'),
+    '这两项属于 ⑥（诊断与路径），不该跟着「参数设置」走');
+  check('⑥ 展开后有「写打分日志」与「启动时回填」两个开关',
+    diagText.includes('写打分日志') && diagText.includes('启动时回填'),
+    '找不到 ⑥ 的两个开关');
+  /* 反向守卫：⑥ 的展开**不许**把参数区摊开（这正是这次修掉的那个反直觉行为）。
+   * 判据只挑**「参数设置」独有**的文案：⑦ 的「调用参数」区（入库调用超时 / 每批块数 /
+   * 单次输出上限…）不受 `openAdvanced` 控制，用它当判据会误报。 */
+  check('⑥ 展开不会连带展开「参数设置」（调参项一个都不出现）',
+    !diagText.includes('命中阈值') && !diagText.includes('单轮注入上限') && !diagText.includes('单轮最多条数')
+    && !diagText.includes('每条最大字符') && !diagText.includes('入库冷却') && !diagText.includes('回收站自动清空'),
+    '⑥ 只该管它自己那一块：顶部「参数设置」由它自己的按钮控制');
+  /* 默认态：两个开关都收起时，两边的内容都不该出现 */
+  check('默认态（两个都收起）⑥ 的内容不出现',
+    !text.includes('本会话已注入') && !text.includes('全局数据目录：') && !text.includes('恢复默认设置'),
+    '⑥ 默认是收起的');
 }
 
 /* ── 断言：⑦ 自身收起时，调用统计照样在（2026-10-07 车回首屏的那一行）──────

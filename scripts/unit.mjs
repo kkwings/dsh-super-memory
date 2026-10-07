@@ -21,7 +21,7 @@ import {
 import { conversationTurns, rawRecords, summaryRecords } from '../lib/ingest.js';
 import { MemoryIndex, localTopScore, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
-import { formatRecall, questionTextOf, queryTextOf } from '../lib/recall.js';
+import { formatRecall, itemText, questionTextOf, queryTextOf, selectFreshHits } from '../lib/recall.js';
 import { mergeUsage } from '../lib/llm.js';
 import { STRONG_HIT_RATIO, strongHitScore } from '../lib/routes.js';
 import { shouldExpand } from '../lib/host.js';
@@ -315,7 +315,100 @@ console.log('\n=== 11. 「强命中跳过改写」的门槛 ===');
   check('不相关查询的最高分 < 分数线（不该跳过改写）', miss < strongHitScore(0.28), `实际最高分=${miss.toFixed(3)}`);
 }
 
+console.log('\n=== 12. 同一轮里不注入近重复的块（真实浪费：约 195 token/轮）===');
+{
+  // 真实场景（2026-10-07 实测）：库里同名标题「Primary Request and Intent」有 7 块，
+  // 两两 full Jaccard 0.628~0.996 —— 远超 0.6 的阈值。原有去重只比对"本进程已经注入过的
+  // 完整正文"，于是**库里本就近重复的多块在同一轮被一起选中**时没人管（约 195 token/轮）。
+  // 这一节就是那个场景的最小复现，`selectFreshHits` 是宿主 `runRecall` 真正调用的那个函数。
+  const base = '结论：跨压缩记忆插件必须在同一会话被压缩多次之后，仍能检索到早先定过的结论并作为参考注入，'
+    + '未命中时一分 token 都不花，命中时单轮注入不超过 500 token，每条不超过 300 字符。';
+  /** 造一批"彼此近重复"的块。 */
+  const make = (title, text, compactionId) => makeRecord({ layer: 'summary', title, text, compactionId });
+  /** 一段**互不重复**的中文填充（字都不重样 → bigram 也都不重样，用来精确控制相似度）。 */
+  const filler = (start, count) => Array.from({ length: count }, (_, i) => String.fromCharCode(start + i)).join('');
+  /** 走一遍真实管线：检索 → 同轮筛选 → 拼装（两处的 maxCharsPerItem 必须同口径）。 */
+  const recall = (records, query, options = {}) => {
+    const maxChars = options.maxCharsPerItem ?? 300;
+    const pairs = new MemoryIndex(records).search(query, { limit: 6 });
+    const ranked = pairs.map((hit) => ({ ...hit, fp: String(hit.record.fp ?? '') }))
+      .sort((a, b) => b.score - a.score);
+    const selected = selectFreshHits(ranked, {
+      dedupe: options.dedupe !== false,
+      maxCharsPerItem: maxChars,
+      injectedFps: options.injectedFps ?? new Set(),
+      injectedTexts: options.injectedTexts ?? [],
+    });
+    return { built: formatRecall(selected.fresh, { maxItems: 2, maxCharsPerItem: maxChars, maxTokensPerTurn: 500 }), selected, ranked };
+  };
+
+  // ① 三块近似（标题不同、正文几乎一样）→ 只注入 1 条（改前：分数接近就会注入 2 条）
+  const sameBody = [
+    make('压缩策略与成本', `${base}（第 1 次压缩留下的副本）`, 'c1'),
+    make('注入预算与阈值', `${base}（第 2 次压缩留下的副本）`, 'c2'),
+    make('检索与注入口径', `${base}（第 3 次压缩留下的副本）`, 'c3'),
+  ];
+  const round1 = recall(sameBody, '跨压缩记忆插件要做到什么');
+  check('三块近似都被检索到（前提成立）', round1.ranked.length >= 2, `实际候选=${round1.ranked.length}`);
+  eq('同一轮里只注入 1 条（近重复被互相去重）', round1.built.items, 1);
+  eq('保留的是分数最高的那条', round1.selected.fresh[0].fp, round1.ranked[0].fp);
+  check('被丢掉的以 near-duplicate 记因', round1.selected.dropped.every((item) => item.reason === 'near-duplicate'),
+    JSON.stringify(round1.selected.dropped));
+  const before1 = formatRecall(round1.ranked, { maxItems: 2, maxCharsPerItem: 300, maxTokensPerTurn: 500 });
+  check('（对照）不做同轮去重时确实是 2 条 —— 证明这条断言不是白写的', before1.items === 2, `实际=${before1.items}`);
+
+  // ② 指纹不同、正文相似度不到 0.6，但**截断后的那一行几乎一样** → 也只注入 1 条。
+  //    这正是 scripts/selftest.mjs 的注入样例里"两条一模一样的行"的来历（那两条逐字相同，
+  //    却因为指纹不同、完整正文不同而谁都挡不住，白白多喂约 100 token）。
+  //    每条截到 160 字符：两条加起来仍在 500 token 的单轮预算内，否则预算本身就会先砍掉第二条。
+  const lineCap = 160;
+  const head = ('问：你前面帮我做的测试页面有点几年前的小米的视觉风格，你可以参考一下我这几张截图 — 先重写页面：'
+    + '页面已重写为手机 App / 小程序风格。我尝试再用无头浏览器生成效果图（上次被环境拦截，这次换 --no-sandbox）：'
+    + '仍在环境层被拦截（码 13），无头渲染子进程无法在受限沙箱内启动，这是环境限制，我放弃自动出图。').repeat(2).slice(0, 280);
+  const linePair = [
+    make('页面重做', `${head}${filler(0x4e00, 300)}`, 'c1'),
+    make('视觉风格', `${head}${filler(0x5e00, 300)}`, 'c2'),
+  ];
+  const lineA = linePair[0];
+  const lineB = linePair[1];
+  const lineSim = jaccard(tokenSet(itemText(lineA, lineCap)), tokenSet(itemText(lineB, lineCap)));
+  const bodySim = jaccard(tokenSet(lineA.text), tokenSet(lineB.text));
+  check('两块正文相似度 < 0.6（标题规则与正文规则都挡不住）', bodySim < 0.6, `正文相似=${bodySim.toFixed(3)}`);
+  check('两块"会被注入的那一行"≥ 0.6（只有行口径能挡）', lineSim >= 0.6, `行相似=${lineSim.toFixed(3)}`);
+  const round2 = recall(linePair, '测试页面视觉风格', { maxCharsPerItem: lineCap });
+  check('两块都被检索到（前提成立）', round2.ranked.length >= 2, `实际候选=${round2.ranked.length}`);
+  eq('截断后几乎一样的两条只注入 1 条', round2.built.items, 1);
+  const before2 = formatRecall(round2.ranked, { maxItems: 2, maxCharsPerItem: lineCap, maxTokensPerTurn: 500 });
+  check('（对照）不做同轮去重时是 2 条、白花一大截 token',
+    before2.items === 2 && before2.tokens > round2.built.tokens,
+    `改前 ${before2.items} 条 ≈${before2.tokens} token / 改后 ${round2.built.items} 条 ≈${round2.built.tokens} token`);
+
+  // ③ 真的是"不同的块"时必须照旧注入 2 条（不能把去重写成"每轮只留一条"）
+  const distinct = [
+    make('命中阈值标定', '结论：命中阈值定为 0.28，因为相关与不相关的分数分得很开，实测能分开。', 'c1'),
+    make('入库口径', '结论：思考过程永不入库，工具结果只收只读类工具的结果原文，带白名单与两级上限。', 'c2'),
+  ];
+  const round3 = recall(distinct, '命中阈值和入库口径分别是怎么定的');
+  eq('内容不同的两块照旧各注入一条', round3.built.items, 2);
+
+  // ④ injectedTexts 必须存**真正注入的那一行**（截断后），不是完整正文
+  const longBody = `${base}${filler(0x4e00, 3000)}`;
+  const longRound = recall([make('长块', longBody, 'c1')], '跨压缩记忆插件要做到什么', { maxCharsPerItem: 300 });
+  const stored = longRound.selected.fresh[0].tokens;
+  const fullBody = tokenSet(longBody);
+  check('入队的是那一行（≤ 300 字符量级）', stored.size <= 320, `行 token=${stored.size}`);
+  check('不再是完整正文（6000 字符的块：正文 token 数量级大得多）', fullBody.size >= 2500, `正文 token=${fullBody.size}`);
+  check('两者口径确实不同（这就是"存正文、注入截断文本"的 bug）',
+    jaccard(stored, fullBody) < 0.6, `相似度=${jaccard(stored, fullBody).toFixed(3)}`);
+  check('宿主登记的是 built.lines（逐条真正注入的文本）',
+    Array.isArray(longRound.built.lines) && longRound.built.lines.length === longRound.built.items
+    && String(longRound.built.lines[0]).startsWith('- ') && String(longRound.built.text).includes(longRound.built.lines[0]),
+    `lines=${JSON.stringify(longRound.built.lines)}`);
+  eq('fps 与 lines 一一对应', longRound.built.fps.length, longRound.built.lines.length);
+}
+
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);
+
 if (failures.length > 0) {
   console.log('失败明细：');
   for (const item of failures) console.log(`  - ${item}`);
