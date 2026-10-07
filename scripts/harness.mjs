@@ -29,8 +29,9 @@ const { toolRecords } = await import('../lib/ingest.js');
 const behavior = { mode: 'off', calls: 0 };
 const fakeLlm = {
   async listProviders() { return [{ provider: 'fake-provider', model: 'fake-model' }]; },
-  async *stream() {
+  async *stream(input) {
     behavior.calls += 1;
+    behavior.lastInput = input;
     if (behavior.mode === 'hang') { await new Promise((resolve) => setTimeout(resolve, 3000)); return; }
     if (behavior.mode === 'no-adapter') {
       yield { type: 'finish', kind: 'error', failure: { code: 'NO_ADAPTER', message: '提供方未注册' } };
@@ -323,9 +324,9 @@ await put({ compactionRecapMaxTokens: 0 });
 await probe('总览上限调 0');
 await put({ compactionRecapMaxTokens: 300, maxTokensPerTurn: 0 });
 await probe('单轮上限调 0');
-await put({ maxTokensPerTurn: 500, sessionBudgetRatio: 0 });
-await probe('会话累计上限调 0（应为 0）');
-await put({ sessionBudgetRatio: 0.02 });
+await put({ maxTokensPerTurn: 500 });
+// 「会话累计上限」(sessionBudgetRatio) 已按用户决定删除：不再有"累计用尽就停止注入"
+// 这条路，注入量只受**单次**口径约束（上面三条探针就是全部闸门）。
 
 console.log('\n=== 成本上限在注入文本上的实际效果（走 /search）===');
 const capProbe = async (label, patch) => {
@@ -380,6 +381,121 @@ const audit = await call('GET', `/api/dsh-super-memory/audit?workspace=${encodeU
 console.log('GET /audit →', audit.status, audit.body.value.entries.map((e) => e.action).join(', '));
 const outside = await call('POST', '/api/dsh-super-memory/delete', { workspace: 'C:\\Windows', session: 'x', confirm: true });
 console.log('越界工作区 delete →', outside.status, outside.body.error?.code ?? '');
+
+/* ── ④c 工作区自动识别：插件刚重启、body.workspace 为空时从**会话日志**读 cwd ──
+ *
+ * 用户实测场景：重启 DSH 后点 ✕ 报"未知工作区（先随便发一条消息）" —— 因为进程内
+ * 还没有任何会话状态，面板拿不到工作区。修法是宿主自己从会话日志读 cwd 并登记为已知工作区。
+ * 这里造两份真实布局的日志：
+ *   A) 首行是 v4 会话头、带顶层 cwd   → 必须解析成功（不再 403）
+ *   B) 首行没有 cwd（旧格式/缺字段） → 必须仍然 403，且提示要说清"日志里读不到 cwd"
+ * 另外钉死安全边界：兜底值**只能**来自会话日志，请求体里的任意路径绝不能被采信。 */
+{
+  let smokePassed = 0;
+  let smokeFailed = 0;
+  const expect = (label, condition, detail = '') => {
+    if (condition) { smokePassed += 1; console.log(`  ✓ ${label}`); return; }
+    smokeFailed += 1; process.exitCode = 1;
+    console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
+  };
+  console.log('\n=== ④c 工作区自动识别（重启后点 ✕ 不再因"未知工作区"失败）===');
+
+  const sessionsRoot = path.join(home, 'sessions');
+  // **必须用一个本次进程从没见过的目录当 cwd**：否则 workdir 早就在 knownWorkspaces 里，
+  // "解析成功"什么都证明不了（实测踩过：最初用 workdir 当 cwd，把"不登记 cwd"的旧行为
+  // 注入回去之后这些断言照样全绿 —— 等于白测）。
+  const probeWorkspace = path.join(os.tmpdir(), `dsm-probe-workspace-${process.pid}-${Date.now()}`);
+  const makeLog = (id, header) => {
+    const dir = path.join(sessionsRoot, '--probe--', id);
+    fs.mkdirSync(dir, { recursive: true });
+    const lines = [
+      JSON.stringify(header),
+      JSON.stringify({
+        type: 'user/message', seq: 1, time: Date.now(),
+        data: { content: [{ type: 'text', text: '跨压缩记忆怎么装' }], source: { kind: 'user' } },
+      }),
+    ];
+    fs.writeFileSync(path.join(dir, 'session.jsonl'), `${lines.join('\n')}\n`, 'utf8');
+    return id;
+  };
+  const withCwd = makeLog(`session-restart-probe-${process.pid}`, {
+    type: 'session', version: 4, id: `session-restart-probe-${process.pid}`, createdAt: Date.now(), cwd: probeWorkspace,
+  });
+  const withoutCwd = makeLog(`session-no-cwd-probe-${process.pid}`, {
+    type: 'session', version: 3, id: `session-no-cwd-probe-${process.pid}`, createdAt: Date.now(),
+  });
+  console.log(`  造了两份日志：${withCwd}（cwd=${probeWorkspace}）/ ${withoutCwd}（无 cwd）`);
+
+  // ⓪ 基线：这个 cwd 现在**确实未知** —— 不先证明这一点，后面"解析成功"就是空测
+  const baseline = await call('GET', `/api/dsh-super-memory/trash?workspace=${encodeURIComponent(probeWorkspace)}`);
+  expect('基线：该 cwd 在本次进程里确实是未知工作区', baseline.status === 403, `实际 HTTP ${baseline.status}`);
+
+  // ① 带 cwd + workspace 为空 → 必须成功
+  const diagnose = await call('POST', '/api/dsh-super-memory/diagnose', { workspace: '', session: withCwd, query: '跨压缩记忆怎么装', limit: 3 });
+  expect('workspace 为空但日志里有 cwd → /diagnose 不再 403', diagnose.status === 200, `实际 HTTP ${diagnose.status} ${diagnose.body?.error?.message ?? ''}`);
+
+  // ② 记忆目录必须落在**正确的工作区**下（不是别的目录、更不是请求体里的路径）
+  const trashRoute = await call('GET', `/api/dsh-super-memory/trash?session=${encodeURIComponent(withCwd)}`);
+  const expectedRoot = path.join(probeWorkspace, '.dsh-compaction-memory');
+  expect('兜底解析出的工作区 = 会话日志里的 cwd', trashRoute.body?.value?.workspace === probeWorkspace, `实际=${trashRoute.body?.value?.workspace}`);
+  expect('记忆目录落在该工作区下', trashRoute.body?.value?.root === expectedRoot, `实际=${trashRoute.body?.value?.root}`);
+
+  // ③ 一致性：同一条兜底口径对其它需要 workspace 的路由也生效
+  const sessionRoute = await call('GET', `/api/dsh-super-memory/session?session=${encodeURIComponent(withCwd)}`);
+  expect('同一条兜底口径对 /session 也生效', sessionRoute.status === 200 && sessionRoute.body?.value?.workspace === probeWorkspace, `实际 HTTP ${sessionRoute.status}`);
+
+  // ④ 安全边界：请求体里塞一个未知路径，解析结果必须仍是**会话日志里的 cwd**
+  const spoofed = await call('GET', `/api/dsh-super-memory/trash?workspace=${encodeURIComponent('C:\\Windows')}&session=${encodeURIComponent(withCwd)}`);
+  expect('请求体里的任意路径不被采信（仍解析到会话 cwd）', spoofed.status === 200 && spoofed.body?.value?.workspace === probeWorkspace, `实际 HTTP ${spoofed.status} / ${spoofed.body?.value?.workspace}`);
+
+  // ⑤ 日志里也读不到 cwd → 仍然 403，且提示要明确
+  const noCwd = await call('POST', '/api/dsh-super-memory/diagnose', { workspace: '', session: withoutCwd, query: '跨压缩记忆怎么装', limit: 3 });
+  expect('日志里读不到 cwd → 仍然 403', noCwd.status === 403, `实际 HTTP ${noCwd.status}`);
+  expect('403 的提示说清了原因（读不到 cwd）', String(noCwd.body?.error?.message ?? '').includes('cwd'), `实际=${noCwd.body?.error?.message ?? ''}`);
+  const noSession = await call('POST', '/api/dsh-super-memory/diagnose', { workspace: '', query: '跨压缩记忆怎么装', limit: 3 });
+  expect('连 session 都没有 → 仍然 403（不猜工作区）', noSession.status === 403, `实际 HTTP ${noSession.status}`);
+
+  // ⑥ 登记范围与既有机制一致：登记过的 cwd 立刻出现在 /overview 的工作区清单里
+  const overviewAfter = await call('GET', '/api/dsh-super-memory/overview');
+  expect('/overview 的工作区清单里出现了这个 cwd（与会话内登记同一条路）',
+    (overviewAfter.body?.value?.workspaces ?? []).some((item) => item.workspace === probeWorkspace),
+    `实际=${(overviewAfter.body?.value?.workspaces ?? []).map((item) => item.workspace).join(' | ')}`);
+
+  console.log(`  工作区自动识别：通过 ${smokePassed} 条，失败 ${smokeFailed} 条。`);
+  const workspaceChecks = smokePassed;
+
+  /* ── ④d 思考强度：插件不指定、也不继承 ─────────────────────────────────
+   * 用户决定（2026-10-07）：插件不再有"思考强度"这个概念，设置键 `llmReasoningEffort` 已删除，
+   * 要调就去 DSH 官方「设置 → 模型」页调。而主对话的 `request/header.config.reasoningEffort`
+   * 就明晃晃躺在会话事件里（实测本机每份日志都是 `"reasoningEffort":"max"`），
+   * 历史上正是这里误继承过 → 辅助调用又慢又贵。所以下面**必须**用"路线来自会话事件"的
+   * 那条路径来验（不显式配 provider/model），否则测不到继承。 */
+  console.log('\n=== ④d 思考强度：插件不指定、也不继承 ===');
+  const inheritProbe = makeLog(`session-reasoning-probe-${process.pid}`, {
+    type: 'session', version: 4, id: `session-reasoning-probe-${process.pid}`, createdAt: Date.now(), cwd: workdir,
+  });
+  // 往这份日志里补一条真实的 request/header（带主对话的 reasoningEffort: max）
+  fs.appendFileSync(path.join(sessionsRoot, '--probe--', inheritProbe, 'session.jsonl'), `${JSON.stringify({
+    type: 'request/header', seq: 2, time: Date.now(),
+    data: { header: { config: { provider: 'fake-provider', model: 'fake-model', reasoningEffort: 'max', maxTokens: 256000 } } },
+  })}\n`, 'utf8');
+
+  await put({ llmAssistEnabled: true, llmIngestProvider: '', llmIngestModel: '', llmIngestTimeoutMs: 3000 });
+  behavior.mode = 'ok';
+  behavior.lastInput = null;
+  const inherited = await call('POST', '/api/dsh-super-memory/llm/test', { session: inheritProbe });
+  expect('路线跟随会话事件时，测试连接仍走通', inherited.status === 200 && inherited.body?.value?.ok === true, `实际 HTTP ${inherited.status} ${JSON.stringify(inherited.body?.value ?? inherited.body?.error)}`);
+  expect('主对话的 reasoningEffort=max 没有被继承', behavior.lastInput !== null && !('reasoningEffort' in behavior.lastInput), `实际键=${behavior.lastInput === null ? '(没调用)' : Object.keys(behavior.lastInput).join(',')}`);
+  expect('整个调用参数里搜不到 reasoningEffort', behavior.lastInput !== null && !JSON.stringify(behavior.lastInput).includes('reasoningEffort'));
+  expect('解析出的路线里也不带 reasoningEffort（连留痕都不留这个字段）', !JSON.stringify(inherited.body?.value?.route ?? {}).includes('reasoningEffort'), `实际 route=${JSON.stringify(inherited.body?.value?.route ?? null)}`);
+
+  behavior.lastInput = null;
+  await put({ llmIngestProvider: 'fake-provider', llmIngestModel: 'fake-model' });
+  const explicit = await call('POST', '/api/dsh-super-memory/llm/test', { provider: 'fake-provider', model: 'fake-model', session: inheritProbe });
+  expect('显式配了提供方/型号时也不传 reasoningEffort', explicit.status === 200 && behavior.lastInput !== null && !('reasoningEffort' in behavior.lastInput));
+  await put({ llmAssistEnabled: false, llmIngestProvider: '', llmIngestModel: '' });
+  console.log(`  ④ 段累计：通过 ${smokePassed} 条，失败 ${smokeFailed} 条（其中工作区自动识别 ${workspaceChecks} 条、思考强度 ${smokePassed - workspaceChecks} 条）。`);
+}
 
 console.log('\n=== ⑤ history_read（只在用户明确要求查原文时用）===');
 const tool = ctx._tools.get('history_read');

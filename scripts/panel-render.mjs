@@ -85,14 +85,14 @@ const settingsPayload = {
       enabled: true, injectRecap: true, injectRecall: true, ingestSummary: true, ingestRawText: true,
       includeToolResults: true, toolResultNames: 'read, grep', toolResultMaxChars: 4000, toolResultBudgetChars: 120000,
       compactionRecapMaxTokens: 300, maxTokensPerTurn: 500, maxItems: 2, maxCharsPerItem: 300,
-      sessionBudgetRatio: 0.02, recapPersist: true, stickyRecall: true, minScore: 0.28, dedupe: true,
+      recapPersist: true, stickyRecall: true, minScore: 0.28, dedupe: true,
       observationTurns: 3, cooldownTurns: 1, preferSummaryChunks: true, storeDir: '.dsh-compaction-memory',
       trashEnabled: true, protectRecentDays: 7, trashAutoPurgeEnabled: true, trashAutoPurgeDays: 7,
       logScores: true, backfillOnStart: true, includePrune: false, maxRawCharsPerCompaction: 400000,
       llmAssistEnabled: true, llmIngestExpand: true, llmIngestProvider: '', llmIngestModel: '',
-      llmIngestTimeoutMs: 8000, llmIngestBatchBlocks: 5, llmIngestMaxTokens: 600,
+      llmIngestTimeoutMs: 8000, llmIngestBatchBlocks: 5, llmIngestBlockChars: 600, llmIngestMaxTokens: 300,
       llmRecallRewrite: true, llmRecallRerank: false, llmRecallProvider: '', llmRecallModel: '',
-      llmRecallTimeoutMs: 4000, llmDailyCallCap: 200, llmCacheEnabled: true,
+      llmRecallTimeoutMs: 4000, llmRewriteMaxTokens: 120, llmDailyCallCap: 0, llmCacheEnabled: true,
     },
   },
 };
@@ -122,7 +122,9 @@ const overviewPayload = {
     runtime: [{
       sessionId: 'session-d7e61f90-e491-45ad-9378-0b6fc158ca15', workspace: 'E:\\软件\\DeepSeek Harness',
       root: 'E:\\软件\\DeepSeek Harness\\.dsh-compaction-memory', hits: 0, misses: 2,
-      injectedTokensEst: 167, knownCompactions: 2, budgetTokens: 20000, budgetUsedTokens: 167, budgetOff: false, budgetExhausted: false,
+      // 上限字段（budgetTokens / budgetUsedTokens / budgetOff / budgetExhausted）随
+      // 「会话累计上限」的删除一起消失；现在只报"本会话已注入 ≈N token"这一个计数器。
+      injectedTokens: 167, injectedTokensEst: 167, knownCompactions: 2,
     }],
   },
 };
@@ -265,6 +267,39 @@ check('⑦ 不再出现两套字段（入库用 / 检索用）', !text.includes(
   '把实现结构暴露成用户决策是设计错误：用户只需回答"要不要调用大模型"');
 check('⑦ 三种选择都在', text.includes('不调用大模型') && text.includes('调用主模型') && text.includes('调用指定模型'),
   '三选一：不调用 / 主模型 / 指定模型');
+
+/* ── ⑥ 展开后的内容：需要把 `openAdvanced` 打开才看得到 ──────────────────
+ * 桩 React 不会点按钮，所以这里**直接往 hook 槽位里种**（就等于用户点了「展开」）。
+ * 目的：锁住「本会话已注入 ≈N token」这条**纯计数展示**真的渲染出来 —— 累计上限删除后，
+ * 注入量不再参与任何判定，但用户仍必须看得到它（否则成本反馈就彻底没了）。
+ * 这一步同时验证 fixture 里的字段名与面板读的字段名一致（`injectedTokens`）。 */
+let advancedText = '';
+{
+  const panelKey = [...hookStore.keys()].find((key) => key.startsWith('root<PanelBoundary>.0<Panel>#'));
+  if (panelKey === undefined) {
+    check('⑥ 展开态可渲染（找到 Panel 的 hook 槽位）', false, '找不到 Panel 的 hook 槽位');
+  } else {
+    // `openAdvanced` 是 Panel 里第 6 个 useState（下标 5；见 client.js 的 hooks 顺序）。
+    hookStore.set(`${panelKey.slice(0, panelKey.lastIndexOf('#'))}#5`, true);
+    let advanced = null;
+    for (let pass = 0; pass < 4; pass += 1) {
+      hookIndex = 0;
+      currentComponent = 'root';
+      pendingUpdate = false;
+      advanced = resolveTree(renderPanel({}));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (!pendingUpdate) break;
+    }
+    advancedText = textOf(advanced);
+    check('⑥ 展开后能看到「本会话已注入 ≈167 token（不设上限）」',
+      advancedText.includes('本会话已注入 ≈167 token（不设上限）'),
+      '注入计数没渲染出来 —— 面板读的字段名可能与 routes.js 返回的不一致');
+    check('⑥ 展开后不再出现「额度：N / M」「已用尽」这类已删除的额度文案',
+      !advancedText.includes('额度：') && !advancedText.includes('已用尽') && !advancedText.includes('额度已关闭'),
+      '累计上限已删除，面板不应再显示额度/用尽提示');
+    check('⑥ 展开后仍显示本进程注入估算', advancedText.includes('估算注入'), '找不到「估算注入」');
+  }
+}
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
 

@@ -163,12 +163,24 @@ console.log('\n=== 3. 检索与注入上限 ===');
   check('阈值放低后能命中', gated.tier !== 'none', `tier=${gated.tier} top=${gated.topScore}`);
   const strict = retrieveTwoTier(index, '明天北京天气预报怎么样', { minScore: 0.28, maxItems: 2 });
   eq('不相关问题在默认阈值下不命中', strict.tier, 'none');
-  const built = formatRecall(gated.hits.length > 0 ? gated.hits : ranked, { maxItems: 1, maxCharsPerItem: 40, maxTokensPerTurn: 500 });
+  const built = formatRecall(gated.hits.length > 0 ? gated.hits : ranked, { maxItems: 1, maxCharsPerItem: 60, maxTokensPerTurn: 500 });
   check('注入条数受 maxItems 约束', built.items <= 1, `实际=${built.items}`);
   const line = built.text.split('\n').find((l) => l.startsWith('- ')) ?? '';
-  check('每条正文受 maxCharsPerItem 约束', line.length - 2 <= 40, `实际=${line.length - 2}`);
+  check('每条正文受 maxCharsPerItem 约束', line.length - 2 <= 60, `实际=${line.length - 2}`);
   check('总注入受 maxTokensPerTurn 约束', built.tokens <= 500, `实际=${built.tokens}`);
   eq('无可注入内容 → 空串（0 token）', formatRecall([], { maxItems: 2, maxCharsPerItem: 300, maxTokensPerTurn: 500 }).text, '');
+  // 单条下限 50（2026-10-07 用户决定：20 字符装不下一句结论，纯浪费 token）。
+  // 三条口径必须一致：recall.js 的 Math.max、config.js INTEGER_FIELDS 的 minimum、面板 NumberRow 的 min。
+  const floored = formatRecall(
+    [{ record: makeRecord({ layer: 'summary', title: '下限探针', text: '结'.repeat(200), compactionId: 'c1' }) }],
+    { maxItems: 1, maxCharsPerItem: 20, maxTokensPerTurn: 500 },
+  );
+  const flooredLine = floored.text.split('\n').find((l) => l.startsWith('- ')) ?? '';
+  eq('maxCharsPerItem 传 20 也被抬到 50（不再有 20 字符的注入）', flooredLine.length - 2, 50);
+  eq('validatePatch 拒绝 40（与下限一致，避免"能改但不生效"）', typeof validatePatch({ maxCharsPerItem: 40 }, DEFAULTS), 'string');
+  eq('validatePatch 接受 50', validatePatch({ maxCharsPerItem: 50 }, DEFAULTS), undefined);
+  eq('normalizeSettings 把设置文件里的 40 夹到 50', normalizeSettings({ maxCharsPerItem: 40 }, DEFAULTS).maxCharsPerItem, 50);
+  eq('默认值仍是 300', DEFAULTS.maxCharsPerItem, 300);
 }
 
 console.log('\n=== 4. 总览（可为 0）===');

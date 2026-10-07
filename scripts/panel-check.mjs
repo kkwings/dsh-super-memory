@@ -88,19 +88,27 @@ for (const no of ['①', '②', '③']) {
 }
 
 /* ⑤ 源码级回归：数字框精度
- * 曾经真实出过的 bug：NumberRow 无条件 Math.floor(parsed)，于是「命中阈值 0.28」与
- * 「会话累计上限 0.02」只要点进输入框再点走就被抹成 0（阈值归零→每轮都注入；
- * 上限归零→整条注入通路被关掉，而用户看不出发生了什么）。这里守住这条路径。 */
+ * 曾经真实出过的 bug：NumberRow 无条件 Math.floor(parsed)，于是「命中阈值 0.28」只要点进
+ * 输入框再点走就被抹成 0（阈值归零 → 命中判定形同关闭，几乎每轮都注入）。
+ *
+ * 守卫的**本意**是"凡是小数型设置，面板必须声明 step"——所以断言写法是"每个小数项都在"，
+ * 而不是钉死某一个键：2026-10-07 删掉了另一个小数项（会话累计上限 0.02 / step 0.005），
+ * 这里跟着改成只要求当前仅剩的小数项 `minScore`（step 0.01）。将来再加小数项，请把它的
+ * step 一并加进下面的清单——**不要**把这条断言删掉或改成恒真。 */
 console.log('\n⑤ 数字框精度（源码级回归守卫）');
 const numberRowSrc = client.slice(client.indexOf('function NumberRow'), client.indexOf('function Card'));
+const DECIMAL_FIELDS = [
+  { key: 'minScore', step: 'step: 0.01' },
+];
+const missingStep = DECIMAL_FIELDS.filter((item) => !client.includes(item.step));
 if (/let next = Math\.floor\(parsed\)/.test(numberRowSrc)) {
-  fail('NumberRow 仍在无条件取整（0.28 / 0.02 会被抹成 0）');
+  fail('NumberRow 仍在无条件取整（0.28 会被抹成 0）');
 } else if (!/decimalsOf\(|toFixed\(/.test(numberRowSrc)) {
   fail('NumberRow 没有按 step 处理小数');
-} else if (!/step: 0\.01/.test(client) || !/step: 0\.005/.test(client)) {
-  fail('小数参数没有声明 step（minScore 0.01 / sessionBudgetRatio 0.005）');
+} else if (missingStep.length > 0) {
+  fail(`小数参数没有声明 step：${missingStep.map((item) => `${item.key} 需要 ${item.step}`).join('、')}`);
 } else {
-  ok('NumberRow 按 step 保留小数，且两个小数参数都声明了 step');
+  ok(`NumberRow 按 step 保留小数，${DECIMAL_FIELDS.length} 个小数参数都声明了 step（${DECIMAL_FIELDS.map((item) => item.key).join('、')}）`);
 }
 
 console.log(problems === 0 ? '\n全部通过。\n' : `\n发现 ${problems} 处问题。\n`);

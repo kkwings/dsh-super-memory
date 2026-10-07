@@ -31,6 +31,10 @@ const session = { id: sessionId, header: { cwd: workdir }, snapshotEvents: () =>
 const settings = { ...DEFAULTS };
 
 const root = storeRoot(workdir, '.dsh-compaction-memory');
+// **先清空自己的临时库**：本脚本是"把整份日志重新入库一遍"，而 `appendRecords` 只追加，
+// 于是重复运行会**累积**（实测 348 → 731 → 1041 条）—— 条数、占用、分数分布都不再可比，
+// 看起来还像"插件重复入库"的 bug。只删本脚本自己的记忆目录，绝不动会话日志。
+fs.rmSync(root, { recursive: true, force: true });
 console.log('store root:', root);
 
 let totalSummary = 0;
