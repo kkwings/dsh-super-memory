@@ -12,7 +12,6 @@
   },
   "files": [
     "lib",
-    "scripts",
     "locale",
     "cordis.patch.yml",
     "icon.svg",
