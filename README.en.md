@@ -1,101 +1,118 @@
-﻿# dsh-super-memory (Super Memory)
+# dsh-super-memory (Super Memory)
 
-A **cross-compaction memory** plugin for [DSH (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness).
+**Cross-compaction memory** for [DSH (DeepSeek Harness)](https://github.com/deepseek-ai/deepseek-harness).
 
-When one very long session has been compacted a few times, things you asked or decided earlier
-**fall out of the context window**. This plugin keeps them: it stores what a compaction drops into a
-local file, and hands it back as *reference material* exactly when a new question is related to it.
-The model sees the old decision first and reasons about it together with the new conditions —
-instead of starting from zero.
+After a very long session has been compacted a few times, things you asked or decided early on **fall out of the context window**. This plugin stores what a compaction drops on your own machine, then hands those passages back to the model **only when they are relevant** — so it can recall an earlier decision instead of starting from zero.
 
-> Scope: **cross-compaction only** (same session). No cross-session memory. Self-contained:
-> no other memory plugin, no network, no model calls.
+> Scope: **within one session, across compactions**. **Cross-session memory is out of scope.**
+> Self-contained: no other memory plugin, **no internet access**, and **zero model calls by default**.
 
-## What it does
+## What it does and does not do
+
+**Does** — three things, each with its own switch and its own cost:
 
 | # | When | What | Cost |
 | --- | --- | --- | --- |
-| ① | **On compaction** | Ingest what is being dropped into a local store: L1 summary chunks (reusing the summary DSH already generated) + L2 conversation-text chunks (user questions and assistant answers only) | **0 model calls** |
-| ② | **After compaction** | Inject a directory-level outline of "what this session was about" so the new window is not disconnected | ≤ **300 tokens**, adaptive, may be 0 |
-| ③ | **On every question** | Search the local store lexically first; inject a reference **only on a hit** | hit ≤ **500 tokens** (≤2 items, ≤300 chars each); **miss = 0 tokens** |
+| ① | **On compaction** | Ingest what is being dropped: a summary layer (reusing the summary DSH already wrote, split by section) and a raw-conversation layer (your questions + the assistant's answer text), plus **the file/search results the model read** (`read`, `grep`, `glob`, `web_fetch`, `history_read`). | **0 model calls** |
+| ② | **After compaction** | Inject a directory-level outline of "what this session was about" (topic — conclusion). Nothing worth keeping means nothing is injected. | ≤ **300 tokens per compaction**, adaptive, **may be 0** |
+| ③ | **On every question** | Score the local store first; inject a reference **only on a hit**. | hit ≤ **500 tokens/turn** (≤2 items, ≤300 chars each); **miss = 0 tokens** |
 
-Verbatim history is only read through the `history_read` tool when you explicitly ask for it.
+**Does not**:
 
-Injected blocks are labelled as *reference, not conclusion*: if a later decision contradicts an
-earlier one, the assistant is told to say "earlier it was X, now it is Z because Y" rather than
-silently switching answers.
+- **No cross-session memory.** A different session has a different store (memory lives per workspace + session id).
+- **Cannot send messages for you.** The plugin's session handle has **no append capability** (verified platform boundary). It can only queue material into your **next** turn — it cannot make the main model answer again immediately.
+- **Never rewrites your conversation, never writes to DSH's native session logs** (read-only), **never reads or stores API keys**.
 
-## Where data lives
+## Two ways to retrieve (the first one is the default)
 
-**All memory content stays inside the session's own workspace**, so projects are isolated and the
-system drive is untouched:
+| | ① Local retrieval (default) | ② Model-assisted retrieval (optional) |
+| --- | --- | --- |
+| When | every question | only after you pick a tier in panel section ⑦ |
+| How | local lexical scoring: CJK character bigrams + latin words, weighted fields (title / keywords / body) via BM25, then a score threshold | ① at compaction the model adds "how might the user ask about this block" keywords; ② when you click ✕ it rewrites your phrasing and **judges which passage is strongly relevant** |
+| Cost | **0 model calls, 0 tokens**; a miss costs **nothing at all** (no text is produced) | pay per call through DSH's model service; one call per batch at compaction, one per ✕ click (same question cached 30 days) |
+| How to switch | it is the default | panel ⑦ "usage": **no model (default)** / **main model** / **a specific model** |
 
-```
-<workspace>/.dsh-compaction-memory/
-  <sessionId>.jsonl        this session's memory (one block per line)
-  _trash/<time>_<session>/ recycle bin (blocks.jsonl + manifest.json)
-  _audit.jsonl             audit of delete / restore / purge
-```
+Both can coexist, but **the question-time retrieval is always local**: the model is only ever called at "compaction keyword expansion" and "you clicked ✕" — **never in the question hot path**.
 
-Only two small **global** files live in the "global data directory" (default `$DSH_HOME`, i.e.
-`~/.dsh`): the settings file (<1 KB) and a capped diagnostics log. Set the environment variable
-`DSH_SUPER_MEMORY_HOME` to move them to another location. The memory directory itself can be
-changed in the panel (relative = per workspace, absolute = one shared directory).
+## The meaning of the ✕ button
 
-## Install
+Every assistant answer in a **compacted** session shows a small **✕** (it only appears once the session has been compacted — before that there is nothing to find).
 
-Requires DSH **0.1.7-rc.2 / 0.2.0-rc.1 or newer** (see `peerDependencies`; tested on the 0.2.0-rc.2
-desktop client). After installing, **restart the DSH client** — host plugin code is cached in the
-process. Success = a "超级记忆 / Super Memory" section in Settings and a `history_read` tool.
+1. Clicking it **immediately** shows a line in the conversation: "**xxx (auxiliary model) searching, please wait…**". No popup, and **no buttons** while it runs.
+2. The plugin searches **this session's** compacted history with your last question, optionally has the model rewrite it into keywords, and then has the model **decide which passage is strongly relevant** — meaning "it would change the answer", not "it is somewhat related". The model may answer **0 = none of them qualify** (weak models tend to be people-pleasers; forcing a pick is the dangerous failure mode).
+3. Result:
+   - **Something is strongly relevant** → the conversation shows "found related content" plus **「open the verbatim excerpt」** (a Markdown file with **only** the strongly relevant passages, questions and answers only, generated in code, **0 tokens**) and a dismiss button. The material is **queued into your next turn**: just **ask your next question** and the model answers with it.
+   - **Nothing is strongly relevant** → it says so plainly ("**no strongly related content found**"), injects **nothing**, and offers **no** "open excerpt" button.
+4. **Be clear about this**: the plugin **cannot** make the model re-answer right now. It can only queue the material into your next turn. That is exactly what the on-screen line means.
+
+If local search already found a strong hit (top score ≥ threshold × 1.5), the rewrite call is **skipped** and the plugin says so — pure saving, same result. The ✕ search waits at most **8 seconds** (configurable); a timeout only writes a diagnostic line and never blocks your conversation.
+
+## The cost account
+
+All limits are **single-shot ceilings**, not quotas:
+
+| Item | Number |
+| --- | --- |
+| Post-compaction outline | ≤ 300 tokens per compaction, may be 0 |
+| Per-turn injection | ≤ 500 tokens, ≤ 2 items, ≤ 300 chars each (≥ 50 chars per item) |
+| Measured single injection | 128 / 167 / 458 tokens |
+| Ingest expansion | first **600 chars** of each block, **8 blocks** per batch, **output cap 240 tokens** (bad format = whole batch dropped, original keywords kept) |
+| Query rewrite | output cap 120 tokens |
+| Daily call cap | default **0 = unlimited** |
+
+**The deleted gate**: an earlier version capped the *cumulative* injection per session (2% of the window). Measured on 2026-10-07 it was removed — a day had only 19–21 auxiliary calls and a whole long session cost about 60k tokens against 560M tokens of main-model usage (≈0.01%). Its only reliable effect was "hit rate mysteriously drops", because **users do not attribute their own ✕ clicks to an exhausted budget**. Cost control is now per-call only.
+
+**Order of magnitude**: **5 compactions + 20 ✕ clicks ≈ 33k tokens**, versus hundreds of millions of tokens of main-model usage in the same session — roughly **0.01%**. (The 33k figure comes from `scripts/measure-savings.mjs` replaying the production ingest path over a real session log.)
+
+## Architecture and terminology
+
+- **L0** = DSH's native session log (multi-frame zstd). Read-only, never written.
+- **L1** = summary blocks: the summary DSH already generated, split by Markdown section. Short, precise, conclusion-level.
+- **L2** = conversation-text blocks distilled from what was dropped (your question + the answer), **with a title and keywords**, plus read-class tool results.
+
+**Why L2 is not just L0**: (1) L0 is a compressed, machine-format archive — parsing it live on the question hot path is far too slow; (2) tool results in L0 are **3.3× the volume** of the actual conversation, so noise would drown the retrieval; (3) titles and keywords only exist in L2, and scoring weights them 3× and 4× over the body. Retrieval is local BM25 over CJK bigrams; each block carries a 16-hex content fingerprint so nothing is injected twice.
+
+## Optional model assist (off by default)
+
+Only **two moments** ever call a model: keyword expansion at compaction, and query rewrite + strong-relevance judgement when you click ✕. Failure of any kind degrades silently (diagnostic log only). Cooldowns: rate/quota errors 10 minutes, provider/credential errors 30 minutes. Timeouts: ingest 8000 ms, ✕ 8000 ms (it was 4000 ms; thinking models often spent 4 s emitting only reasoning, wasting the click). Same input is cached 30 days (rewrite results). The plugin **neither sets nor inherits reasoning effort** — configure that on DSH's own model settings page. Call traces contain **metadata only**.
+
+## Privacy and boundaries
+
+- **Dependencies**: no third-party runtime dependencies at all (`peerDependencies` only, all `@deepseek-ai/*` provided by DSH itself). Services used: `tools`, `systemPrompt`, `webServer` (required) and `llm` (optional).
+- **Reads**: DSH session logs (`$DSH_HOME/sessions/**`, read-only, never written) and the session-title projection cache. Stat-only for size queries.
+- **Writes**: inside the session's own workspace, `<workspace>/.dsh-compaction-memory/` (per-session `.jsonl`, `_trash/`, `_audit.jsonl`, `_pairs.jsonl`, `_readable/excerpts/*.md`), plus five small files in the global data directory (settings, diagnostics, daily usage, rewrite cache, call trace).
+- **Deletes**: every delete path is validated to be **strictly inside** the memory directory (equal to the root is refused too; `..`, absolute paths and symlink escapes are rejected). Deletes go to a recycle bin by default and are audited.
+- **Network**: **no internet access.** `lib/` imports no HTTP client; every panel `fetch` targets the local `/api/dsh-super-memory/*` routes. Model calls happen only through DSH's `llm` service, only after you opt in.
+- **Command execution**: exactly **one** `spawn` in the whole repo — `revealInFileManager()` in `lib/routes.js`, used solely to reveal a file in your file manager (Windows `explorer /select,`, macOS `open -R`, else `xdg-open`). No shell, no request-supplied executable or arguments, path built server-side, out-of-scope workspaces answered with 403.
+- **Credentials**: never read, stored or forwarded. The plugin only fills in two **string names** (`provider`, `model`); DSH holds the keys.
+
+## Install and use
+
+Requires DSH **0.1.7-rc.2 / 0.2.0-rc.1 or newer** (tested on the 0.2.0-rc.2 desktop client).
 
 ```
 plugin_manager  action: install_bundle  target: dsh-super-memory
 ```
 
-## Panel
+Then **restart the DSH client** (host plugin code is cached in the process). Success = a "超级记忆 / Super Memory" section in Settings and a `history_read` tool. To uninstall: `plugin_manager action: remove_bundle target: dsh-super-memory` — the memory directory and the global files are **not** removed automatically.
 
-Settings are grouped by the three things the plugin does, and each group shows its own cost:
-① ingest (0 tokens) · ② post-compaction outline (≤N tokens per compaction) · ③ question-time recall
-(0 on a miss, ≤N per turn). Two more groups: ④ saved compaction content (session list with the same
-titles as the DSH sidebar, browse/delete) and ⑤ recycle bin (restore / delete permanently), plus a
-collapsed ⑥ diagnostics section.
+Day to day you only need three sentences: it stores what compaction drops, it hands back only the relevant passages (≤ 500 tokens/turn, **nothing at all when nothing matches**), and if you think it forgot something you just click **✕** under the answer. All tuning lives behind the collapsed "参数设置" button; everything applies immediately, no restart.
 
-> The panel UI text is currently **Chinese only**; plugin metadata (title/description) ships in both
-> Chinese and English.
+> The panel UI text is Chinese only; plugin metadata (title/description) ships in both languages.
+
+## Notable fixes in the current version
+
+Path-traversal write via the session id in the excerpt filename; the ✕ material being visible only in the first step of a turn (clear point moved to `turn/end`); cross-session bleed in `/diagnose` (candidates are now filtered to the target session); a backfill `NaN` that kept cold-start blocks invisible; `outChars` always 0 for models that only emit reasoning; a millisecond-resolution staleness check that dropped fresh results (now a publish sequence number); hooks placed after an early return (the ✕ button vanished), and a TDZ crash in the ✕ click handler. `npm test` used to be unable to see the host half at all (a corrupted `lib/host.js` passed every test), so `scripts/host-smoke.mjs` now checks every file's bytes, syntax, loadability and export contract.
 
 ## Self-checks
 
-Requires **Node ≥ 22.15** (session logs are multi-frame zstd; older Node cannot decode them).
+Requires **Node ≥ 22.15**. `npm test` exits non-zero on failure and runs four suites: unit tests, panel static checks, panel render smoke, host smoke.
 
 ```bash
-npm test                                    # unit tests + panel static checks, no session log needed
+npm test
 node scripts/selftest.mjs <session.v4.jsonl.zstd>
 node scripts/harness.mjs  <session.v4.jsonl.zstd> [tmp workspace]
-node scripts/inspect.mjs  "<workspace>" "<an old topic>"
 ```
-
-`npm test` exits non-zero on failure (it is a real check, not a printout). `harness.mjs` boots the host half
-against a fake Cordis context and a real session log, and asserts ingest idempotency, hit/miss cost, toggle
-effects, the panel API contract (including the CSRF guard and path-traversal rejection), workspace isolation
-and `history_read` cleanliness.
-
-## Privacy
-
-- **Local only by default, nothing leaves the machine**: no network calls, no model calls, no telemetry. `lib/` pulls in
-  no HTTP client (`node:http(s)`, `net`, `dns`, `tls` are absent); the only "network" traffic is your browser
-  talking to the plugin's own routes on `127.0.0.1` when you click a button in the settings panel.
-- **What is stored**: conversation text (your questions and the assistant's answer text) plus **read-class tool results** (ead/grep/glob/web_fetch/history_read) — turn it off with `includeToolResults`. **No** reasoning blocks, no shell or other tool output, no system-injected content.
-- **Optional model assist (off by default)**: after you enable it in section ⑦, the plugin may call the provider **you** configured through DSH's `ctx.llm` — for keyword expansion at compaction time and for query rewriting when you click the ✕ miss button. Leave it off and the plugin stays fully local.
-- **Where**: `<workspace>/.dsh-compaction-memory/` (per workspace) plus two small global files (settings and a
-  capped diagnostics log). Nothing is written anywhere else, and the original DSH session logs are **never**
-  touched.
-- **When verbatim history is read**: only when you explicitly ask for it (`history_read`); day-to-day turns do
-  not read raw history.
-- **Accidental commit risk**: the memory directory lives inside *your* project folder. If that workspace is a
-  git repository, the settings panel (section ④) detects it and offers a one-click button that adds the ignore
-  rule to that project's `.gitignore`. The plugin's own `.gitignore` cannot cover your project.
-- **Deleting**: removing `<workspace>/.dsh-compaction-memory/` clears that project's memory completely; the
-  panel can also delete per session (7-day protection period by default, configurable) and empty the recycle bin.
 
 ## License
 

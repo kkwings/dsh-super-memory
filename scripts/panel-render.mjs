@@ -288,8 +288,12 @@ check('板块顺序正确（①→⑦）', (() => {
 /* 关键控件/文案是否真的渲染出来了（桩渲染下能拿到的文案） */
 for (const [label, needle] of [
   ['顶部三句话之一（它做什么）', '压缩那一刻'],
-  ['顶部边界声明（不联网 / 不存密钥 / 不改写对话 / 只读会话日志）', '不联网、不存密钥、不改写你的对话；只读 DSH 的会话日志'],
-  ['顶部操作性指引（点 ✕）', '点回答下面的 ✕'],
+  /* 2026-10-07：用户钦定的顶部文案里**删掉了"不联网"**（他要的是"可选调用辅助大模型"那段），
+   * 边界声明整体搬到了 ⑦ 展开态的隐私提示（见下面的展开态断言）。
+   * 这里改成守住**事实本身**：只读会话日志、不存密钥、不改写对话 —— 这三条还在顶部。 */
+  ['顶部边界声明（不存密钥 / 不改写对话 / 只读会话日志）', '本插件不存密钥、不改写你的对话；只读 DSH 的会话日志'],
+  ['顶部模型辅助说明（可选调用辅助大模型）', '可以选择调用辅助大模型增加检索历史记忆的命中率'],
+  ['顶部操作性指引（点 ✕）', '就点回答下面的 ✕ 让它再找一遍'],
   ['未命中诊断门槛提示或入口', '压缩'],
   ['板块 ① 的两条人话开关', '存摘要'],
 ]) {
@@ -303,14 +307,20 @@ check('turnTail 无结果时不渲染任何内容',
  * 判据是**每块的字数**（标题行 + 至多 1 行说明）：阈值取得宽，
  * 只拦"又把设计论证塞回界面"这种明显回退，不追求卡死排版。
  * ① – ⑥ 的上限 420 字；⑦ 单独给 720 —— 它把三选一的三个选项（控件本身）和
- * 「提供方 / 模型 / 测试连接」一起摊在首屏，字面量本来就多，但都必须是**人话短句**。 */
+ * 「提供方 / 模型 / 测试连接」一起摊在首屏，字面量本来就多，但都必须是**人话短句**。
+ * 「使用方式」段（三选一控件 + 紧邻它的那一行调用统计）单独给 820：字面量本来就多，
+ * 但都必须是**人话短句**。（2026-10-07 用户要求把"今日调用 / 估算用量"搬回首屏，
+ * 就挂在这一段里 —— 实测 757 字，上限从 720 提到 820 只给它让出那 ~80 字的额度；
+ * 再往这段里塞整段说明仍然会被拦下。切分不按「今日调用」来切：那样会把它一路量到
+ * 面板末尾，反而量错东西。） */
 {
   const marks = ['① ', '② ', '③ ', '④ ', '⑤ ', '⑥ ', '⑦ '];
   if (text.includes('使用方式')) marks.push('使用方式');
   const segments = boardSegments(text, marks);
-  const fat = segments.filter((item) => item.length < 0 || item.length > (item.mark === '使用方式' ? 720 : 420));
+  const limit = (mark) => (mark === '使用方式' ? 820 : 420);
+  const fat = segments.filter((item) => item.length < 0 || item.length > limit(item.mark));
   check('首屏每块都短（没有哪块塞回了一大段说明）', fat.length === 0,
-    fat.map((item) => `${item.mark} ${item.length} 字`).join('、'));
+    fat.map((item) => `${item.mark} ${item.length} 字（上限 ${limit(item.mark)}）`).join('、'));
 }
 /* 设计论证必须**离开界面**：这些词以前就写在面板上，现在只应存在于 README/代码注释里。
  * 注意只查**渲染出来的文本**，不查源码 —— 源码注释里保留这些解释是刻意的。 */
@@ -342,11 +352,17 @@ check('⑦ 默认展开（能看到隐私提示与使用方式）', text.include
 check('⑦ 默认展开且只有三选一，没有第二段说明',
   text.includes('不调用大模型') && text.includes('调用指定模型'),
   '三选一的三个选项必须在首屏；「测试连接」只在选"调用指定模型"时出现');
-/* ⑦ 的调用统计是排障信息：默认不占版面（展开⑥「参数设置」才显示）。
+/* ⑦ 的调用统计：2026-10-07 用户要求**搬回首屏**（"今日调用 N 次 / 估算用量"是他的账，
+ * 不是我们的排障细节，收进折叠区等于看不见）。断言意图随之反转但**意图本身不变**：
+ * 统计必须可见，且字段名必须与宿主 `usage()` 一致（calls / inTokensEst / outTokensEst）——
+ * 对不上就会显示成 0，这条就是那个守卫。
  * 只认统计行自己的说法，别误伤隐私提示里那句"你选的那个模型服务"。 */
-check('⑦ 首屏不显示调用统计（移到参数设置里了）',
-  !text.includes('今日调用') && !text.includes('估算用量'),
-  '调用统计属于排障信息，不该占首屏');
+check('⑦ 首屏（参数设置收起）就显示调用统计',
+  text.includes('今日调用') && text.includes('估算用量'),
+  '调用统计必须默认可见：它是用户要看的账，不是折叠区里的排障细节');
+check('⑦ 首屏的调用统计读的是宿主字段（calls / inTokensEst / outTokensEst）',
+  text.includes('今日调用 3 / 200 次') && text.includes('输入 ≈5120') && text.includes('输出 ≈860'),
+  `实际：${(text.match(/今日调用[^。]*/) ?? ['(没渲染)'])[0]}`);
 check('⑦ 不再有"命中率提升来自两处"这段原理说明', !text.includes('命中率的提升来自两处'),
   '设计论证应写进 README，不是面板');
 // 用户明确要求：**只让用户选一次**（要不要调用大模型），不许再拆成"入库/检索"两套
@@ -361,9 +377,10 @@ check('⑦ 三种选择都在', text.includes('不调用大模型') && text.incl
  * 所以「同一棵树渲染两次」成为默认断言姿势：
  *   · `render()`        —— 用户打开面板看到的首屏（不展开）；
  *   · `render(true)`    —— 点开「参数设置」之后（所有设置项都必须在，一个都不能少）。
- * 桩 React 不会点按钮，所以展开态是**直接往 hook 槽位里种**（见下OPEN_ADVANCED_SLOT）。 */
+ * 桩 React 不会点按钮，所以展开态是**直接往 hook 槽位里种**（见下OPEN_ADVANCED_SLOT）。
+ * `openLlm=false` 用来验证「⑦ 收起时统计照样在」——⑦ 自身也有一个折叠按钮。 */
 const STABLE_PASSES = 8;
-async function render(openAdvanced = false) {
+async function render(openAdvanced = false, openLlm = true) {
   const panelKey = [...hookStore.keys()].find((key) => key.startsWith('root<PanelBoundary>.0<Panel>#'));
   if (panelKey === undefined) {
     check('面板的 hook 槽位存在（展开态可渲染）', false, '找不到 Panel 的 hook 槽位');
@@ -371,8 +388,8 @@ async function render(openAdvanced = false) {
   }
   const base = panelKey.slice(0, panelKey.lastIndexOf('#'));
   /* 把面板自己的所有 hook 槽位重置成初始值（= 一组全新的 useState），
-   * 再按需要种 `openAdvanced`。**不要清空整个 hookStore** —— 别的组件的槽位
-   * （会话内按钮 / 结果块）不受影响。
+   * 再按需要种 `openAdvanced` / `openLlm`。**不要清空整个 hookStore** —— 别的组件的
+   * 槽位（会话内按钮 / 结果块）不受影响。
    *
    * 槽位顺序就是 Panel 里 `React.useState` 的出现顺序：
    *   0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced …
@@ -383,10 +400,16 @@ async function render(openAdvanced = false) {
     if (key.startsWith(base)) hookStore.delete(key);
   }
   initialSlots.forEach((value, index) => hookStore.set(`${base}#${index}`, value));
-  /* ⚠️ 槽位下标是**数组下标**，不是"第几个 useState"：
-   * 0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced …
-   * （off-by-one 踩过：把 `detail` 种成 true 会让面板去读 `detail.blocks.length` 而崩）。 */
+  /* ⚠️ 槽位下标是**数组下标**，不是"第几个 useState"。实际顺序（与 lib/client.js 里
+   * `React.useState` 的出现顺序一致，加字段时请同步更新这张表）：
+   *   0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced · 6 openLibrary
+   *   7 confirmZero · 8 pending · 9 confirmDelete · 10 confirmTrashDelete · 11 confirmPurge
+   *   12 query · 13 search · 14 llmTest · 15 llmTestBusy · 16 openLlm · 17 error · 18 notice
+   *   19 llmProviders
+   * （off-by-one 踩过两次：把 `detail` 种成 true 会让面板去读 `detail.blocks.length` 而崩；
+   * 把 `openLlm` 的槽位号写成 6 会去改 `openLibrary`，于是"收起 ⑦"的断言形同虚设。） */
   if (openAdvanced) hookStore.set(`${base}#5`, true);
+  hookStore.set(`${base}#16`, openLlm);
   let out = null;
   for (let pass = 0; pass < STABLE_PASSES; pass += 1) {
     hookIndex = 0;
@@ -419,9 +442,13 @@ async function render(openAdvanced = false) {
     '累计上限已删除，面板不应再显示额度/用尽提示');
   check('参数设置展开后仍显示本进程注入估算', advancedText.includes('估算注入'), '找不到「估算注入」');
   // E 项：今日 token 估算要真的显示出来（字段名对不上就会显示成 0）。
-  // 2026-10-07 精简：这条统计属于排障信息，移到了「参数设置」展开态里 —— 断言跟着搬家，
-  // **意图不变**：字段名必须与宿主 usage() 一致（calls / inTokensEst / outTokensEst）。
-  check('参数设置展开后仍显示今日 token 估算（输入/输出）',
+  // 2026-10-07：这行统计**搬回了首屏**（⑦ 里、紧邻「使用方式」，收起 ⑦ 时由板块下方那行兜住），
+  // 所以真正该守住的不再是"展开态里有没有它"，而是"**收起时也**看得到它"——
+  // 下面这条改成在**默认态**（参数设置收起）的文本上断言，展开态只是顺带再确认一次。
+  check('调用统计在默认态（参数设置收起）就显示今日 token 估算（输入/输出）',
+    text.includes('输入 ≈5120') && text.includes('输出 ≈860'),
+    `默认态实际：${(text.match(/估算用量[^·]*/) ?? ['(没渲染)'])[0]}`);
+  check('参数设置展开后调用统计仍在（输入/输出）',
     advancedText.includes('输入 ≈5120') && advancedText.includes('输出 ≈860'),
     `实际：${(advancedText.match(/估算用量[^·]*/) ?? ['(没渲染)'])[0]}`);
   for (const [label, needle] of [
@@ -464,6 +491,27 @@ async function render(openAdvanced = false) {
   check('参数设置展开后仍显示路径信息（全局数据目录 / 设置文件）',
     advancedText.includes('全局数据目录：') && advancedText.includes('设置文件：'),
     '排障需要真实路径，不能只剩抽象说明');
+  /* 顶部文案 2026-10-07 按用户钦定版改写后**删掉了"不联网"**：
+   * 这条事实改由 ⑦ 展开态的隐私提示承担 —— 它必须仍在，因为它是市场审查要看的边界声明。
+   * （断言写在展开态里：那句话本来就只随 ⑦ 展开显示。） */
+  check('⑦ 展开态仍有边界声明（不访问互联网 / 不自己连网 / 不存密钥）',
+    advancedText.includes('不访问互联网') && advancedText.includes('不自己连网') && advancedText.includes('不存密钥'),
+    '顶部已不再写"不联网"，这条事实必须在 ⑦ 的隐私提示里仍然可见');
+}
+
+/* ── 断言：⑦ 自身收起时，调用统计照样在（2026-10-07 车回首屏的那一行）──────
+ * 意图：**统计必须可见**。⑦ 收起时正文（隐私提示 / 三选一控件）整块消失，
+ * 但那一行统计必须由板块下方兜住，否则用户一点「收起」就再也看不到自己的账。 */
+{
+  const collapsedLlmTree = await render(false, false);
+  const collapsedLlmText = collapsedLlmTree === null ? '' : textOf(collapsedLlmTree);
+  check('⑦ 收起时也显示调用统计（今日调用 + 估算用量）',
+    collapsedLlmText.includes('今日调用 3 / 200 次')
+    && collapsedLlmText.includes('输入 ≈5120') && collapsedLlmText.includes('输出 ≈860'),
+    `实际：${(collapsedLlmText.match(/当前：[^。]*/) ?? ['(没渲染)'])[0]}`);
+  check('⑦ 收起时不再显示被折叠的正文（隐私提示与三选一控件）',
+    !collapsedLlmText.includes('会被发送到') && !collapsedLlmText.includes('不调用大模型'),
+    '收起就该收起：只留那行统计');
 }
 
 
