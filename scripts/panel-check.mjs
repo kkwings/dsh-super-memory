@@ -20,6 +20,23 @@ let problems = 0;
 const fail = (msg) => { problems += 1; console.log(`  ✗ ${msg}`); };
 const ok = (msg) => console.log(`  ✓ ${msg}`);
 
+/* ④ 会话内按钮的 TDZ 防线（实测踩过，且 node --check / 渲染自检都抓不到）
+ *
+ * 背景：✕ 按钮的 onClick 引用了 `run`。当 `run` 写成 `const run = async () => {}` 且定义在
+ * onClick **之后**时，点击会抛 "Cannot access 'run' before initialization" —— 抛在事件回调里、
+ * 不在 try/catch 范围内，于是**完全静默**：用户看到的就是"点了没反应"。
+ * 唯一可靠的预防是让 `run` 保持**函数声明**（会提升），所以在这里钉死。
+ */
+console.log('\n④ 会话内按钮：run 必须是提升的函数声明（防 TDZ 静默失效）');
+if (/async function run\(/.test(client)) {
+  ok('run 是函数声明（会被提升），onClick 提前引用也安全');
+} else {
+  fail('run 不是函数声明 —— 若用 `const run = …` 且 onClick 在它之前，点击会抛 TDZ 错误且被静默吞掉');
+}
+if (/const run = async/.test(client)) {
+  fail('发现 `const run = async`：会与上面的早返回分支形成 TDZ 陷阱');
+}
+
 /* ① 设置键 */
 console.log('\n① 设置键（client.js ↔ config.js）');
 const { DEFAULTS, EDITABLE_FIELDS } = await import('../lib/config.js');
