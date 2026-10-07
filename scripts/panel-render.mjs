@@ -246,10 +246,31 @@ for (let pass = 0; pass < 8; pass += 1) {
 check('渲染没有抛错', tree !== null && typeof tree === 'object');
 check('面板已脱离"加载中"（settings 已就绪）', textOf(tree).includes('超级记忆'), `树文本前 80 字：${textOf(tree).slice(0, 80)}`);
 
-/* ── 断言：七个板块都在（顺序正确）───────────────────────────────────────
+const defaultText = textOf(tree);
+
+/**
+ * 按板块标题行切分整棵树的文本，得到"每块自己有多少字"。
+ *
+ * ⑦ 另按「使用方式」再切一刀：那是一组控件（三个选项的字面就写在控件里），
+ * 不是说明文字，所以长度只对**卡片头**（标题 + 副标题）有约束。
+ * @param {string} fullText - `textOf(tree)` 的结果。
+ * @param {string[]} marks - 切分标记（按出现顺序）。
+ * @returns {{mark:string,length:number}[]} 每段的字数。
+ */
+function boardSegments(fullText, marks) {
+  return marks.map((mark, index) => {
+    const at = fullText.indexOf(mark);
+    if (at < 0) return { mark, length: -1 };
+    const end = index + 1 < marks.length ? fullText.indexOf(marks[index + 1]) : fullText.length;
+    return { mark, length: (end < 0 ? fullText.length : end) - at };
+  });
+}
+
+/* ── 断言：首屏（默认态）───────────────────────────────────────────────────
  * 不断言"必须是根节点的直接子节点"：那取决于 Board 组件的包装层次，
- * 太脆；这里断言"每个板块标题都渲染出来了，且顺序是 ①→⑦"。 */
-const text = textOf(tree);
+ * 太脆；这里断言"每个板块标题都渲染出来了，且顺序是 ①→⑦"。
+ * 精简改版后，七个板块标题仍必须**默认可见**（它们是首屏的骨架）。 */
+const text = defaultText;
 const sectionNumbers = ['①', '②', '③', '④', '⑤', '⑥', '⑦'];
 for (const no of sectionNumbers) {
   check(`渲染树里有板块 ${no}`, text.includes(`${no} `), `找不到「${no} 」`);
@@ -264,26 +285,70 @@ check('板块顺序正确（①→⑦）', (() => {
   return true;
 })());
 
-/* 关键控件是否真的渲染出来了（桩渲染下能拿到的文案） */
+/* 关键控件/文案是否真的渲染出来了（桩渲染下能拿到的文案） */
 for (const [label, needle] of [
-  ['工具结果开关相关文案', '工具结果'],
+  ['顶部三句话之一（它做什么）', '压缩那一刻'],
+  ['顶部边界声明（不联网 / 不存密钥 / 不改写对话 / 只读会话日志）', '不联网、不存密钥、不改写你的对话；只读 DSH 的会话日志'],
+  ['顶部操作性指引（点 ✕）', '点回答下面的 ✕'],
   ['未命中诊断门槛提示或入口', '压缩'],
-  ['每批块数的新口径（15 块 ≈ 2 次调用）', '一次压缩 15 块 ≈ 2 次调用'],
-  ['✕ 路径超时上限的说明（8 秒是上限）', '8 秒是上限'],
+  ['板块 ① 的两条人话开关', '存摘要'],
 ]) {
   check(`渲染树里含${label}`, text.includes(needle), `找不到「${needle}」`);
 }
 // 会话内结果块（turnTail）：从没在浏览器之外渲染过，这里至少确认它在"无结果"时不渲染
 check('turnTail 无结果时不渲染任何内容',
   textOf(resolveTree(withComponent('missTail', () => renderMissTail({ sessionId: 'session-x' })))).trim() === '', '');
+
+/* ── 断言：首屏的"信息密度"（本次改版的核心目标）─────────────────────────
+ * 判据是**每块的字数**（标题行 + 至多 1 行说明）：阈值取得宽，
+ * 只拦"又把设计论证塞回界面"这种明显回退，不追求卡死排版。
+ * ① – ⑥ 的上限 420 字；⑦ 单独给 720 —— 它把三选一的三个选项（控件本身）和
+ * 「提供方 / 模型 / 测试连接」一起摊在首屏，字面量本来就多，但都必须是**人话短句**。 */
+{
+  const marks = ['① ', '② ', '③ ', '④ ', '⑤ ', '⑥ ', '⑦ '];
+  if (text.includes('使用方式')) marks.push('使用方式');
+  const segments = boardSegments(text, marks);
+  const fat = segments.filter((item) => item.length < 0 || item.length > (item.mark === '使用方式' ? 720 : 420));
+  check('首屏每块都短（没有哪块塞回了一大段说明）', fat.length === 0,
+    fat.map((item) => `${item.mark} ${item.length} 字`).join('、'));
+}
+/* 设计论证必须**离开界面**：这些词以前就写在面板上，现在只应存在于 README/代码注释里。
+ * 注意只查**渲染出来的文本**，不查源码 —— 源码注释里保留这些解释是刻意的。 */
+for (const [label, needle] of [
+  ['实测数据（本机实测 …）', '本机实测'],
+  ['阈值标定依据（分得很开 / 0.7–1.5）', '分得很开'],
+  ['指纹去重的原理说明', '指纹去重'],
+  ['L1 / L2 分层术语', '（L1）'],
+  ['前缀缓存/快照追加量这类实现细节', '前缀缓存'],
+]) {
+  check(`首屏不再出现${label}`, !text.includes(needle), `仍然出现「${needle}」——这类内容应写进 README，不是面板`);
+}
+
+/* ── 断言：参数设置默认收起（"参数收进折叠的高级"这把刀）─────────────────
+ * 收起时既不能显示调参项，也不能显示⑥里那些排障/路径细节。 */
+for (const [label, needle] of [
+  ['命中阈值', '命中阈值'],
+  ['单轮注入上限', '单轮注入上限'],
+  ['入库冷却', '入库冷却'],
+  ['工具结果白名单', '收哪些工具'],
+  ['记忆目录输入框', '记忆目录'],
+  ['本会话已注入 ≈N token（排障行）', '本会话已注入'],
+]) {
+  check(`参数设置收起时不显示${label}`, !text.includes(needle), `「${needle}」默认就渲染出来了`);
+}
 // ⑦ 模型辅助：用户明确要求**默认展开**（不再折叠）——正文应直接渲染出来
 check('⑦ 默认展开（能看到隐私提示与使用方式）', text.includes('会被发送到') && text.includes('使用方式'),
   '用户已确认不要折叠：可选功能的入口要一眼可见；「测试连接」只在选"调用指定模型"时出现');
-check('⑦ 展开后显示模型服务状态', text.includes('模型服务：'), `找不到「模型服务：」`);
-// E 项：今日 token 估算要真的显示出来（字段名对不上就会显示成 0）
-check('⑦ 显示今日 token 估算（输入/输出）',
-  text.includes('今日估算用量：输入 ≈5120 token') && text.includes('输出 ≈860 token'),
-  `实际：${(text.match(/今日估算用量：[^（]*/) ?? ['(没渲染)'])[0]}`);
+check('⑦ 默认展开且只有三选一，没有第二段说明',
+  text.includes('不调用大模型') && text.includes('调用指定模型'),
+  '三选一的三个选项必须在首屏；「测试连接」只在选"调用指定模型"时出现');
+/* ⑦ 的调用统计是排障信息：默认不占版面（展开⑥「参数设置」才显示）。
+ * 只认统计行自己的说法，别误伤隐私提示里那句"你选的那个模型服务"。 */
+check('⑦ 首屏不显示调用统计（移到参数设置里了）',
+  !text.includes('今日调用') && !text.includes('估算用量'),
+  '调用统计属于排障信息，不该占首屏');
+check('⑦ 不再有"命中率提升来自两处"这段原理说明', !text.includes('命中率的提升来自两处'),
+  '设计论证应写进 README，不是面板');
 // 用户明确要求：**只让用户选一次**（要不要调用大模型），不许再拆成"入库/检索"两套
 check('⑦ 只选一次：出现「使用方式」', text.includes('使用方式'), `找不到「使用方式」`);
 check('⑦ 不再出现两套字段（入库用 / 检索用）', !text.includes('入库用 provider') && !text.includes('检索用 provider'),
@@ -291,38 +356,116 @@ check('⑦ 不再出现两套字段（入库用 / 检索用）', !text.includes(
 check('⑦ 三种选择都在', text.includes('不调用大模型') && text.includes('调用主模型') && text.includes('调用指定模型'),
   '三选一：不调用 / 主模型 / 指定模型');
 
-/* ── ⑥ 展开后的内容：需要把 `openAdvanced` 打开才看得到 ──────────────────
- * 桩 React 不会点按钮，所以这里**直接往 hook 槽位里种**（就等于用户点了「展开」）。
- * 目的：锁住「本会话已注入 ≈N token」这条**纯计数展示**真的渲染出来 —— 累计上限删除后，
- * 注入量不再参与任何判定，但用户仍必须看得到它（否则成本反馈就彻底没了）。
- * 这一步同时验证 fixture 里的字段名与面板读的字段名一致（`injectedTokens`）。 */
-let advancedText = '';
-{
+/* ── 渲染器：默认态（参数设置收起）与展开态（等于用户点了「参数设置」）────────
+ * 2026-10-07 精简改版：面向调参的项全部收进**默认折叠**的「参数设置」，
+ * 所以「同一棵树渲染两次」成为默认断言姿势：
+ *   · `render()`        —— 用户打开面板看到的首屏（不展开）；
+ *   · `render(true)`    —— 点开「参数设置」之后（所有设置项都必须在，一个都不能少）。
+ * 桩 React 不会点按钮，所以展开态是**直接往 hook 槽位里种**（见下OPEN_ADVANCED_SLOT）。 */
+const STABLE_PASSES = 8;
+async function render(openAdvanced = false) {
   const panelKey = [...hookStore.keys()].find((key) => key.startsWith('root<PanelBoundary>.0<Panel>#'));
   if (panelKey === undefined) {
-    check('⑥ 展开态可渲染（找到 Panel 的 hook 槽位）', false, '找不到 Panel 的 hook 槽位');
-  } else {
-    // `openAdvanced` 是 Panel 里第 6 个 useState（下标 5；见 client.js 的 hooks 顺序）。
-    hookStore.set(`${panelKey.slice(0, panelKey.lastIndexOf('#'))}#5`, true);
-    let advanced = null;
-    for (let pass = 0; pass < 4; pass += 1) {
-      hookIndex = 0;
-      currentComponent = 'root';
-      pendingUpdate = false;
-      advanced = resolveTree(renderPanel({}));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      if (!pendingUpdate) break;
-    }
-    advancedText = textOf(advanced);
-    check('⑥ 展开后能看到「本会话已注入 ≈167 token（不设上限）」',
-      advancedText.includes('本会话已注入 ≈167 token（不设上限）'),
-      '注入计数没渲染出来 —— 面板读的字段名可能与 routes.js 返回的不一致');
-    check('⑥ 展开后不再出现「额度：N / M」「已用尽」这类已删除的额度文案',
-      !advancedText.includes('额度：') && !advancedText.includes('已用尽') && !advancedText.includes('额度已关闭'),
-      '累计上限已删除，面板不应再显示额度/用尽提示');
-    check('⑥ 展开后仍显示本进程注入估算', advancedText.includes('估算注入'), '找不到「估算注入」');
+    check('面板的 hook 槽位存在（展开态可渲染）', false, '找不到 Panel 的 hook 槽位');
+    return null;
   }
+  const base = panelKey.slice(0, panelKey.lastIndexOf('#'));
+  /* 把面板自己的所有 hook 槽位重置成初始值（= 一组全新的 useState），
+   * 再按需要种 `openAdvanced`。**不要清空整个 hookStore** —— 别的组件的槽位
+   * （会话内按钮 / 结果块）不受影响。
+   *
+   * 槽位顺序就是 Panel 里 `React.useState` 的出现顺序：
+   *   0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced …
+   * 其中 `detail`（记忆明细）在真机上只有 `loadBlocks()` 成功返回才会是完整对象，
+   * 桩渲染里可能残留半成品 → 一并清成 null，让两次渲染都走"没有明细"的正常路径。 */
+  const initialSlots = [null, null, null, {}, null, false, true, false, null, null, null, null, null, null, null, null, true, false, '', ''];
+  for (const key of [...hookStore.keys()]) {
+    if (key.startsWith(base)) hookStore.delete(key);
+  }
+  initialSlots.forEach((value, index) => hookStore.set(`${base}#${index}`, value));
+  /* ⚠️ 槽位下标是**数组下标**，不是"第几个 useState"：
+   * 0 settings · 1 overview · 2 diag · 3 trash · 4 detail · 5 openAdvanced …
+   * （off-by-one 踩过：把 `detail` 种成 true 会让面板去读 `detail.blocks.length` 而崩）。 */
+  if (openAdvanced) hookStore.set(`${base}#5`, true);
+  let out = null;
+  for (let pass = 0; pass < STABLE_PASSES; pass += 1) {
+    hookIndex = 0;
+    currentComponent = 'root';
+    pendingUpdate = false;
+    out = resolveTree(renderPanel({}));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    if (!pendingUpdate) break;
+  }
+  return out;
 }
+
+/**
+ * 为什么要长度断言：本次改版的核心是"首屏每块不超过 2 行"，而"行"在桩渲染里
+ * 拿不到 —— 用每块的字符数当代理（标题行 + 1 行说明大约 40–90 字），
+ * 阈值给得宽，只拦"又塞回一段设计论证"这种明显回退。
+ */
+
+/* ── 断言：参数设置展开后，**一个设置项都不能少** ────────────────────────
+ * 本次改版只做"折叠 + 精简文案"，删掉任何一项都会变成"配了不生效的死键"：
+ * 这条断言就是那件事的守卫（设置键 → 展开后必须能找到的文案）。 */
+{
+  const advancedTree = await render(true);
+  const advancedText = advancedTree === null ? '' : textOf(advancedTree);
+  check('参数设置展开后能看到「本会话已注入 ≈167 token（不设上限）」',
+    advancedText.includes('本会话已注入 ≈167 token（不设上限）'),
+    '注入计数没渲染出来 —— 面板读的字段名可能与 routes.js 返回的不一致');
+  check('参数设置展开后不再出现「额度：N / M」「已用尽」这类已删除的额度文案',
+    !advancedText.includes('额度：') && !advancedText.includes('已用尽') && !advancedText.includes('额度已关闭'),
+    '累计上限已删除，面板不应再显示额度/用尽提示');
+  check('参数设置展开后仍显示本进程注入估算', advancedText.includes('估算注入'), '找不到「估算注入」');
+  // E 项：今日 token 估算要真的显示出来（字段名对不上就会显示成 0）。
+  // 2026-10-07 精简：这条统计属于排障信息，移到了「参数设置」展开态里 —— 断言跟着搬家，
+  // **意图不变**：字段名必须与宿主 usage() 一致（calls / inTokensEst / outTokensEst）。
+  check('参数设置展开后仍显示今日 token 估算（输入/输出）',
+    advancedText.includes('输入 ≈5120') && advancedText.includes('输出 ≈860'),
+    `实际：${(advancedText.match(/估算用量[^·]*/) ?? ['(没渲染)'])[0]}`);
+  for (const [label, needle] of [
+    ['minScore 命中阈值', '命中阈值'],
+    ['maxTokensPerTurn 单轮注入上限', '单轮注入上限'],
+    ['maxItems 单轮最多条数', '单轮最多条数'],
+    ['maxCharsPerItem 每条最大字符', '每条最大字符'],
+    ['compactionRecapMaxTokens 总量上限', '总量上限'],
+    ['observationTurns 查询携带最近几条提问', '查询携带最近几条提问'],
+    ['cooldownTurns 入库冷却', '入库冷却'],
+    ['preferSummaryChunks 先查摘要再用原文兜底', '先查摘要，再用原文兜底'],
+    ['recapPersist 总览在本窗口内保持稳定', '总览在本窗口内保持稳定'],
+    ['stickyRecall 参考块命中后一直显示', '参考块命中后一直显示'],
+    ['dedupe 同一段不重复塞', '同一段不重复塞'],
+    ['maxRawCharsPerCompaction 单次压缩原文上限', '单次压缩原文上限'],
+    ['includeToolResults 工具结果入库开关', '入库模型读过的文件/检索结果'],
+    ['toolResultNames 收哪些工具', '收哪些工具'],
+    ['toolResultMaxChars 单条工具结果上限', '单条工具结果上限'],
+    ['toolResultBudgetChars 工具结果总量上限', '工具结果总量上限'],
+    ['includePrune 也收录被压缩掉的历史片段', '也收录被压缩掉的历史片段'],
+    ['protectRecentDays 删除保护期', '删除保护期'],
+    ['trashEnabled 删除先进回收站', '删除先进回收站'],
+    ['trashAutoPurgeEnabled 回收站自动清空', '回收站自动清空'],
+    ['trashAutoPurgeDays 回收站保留天数', '回收站保留天数'],
+    ['storeDir 记忆目录', '记忆目录'],
+    ['llmIngestTimeoutMs 入库调用超时', '入库调用超时'],
+    ['llmIngestBatchBlocks 每批块数', '每批块数'],
+    ['llmIngestBlockChars 每块送多少字符', '每块送多少字符'],
+    ['llmRecallTimeoutMs 检索调用超时', '检索调用超时'],
+    ['llmDailyCallCap 每日调用上限', '每日调用上限'],
+    ['llmCacheEnabled 相同输入不重复调用', '相同输入不重复调用'],
+    ['llmIngestMaxTokens 单次输出上限（扩写）', '单次输出上限（扩写）'],
+    ['llmRewriteMaxTokens 单次输出上限（查询改写）', '单次输出上限（查询改写）'],
+  ]) {
+    check(`参数设置展开后有${label}`, advancedText.includes(needle), `找不到「${needle}」`);
+  }
+  // 这两句以前写在界面上当"设计论证"，精简后仍应保留**可操作的事实**（该去哪个菜单改）。
+  check('参数设置展开后仍说明"思考强度去哪设"', advancedText.includes('到「设置 → 模型」里对该型号设置'),
+    '用户会来问"推理强度怎么调不动"，这句是唯一的路标');
+  check('参数设置展开后仍显示路径信息（全局数据目录 / 设置文件）',
+    advancedText.includes('全局数据目录：') && advancedText.includes('设置文件：'),
+    '排障需要真实路径，不能只剩抽象说明');
+}
+
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
 
