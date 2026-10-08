@@ -297,6 +297,13 @@ plugin_manager  action: install_bundle  target: dsh-super-memory
 
 需要 **Node ≥ 22.15**（原始会话日志是多帧 zstd，用到 `zstdDecompressSync`；低版本会直接报"不支持 zstd"）。DSH 自带的 node 在 `<DSH 安装目录>/resources/runtime/primary-runtime/dependencies/node/bin/node.exe`。
 
+> ⚠️ **这些脚本只存在于源码仓库，不随 npm 包发布。** 发布包的 `files` 白名单只有
+> `lib` 与 `locale`（运行时要用的东西），刻意**不含** `scripts/` —— 所以从 npm 安装的包
+> 里跑 `npm test` 会报"找不到 scripts/unit.mjs"，那是预期行为，不是包坏了：
+> 自检脚本依赖仓库里的源码与测试夹具，只在 `git clone` 之后可用。
+> （要自检请克隆仓库；不要把 `scripts` 加回 `files` —— 那会把测试夹具与开发脚本一起
+> 塞进每个用户的 node_modules。）
+
 `npm test` **会真的报错**（退出码非 0），它跑四套：① 单元测试（纯函数 + 历次真实 bug 的回归）、② 面板静态自检（设置键 / CSS 类名 / API 路径 / 板块齐全 / 数字框精度）、③ 面板渲染冒烟（用桩 React 真正渲染面板整棵树）、④ **宿主半边冒烟**（每个文件非空无 BOM 无 NUL、逐个 `node --check`、宿主入口真能加载、导出契约在位）。
 
 其余脚本用真实会话日志做端到端验证：

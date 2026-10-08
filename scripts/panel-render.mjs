@@ -99,7 +99,7 @@ const settingsPayload = {
       logScores: true, backfillOnStart: true, includePrune: false, maxRawCharsPerCompaction: 400000,
       llmAssistEnabled: true, llmIngestExpand: true, llmIngestProvider: 'zai', llmIngestModel: 'glm-5.3-flash',
       llmIngestTimeoutMs: 8000, llmIngestBatchBlocks: 8, llmIngestBlockChars: 600, llmIngestMaxTokens: 240,
-      llmRecallRewrite: true, llmRecallRerank: false, llmRecallProvider: '', llmRecallModel: '',
+      llmRecallRewrite: true, llmRecallProvider: '', llmRecallModel: '',
       llmRecallTimeoutMs: 8000, llmRewriteMaxTokens: 120, llmDailyCallCap: 0, llmCacheEnabled: true,
     },
   },
@@ -128,7 +128,16 @@ const overviewPayload = {
         sessionId: 'session-d7e61f90-e491-45ad-9378-0b6fc158ca15', shortId: 'd7e61f90',
         title: '开发超级记忆跨压缩插件', titleFallback: '开发超级记忆跨压缩插件',
         blocks: 197, bytes: 30687, compactions: 2, protected: true, activityAt: Date.now(), updatedAt: Date.now(),
+      }, {
+        // 第二个会话：用来抓「本工作区 N 条」只读 `sessions[0]` 的那个 bug
+        // （只读审查报告 6 的第 3 条）。数量刻意不同，读错就会露馅。
+        sessionId: 'session-bbbb2222-cccc-3333-dddd-444455556666', shortId: 'bbbb2222',
+        title: '另一个会话', titleFallback: '另一个会话',
+        blocks: 43, summaryBlocks: 20, rawBlocks: 23, bytes: 8000, compactions: 1,
+        protected: false, activityAt: Date.now() - 86400000, updatedAt: Date.now() - 86400000,
       }],
+      // 宿主 workspaceOverview() 的合计口径（面板优先用它）
+      libraryBlocks: 240,
     }],
     runtime: [{
       sessionId: 'session-d7e61f90-e491-45ad-9378-0b6fc158ca15', workspace: 'E:\\软件\\DeepSeek Harness',
@@ -582,6 +591,68 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
+
+/* ── 断言：面板文案三处错的修正（只读审查报告 6）────────────────────────────
+ *  ① 全仓没有 clipboard 调用，却写着"找到的资料会自动复制，粘贴发送即可" → 必须删掉这个承诺；
+ *  ② 会话内结果块里的 `**直接继续提问即可**` 是普通文本节点，Markdown 不渲染，
+ *     用户看到的就是两个星号 → 不许出现裸 `**`；
+ *  ③ 「本工作区 N 条」只统计 `sessions[0]` → 数字必须来自真实合计。
+ * 这三条都写在**渲染出来的文本**上（不是源码），所以文案改回去就会红。 */
+{
+  check('面板不再承诺"自动复制/粘贴发送"（实现里根本没有 clipboard）',
+    !text.includes('自动复制') && !text.includes('粘贴发送') && !text.includes('粘贴'),
+    `实际：${(text.match(/[^。]*复制[^。]*/) ?? ['(没出现)'])[0]}`);
+  check('「本工作区」徽标的数字是真实合计（桩数据里宿主给 240，不是 sessions[0] 的 197）',
+    text.includes('本工作区 2 个会话 · 共 240 条'),
+    `实际：${(text.match(/本工作区[^、]*/) ?? ['(没渲染)'])[0]} / ${(text.match(/共 \d+ 条/) ?? ['(没有合计)'])[0]}`);
+  check('徽标不再直接写成"本工作区 197 条"（那正是只读 sessions[0] 的症状）',
+    !/本工作区\s*197\s*条/.test(text), '徽标仍在读 sessions[0].blocks');
+}
+
+/* ②：会话内结果块（turnTail）在"找到"状态下的文本 —— 点一次 ✕ 再放行，
+ * 把真实的"找到相关内容"那块渲染出来查裸星号与复制承诺。 */
+{
+  const compacted = { ok: true, value: { runtime: [{ sessionId: 'session-x', workspace: 'E:\\w', knownCompactions: 2, hits: 1, misses: 2, lastQuery: '之前那个问题' }] } };
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes('/diagnose') && !target.includes('/diagnostics')) {
+      return {
+        ok: true, status: 200,
+        json: async () => ({ ok: true, value: { verdict: 'above-threshold', found: true, boosting: true, chars: 120, model: 'glm-5.3-flash', material: '资料', file: 'E:\\w\\excerpt.md' } }),
+      };
+    }
+    const body = target.includes('/settings') ? settingsPayload : compacted;
+    return { ok: true, status: 200, json: async () => body };
+  };
+  const tick = async (times = 4) => { for (let i = 0; i < times; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); };
+  const renderOne = () => {
+    hookIndex = 0; currentComponent = 'missBare';
+    return resolveTree(withComponent('missBare', () => renderMiss({ sessionId: 'session-x' })));
+  };
+  hookStore.clear();
+  let out = renderOne();
+  await tick();
+  out = renderOne();
+  const findClickable = (node, acc = []) => {
+    if (node === null || node === undefined || typeof node !== 'object') return acc;
+    if (node.type === 'button' && typeof node.props?.onClick === 'function') acc.push(node);
+    const children = node.props?.children;
+    for (const child of Array.isArray(children) ? children : [children]) findClickable(child, acc);
+    return acc;
+  };
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  out = renderOne();
+  findClickable(out).find((node) => (textOf(node.props.children) ?? '').includes('✕'))?.props.onClick();
+  await tick();
+  hookIndex = 0; currentComponent = 'missTailBare';
+  const tailText = textOf(resolveTree(withComponent('missTailBare', () => renderMissTail({ sessionId: 'session-x' }))));
+  check('会话内结果块渲染出来了（前提成立）', tailText.includes('找到相关内容'), `实际=${tailText.slice(0, 80)}`);
+  check('结果块里没有裸 `**`（Markdown 不会在文本节点里渲染）',
+    !tailText.includes('**'), `实际=${(tailText.match(/.{0,20}\*\*.{0,20}/) ?? ['(没有)'])[0]}`);
+  check('结果块里也不再有"自动复制/粘贴"的暗示', !tailText.includes('复制') && !tailText.includes('粘贴'), tailText.slice(0, 80));
+}
+
+if (failures > 0) process.exit(1);
 
 /* ── 会话内「没想起来？」按钮：只在压缩过的会话里出现 ─────────────────── */
 {
