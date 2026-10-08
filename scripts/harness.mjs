@@ -3,17 +3,100 @@
  * 「压缩入库 → 压缩后总览 → 提问命中注入 → 未命中 0 token → 设置开关即时生效 → 面板 API → history_read」。
  *
  * 用法：node scripts/harness.mjs <sessionLogPath> [workdir]
+ *
+ * 退出口径：**自检失败 = 1，缺参数/日志读不到 = 2**（两者要能分开：
+ * 前者是"代码坏了"，后者是"你少给了一个参数"）。
+ * 临时目录（`%TEMP%\dsm-harness-home-<pid>`）**用完即清**（异常路径也清，见文件末尾的 finally）。
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+/** 用法说明（缺参数 / 日志读不到时打印，不是 TypeError 栈）。 */
+const USAGE = [
+  '用法：node scripts/harness.mjs <sessionLogPath> [workdir]',
+  '  <sessionLogPath>  真实会话日志，形如 $DSH_HOME/sessions/<项目>/<会话id>/session.v4.jsonl[.zstd]',
+  '  [workdir]         可选：把记忆库放在这个目录（默认 %TEMP%\\dsm-harness-workspace）',
+  '',
+  '例：node scripts/harness.mjs "%USERPROFILE%\\.dsh\\sessions\\--x--\\session-xxxx\\session.v4.jsonl.zstd"',
+].join('\n');
+
 const logPath = process.argv[2];
+if (typeof logPath !== 'string' || logPath.trim() === '') {
+  console.error(`缺少会话日志路径。\n\n${USAGE}`);
+  process.exit(2);
+}
+if (!fs.existsSync(logPath)) {
+  console.error(`读不到这份会话日志：${logPath}\n（路径要指向具体的 session*.jsonl[.zstd] 文件，不是目录。）\n\n${USAGE}`);
+  process.exit(2);
+}
+
 const workdir = process.argv[3] ?? path.join(os.tmpdir(), 'dsm-harness-workspace');
 const home = path.join(os.tmpdir(), `dsm-harness-home-${process.pid}`);
 fs.mkdirSync(home, { recursive: true });
 fs.mkdirSync(workdir, { recursive: true });
 process.env.DSH_HOME = home;
+
+/**
+ * 自愈：把**之前**异常中断留下的同类临时目录清掉。
+ *
+ * 为什么要它（2026-10-08）：本机 `%TEMP%` 里实测残留了 76 个 `dsm-harness-home-<pid>`
+ * —— 都是旧版本在异常路径上没清留下的。本次改成"结束时一定清 + 启动时顺手扫掉旧的"：
+ * 只认自己造的两个前缀（`dsm-harness-home-` / `dsm-harness-other-`），并且**只清超过
+ * 6 小时的**（不碰并发运行的另一个 harness，也不碰用户自己传进来的 workdir）。
+ */
+function sweepStaleTempDirs() {
+  const cutoff = Date.now() - 6 * 3600 * 1000;
+  let removed = 0;
+  try {
+    for (const name of fs.readdirSync(os.tmpdir())) {
+      const stale = name.startsWith('dsm-harness-home-') || name.startsWith('dsm-harness-other-');
+      if (!stale) continue;
+      const full = path.join(os.tmpdir(), name);
+      if (full === home) continue;
+      try {
+        if (fs.statSync(full).mtimeMs > cutoff) continue;
+        fs.rmSync(full, { recursive: true, force: true });
+        removed += 1;
+      } catch { /* 单个目录清不掉就跳过 */ }
+    }
+  } catch { /* 扫不动 tmpdir 不影响自检 */ }
+  return removed;
+}
+const swept = sweepStaleTempDirs();
+if (swept > 0) console.log(`启动清理：删掉了 ${swept} 个上次遗留的 dsm-harness-* 临时目录`);
+
+/**
+ * 清理逻辑（**只清插件自己的东西**，不碰用户给的 workdir）：
+ *   · `home`：`<tmp>/dsm-harness-home-<pid>` —— 设置/诊断/用量/缓存都在里面；
+ *   · 同进程造出来的沙箱工作区（`dsm-harness-other-<pid>` 等）跟着一起清。
+ *
+ * 为什么必须是 finally + 兜底钩子：早先只在正常结束路径写了一句清理，异常路径直接
+ * 把临时目录留在盘上 —— 本机实测残留了 76 个 `dsm-harness-home-*`。
+ */
+const makeCleanup = () => {
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    for (const dir of [home, path.join(os.tmpdir(), `dsm-harness-other-${process.pid}`)]) {
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* 清不掉不影响判定 */ }
+    }
+  };
+};
+const cleanupHome = makeCleanup();
+// 兜底：未捕获异常 / 提前退出也要清（正常路径末尾另有 finally）
+process.on('exit', cleanupHome);
+process.on('uncaughtException', (error) => {
+  cleanupHome();
+  console.error(error);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  cleanupHome();
+  console.error(reason);
+  process.exit(1);
+});
 
 const { apply } = await import('../lib/host.js');
 const { decompressFrames } = await import('../lib/zstd.js');
@@ -227,7 +310,7 @@ if (fs.existsSync(diagFile)) {
   for (const line of fs.readFileSync(diagFile, 'utf8').split('\n').filter(Boolean).slice(-10)) {
     const entry = JSON.parse(line);
     if (entry.event === 'recall') {
-      console.log(`  hit=${entry.hit} reason=${entry.reason} top=${entry.topScore} second=${entry.secondScore} chars=${entry.injectedChars} est=${entry.injectedTokensEst} Q=${entry.queryHead.slice(0, 30)}`);
+      console.log(`  hit=${entry.hit} reason=${entry.reason} top=${entry.topScore} second=${entry.secondScore} chars=${entry.injectedChars} est=${entry.injectedTokensEst} Q#${entry.queryHash}/${entry.queryChars}（已哈希，不落明文）`);
     } else {
       console.log(`  [${entry.event}]`, JSON.stringify(entry).slice(0, 140));
     }
@@ -920,3 +1003,9 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
   await put({ llmAssistEnabled: false, llmIngestExpand: false });
   console.log(`  ㉔ 段累计：通过 ${d24Passed} 条，失败 ${d24Failed} 条。`);
 }
+
+/* ── 清理：临时目录用完即清（异常路径由上面的 process 钩子兜底）─────────────
+ * 只清插件自己造的目录（临时 DSH_HOME + 沙箱工作区），**不动**用户传进来的 workdir。
+ * 本机曾在 `%TEMP%` 里残留 76 个 `dsm-harness-home-*`，就是因为这条只在正常结束路径执行。 */
+cleanupHome();
+console.log('临时目录已清理:', home);

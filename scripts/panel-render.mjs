@@ -32,6 +32,50 @@ let hookIndex = 0;
 let currentComponent = 'root';
 let pendingUpdate = false;
 
+/** effect 真的跑了几次 / cleanup 真的跑了几次（依赖数组语义的守卫，见 ReactStub.useEffect）。 */
+let effectRuns = 0;
+let effectCleanups = 0;
+const effectCounter = {
+  reset() { effectRuns = 0; effectCleanups = 0; },
+  snapshot() { return { runs: effectRuns, cleanups: effectCleanups }; },
+};
+
+/**
+ * 依赖数组比较（与真 React 同口径：逐项 `Object.is`，长度也要一致）。
+ * @param {unknown} previous - 上一轮的依赖数组（`null` = 没给依赖数组）。
+ * @param {unknown} next - 本轮的依赖数组。
+ * @returns {boolean} 是否"依赖没变"。
+ */
+function sameDeps(previous, next) {
+  if (previous === null || next === null || previous === undefined || next === undefined) return false;
+  if (previous.length !== next.length) return false;
+  for (let i = 0; i < previous.length; i += 1) {
+    if (!Object.is(previous[i], next[i])) return false;
+  }
+  return true;
+}
+
+/**
+ * 控件 ↔ 设置键的绑定审计收集器（2026-10-08 新增）。
+ *
+ * `lib/client.js` 里那四个基础控件（Toggle / NumberRow / TextRow / SelectRow）外面包了一层
+ * `tracked()`：渲染时把「控件类型 + 它拿到的那个键名 + 它读到的值」推进
+ * `window.__dsmControlAudit`。桩渲染不产生 DOM，这是唯一能"看见值"的地方 ——
+ * **开关接到错的键**在真机上表现是"拨了没反应/拨错东西"，而在这张表里表现是
+ * "值等于另一个键的值"，断言直接对不上。
+ *
+ * 每次 `render()` 都会把它重置为空数组，所以读到的永远是**本次渲染**的取值。
+ */
+const controls = { audit: [] };
+
+/** 从本次审计表里按标签取控件。 */
+function controlByLabel(label) {
+  return controls.audit.find((item) => item.label === label) ?? null;
+}
+
+/** 解析过程中"当前控件"的祖先链（`resolveTree` 维护；控件原型据此找自己的标签）。 */
+const controlStack = [];
+
 function createElement(type, props, ...children) {
   const flat = [];
   const push = (value) => {
@@ -63,9 +107,45 @@ const ReactStub = {
     };
     return [hookStore.get(slot), set];
   },
-  useEffect(fn) { hookIndex += 1; try { fn(); } catch { /* 桩里效应失败不影响结构断言 */ } },
-  useCallback(fn) { hookIndex += 1; return fn; },
-  useMemo(fn) { hookIndex += 1; return fn(); },
+  /* ── 依赖数组必须被真的尊重（2026-10-08 修）──────────────────────────────
+   * 早先的桩是"每渲染一次就把 effect 跑一次、cleanup 直接丢掉"：
+   *   · 依赖没变也重跑 → 掩盖"依赖写错/漏写"（真机上 effect 不会重跑，桩里却会，
+   *     于是测试看到的清理时机、请求次数与真机完全不同）；
+   *   · cleanup 从不执行 → `alive = false` 那类取消逻辑一次都没被验证过；
+   *   · useMemo/useCallback 直接调工厂 → 依赖变化带来的重算/不重算都测不出来。
+   * 现在三者的语义与真 React 一致：依赖逐项 `Object.is` 比较，不变就不重跑；
+   * 依赖变了先跑上一轮的 cleanup 再跑新的；`[]` 表示只跑一次。
+   * 这一切都有 `effectRuns` / `effectCleanups` 计数，断言直接盯着数。 */
+  useEffect(fn, deps) {
+    const slot = `${currentComponent}#eff${hookIndex++}`;
+    const previous = hookStore.get(slot);
+    const changed = previous === undefined || !sameDeps(previous.deps, deps);
+    if (!changed) return undefined;
+    if (typeof previous?.cleanup === 'function') {
+      effectCleanups += 1;
+      try { previous.cleanup(); } catch { /* cleanup 异常不影响结构与后续渲染 */ }
+    }
+    let cleanup;
+    effectRuns += 1;
+    try { cleanup = fn(); } catch { /* 桩里效应失败不影响结构断言 */ }
+    hookStore.set(slot, { deps: Array.isArray(deps) ? deps.slice() : null, cleanup: typeof cleanup === 'function' ? cleanup : null });
+    return undefined;
+  },
+  useCallback(fn, deps) {
+    const slot = `${currentComponent}#cb${hookIndex++}`;
+    const previous = hookStore.get(slot);
+    if (previous !== undefined && sameDeps(previous.deps, deps)) return previous.fn;
+    hookStore.set(slot, { deps: Array.isArray(deps) ? deps.slice() : null, fn });
+    return fn;
+  },
+  useMemo(fn, deps) {
+    const slot = `${currentComponent}#memo${hookIndex++}`;
+    const previous = hookStore.get(slot);
+    if (previous !== undefined && sameDeps(previous.deps, deps)) return previous.value;
+    const value = fn();
+    hookStore.set(slot, { deps: Array.isArray(deps) ? deps.slice() : null, value });
+    return value;
+  },
   // ⚠️ `useRef` **必须像真 React 一样跨渲染复用同一个对象**（按槽位缓存）。
   // 每次渲染都新建一个 {current} 的话，凡是"只在首次渲染记一个值"的组件（例如
   // MissTail 的 mountedAt 用于判断陈旧结果）在测试里就会每次都被重置 ——
@@ -205,13 +285,33 @@ check('拿到了会话内按钮渲染函数', typeof renderMiss === 'function');
 check('拿到了会话内结果块渲染函数（turnTail）', typeof renderMissTail === 'function');
 
 /* ── 最小渲染器需要的文本提取（放在断言之前）────────────────────────── */
-function textOf(node, depth = 0) {
-  if (depth > 60 || node === null || node === undefined) return '';
+/**
+ * 把元素树里的文本抽出来。
+ *
+ * ⚠️ 必须和 `resolveTree` 一样**真的调用函数组件**（2026-10-08 修）：早先这里对
+ * `node.type` 是函数的元素直接返回 ''，于是任何"被包了一层的控件"（例如 1c 里为
+ * 绑定审计而加的 `Tracked` 包装）在文本断言里**整体消失** —— 断言会报"找不到这个控件"，
+ * 而真机上面板好端端的。桩渲染器的两半（结构 / 文本）对函数组件的口径必须一致。
+ * @param {unknown} node - 元素树 / 文本。
+ * @param {number} [depth] - 递归深度保护。
+ * @param {string} [path] - 组件路径（与 resolveTree 保持 hook 槽位一致）。
+ * @returns {string} 文本。
+ */
+function textOf(node, depth = 0, path = 'root') {
+  if (depth > 200 || node === null || node === undefined) return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);
   if (typeof node === 'boolean') return '';
-  if (Array.isArray(node)) return node.map((item) => textOf(item, depth + 1)).join(' ');
-  if (typeof node === 'object' && node.props !== undefined) return textOf(node.props.children, depth + 1);
-  return '';
+  if (Array.isArray(node)) return node.map((item, index) => textOf(item, depth + 1, `${path}.${index}`)).join(' ');
+  if (typeof node !== 'object' || node.type === undefined) return '';
+  const props = node.props ?? {};
+  if (node.type === FRAGMENT) return textOf(props.children, depth + 1, `${path}.frag`);
+  if (typeof node.type === 'function') {
+    const name = node.type.displayName ?? node.type.name ?? 'Anon';
+    const isClass = typeof node.type.prototype?.render === 'function';
+    const output = withComponent(`${path}<${name}>`, () => (isClass ? new node.type(props).render() : node.type(props)));
+    return textOf(output, depth + 1, `${path}<${name}>`);
+  }
+  return textOf(props.children, depth + 1, `${path}.${String(node.type)}`);
 }
 
 /* ── 渲染：反复跑直到状态稳定（桩 useState 会把异步回来的数据写进槽位）──── */
@@ -220,7 +320,7 @@ function textOf(node, depth = 0) {
  * （没有这一步，"树"只是元素对象，Panel 根本不会被执行。）
  */
 function resolveTree(node, path = 'root', depth = 0) {
-  if (depth > 40 || node === null || node === undefined) return null;
+  if (depth > 200 || node === null || node === undefined) return null;
   if (typeof node === 'string' || typeof node === 'number') return node;
   if (typeof node === 'boolean') return null;
   if (Array.isArray(node)) {
@@ -238,7 +338,12 @@ function resolveTree(node, path = 'root', depth = 0) {
     return resolveTree(output, `${path}<${name}>`, depth + 1);
   }
   // 宿主元素：保留它 + 展开 children（断言"根节点的直接子节点"要用这一层）
-  return { type: node.type, props: { ...props, children: resolveTree(props.children, `${path}.${String(node.type)}`, depth + 1) } };
+  controlStack.push(node);
+  try {
+    return { type: node.type, props: { ...props, children: resolveTree(props.children, `${path}.${String(node.type)}`, depth + 1) } };
+  } finally {
+    controlStack.pop();
+  }
 }
 
 let tree = null;
@@ -408,6 +513,9 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
    * 其中 `detail`（记忆明细）在真机上只有 `loadBlocks()` 成功返回才会是完整对象，
    * 桩渲染里可能残留半成品 → 一并清成 null，让两次渲染都走"没有明细"的正常路径。 */
   const initialSlots = [null, null, null, {}, null, false, false, true, false, null, null, null, null, null, null, null, null, true, false, '', ''];
+  // 控件 ↔ 键的绑定审计（见上面的控件包装）：每次 `render()` 从空数组开始收集本次渲染的取值。
+  controls.audit = [];
+  window.__dsmControlAudit = controls.audit;
   for (const key of [...hookStore.keys()]) {
     if (key.startsWith(base)) hookStore.delete(key);
   }
@@ -590,7 +698,173 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   settingsPayload.value = originalValue;
 }
 
+/* ── 断言：桩 React 的依赖数组语义 + useRef 跨渲染复用（2026-10-08）──────────
+ * 这里量的是**桩本身**的行为（不是面板文案）：依赖不变 → effect 不重跑；
+ * 依赖变了 → 先跑上一轮的 cleanup 再跑新的；useRef 同一个槽位返回同一个对象。
+ * 这三条正是"effect 依赖写错"能被测出来的前提 —— 桩不尊重依赖数组时，
+ * 真机上"该跑一次的跑了十次"和"该重跑的没重跑"在测试里都看不见。 */
+{
+  const key = `depsProbe<${process.pid}>`;
+  /** 一次"渲染"：依赖值完全由外部传入（`useState` 只负责占一个槽位，不参与依赖）。 */
+  const probe = (dep) => {
+    ReactStub.useState('x');
+    ReactStub.useEffect(() => () => { /* cleanup 的真实次数由桩自己计数 */ }, [dep]);
+    return ReactStub.useRef({ slot: 'stable' });
+  };
+  currentComponent = key;
+  hookIndex = 0;
+  effectCounter.reset();
+  const ref1 = probe('a');
+  hookIndex = 0;
+  const ref2 = probe('a');
+  check('依赖不变 → effect 不重跑（桩真的在看依赖数组）',
+    effectRuns === 1, `effect 跑了 ${effectRuns} 次`);
+  check('依赖不变 → cleanup 也不跑', effectCleanups === 0, `cleanup 跑了 ${effectCleanups} 次`);
+  check('useRef 跨渲染返回同一个对象（每次新建会让"只在首次渲染记一个值"的组件每帧重置）',
+    ref1 === ref2, `same=${ref1 === ref2}`);
+  hookIndex = 0;
+  probe('b');
+  check('依赖变了 → 先跑 cleanup 再跑新的 effect', effectRuns === 2 && effectCleanups === 1,
+    `effect=${effectRuns} cleanup=${effectCleanups}`);
+  hookIndex = 0;
+  const ref3 = probe('b');
+  check('useRef 仍复用同一个槽位对象（值不因渲染重建而换）', ref3 === ref1);
+  // 清掉探针槽位，免得影响后面的渲染
+  for (const storedKey of [...hookStore.keys()]) if (storedKey.startsWith(key)) hookStore.delete(storedKey);
+}
+
+/* ── 断言：控件 ↔ 设置键的绑定（这才是抓"开关接到错的键"的守卫）──────────────
+ * 桩数据里**种入与默认值不同**的取值（true↔false 互换、数字换成别的合法值、
+ * 下拉换成另一档），再逐项断言"控件拿到的值 === `effective(对应键)`"。
+ *   · 覆盖 5 个开关（布尔，含 true/false 两种）、3 个数字框、1 个文本框、1 个下拉；
+ *   · 判据是**值**不是文案：把某个控件的键名改成另一个键（临时），值就会等于那个键的
+ *     取值，下面必然有一条对上不 → 红。 */
+{
+  const originalValue = settingsPayload.value;
+  const originalSettings = originalValue.settings;
+  const seeded = {
+    ...originalSettings,
+    // 开关：与默认值相反，证明"读的是这个键"而不是"恰好等于默认值"
+    ingestSummary: false,
+    ingestRawText: true,
+    injectRecap: false,
+    // 数字框：换成别的合法值
+    minScore: 0.42,
+    observationTurns: 5,
+    maxRawCharsPerCompaction: 123456,
+    // 文本框 / 下拉
+    toolResultNames: 'read, grep',
+    llmMode: 'main',
+    llmAssistEnabled: true,
+  };
+  settingsPayload.value = { ...originalValue, settings: seeded };
+  await render(true, true);
+  settingsPayload.value = originalValue;
+
+  const expected = [
+    // [标签, 键, 控件类型] —— 键名就是"这个控件应该绑到哪"
+    ['存摘要', 'ingestSummary', 'toggle'],
+    ['存原文', 'ingestRawText', 'toggle'],
+    ['压缩后注入总览', 'injectRecap', 'toggle'],
+    ['命中阈值', 'minScore', 'number'],
+    ['查询携带最近几条提问', 'observationTurns', 'number'],
+    ['单次压缩原文上限', 'maxRawCharsPerCompaction', 'number'],
+    ['收哪些工具', 'toolResultNames', 'text'],
+    ['使用方式', 'llmMode', 'select'],
+  ];
+  // 前提：每个标签都真的被采集到了（没采集到就看不见，等于这条断言形同虚设）
+  const missing = expected.filter(([label]) => controlByLabel(label) === null).map(([label]) => label);
+  check(`控件审计采集到了 ${expected.length} 个控件（含开关/数字框/文本框/下拉）`,
+    missing.length === 0, `没采集到：${missing.join('、')}；实际采集 ${controls.audit.length} 个：${[...new Set(controls.audit.map((c) => c.label))].join('、')}`);
+  for (const [label, key, kind] of expected) {
+    const control = controlByLabel(label);
+    const want = String(seeded[key]);
+    check(`「${label}」的值 = effective('${key}')（${kind}）`,
+      control !== null && String(control.value) === want && control.kind === kind,
+      `控件=${JSON.stringify(control)} 期望值=${want}`);
+  }
+  // 反向守卫：开关类控件的取值必须**两种都出现**（全 true / 全 false 说明绑到了同一个键）
+  const toggles = expected.filter(([, , kind]) => kind === 'toggle')
+    .map(([label]) => controlByLabel(label)?.value);
+  check('三个开关的取值没有全都一样（否则说明它们读到的是同一个键）',
+    new Set(toggles.map(String)).size > 1, JSON.stringify(toggles));
+}
+
 console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
+
+/* ── 断言：删除回执里的「摘抄已被 git 跟踪」提示（2026-10-08）────────────────
+ * `/delete` 的回执早就带 `excerptGit.tracked`，但面板从来没消费它 —— 用户删完
+ * 以为干净了，而 git 索引里还躺着一份逐字问答摘抄（`.gitignore` 对已跟踪文件无效）。
+ * 这里真点一遍「删除 → 确认删除」，断言 tracked=true 时出现那句 `git rm --cached`、
+ * tracked=false 时不出现。**能失败的验证**：把 client.js 里那段提示删掉 → 第一条红；
+ * 无条件拼上那句 → 第二条红。 */
+{
+  const clickable = (node, out = []) => {
+    if (node === null || node === undefined || typeof node !== 'object') return out;
+    if (Array.isArray(node)) { for (const item of node) clickable(item, out); return out; }
+    if (node.type === 'button' && typeof node.props?.onClick === 'function') out.push(node);
+    const children = node.props?.children;
+    for (const child of Array.isArray(children) ? children : [children]) clickable(child, out);
+    return out;
+  };
+  const findButton = (node, needle) => clickable(node).find((item) => textOf(item.props.children).includes(needle)) ?? null;
+  /** 找删除按钮：**按类名**找（danger = 删除类操作），比按文案稳（受保护时会加 title）。 */
+  const findDangerButton = (node) => clickable(node).find((item) => String(item.props.className ?? '').includes('dsm-btn-danger')) ?? null;
+  /** 点一次「删除 → 确认删除」，返回提示文本与抓到的请求。 */
+  const deleteWith = async (tracked) => {
+    const calls = [];
+    globalThis.fetch = async (url, options = {}) => {
+      const target = String(url);
+      calls.push(`${options.method ?? 'GET'} ${target}`);
+      if (target.includes('/delete')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            ok: true,
+            value: {
+              deleted: 3, remaining: 0, trashId: 't1', trashed: true, excerpts: 2,
+              excerptGit: { excerptDir: 'E:\\w\\.dsh-compaction-memory\\_readable\\excerpts', tracked },
+            },
+          }),
+        };
+      }
+      const body = target.includes('/overview') ? overviewPayload
+        : target.includes('/settings') ? settingsPayload
+          : { ok: true, value: {} };
+      return { ok: true, status: 200, json: async () => body };
+    };
+    // ⚠️ 交互后**不能再调 `render()`**：它会把面板的 hook 槽位重置成初始值
+    // （`confirmDelete` / `notice` 一起被清掉），于是"点了删除但确认卡不出现"。
+    // 这里用一个只做"渲染 + 让 effect 落地"的轻量步进器，模拟 React 的
+    // render → commit → effect 循环。
+    const step = async (times = 4) => {
+      hookIndex = 0;
+      currentComponent = 'root';
+      pendingUpdate = false;
+      const out = resolveTree(renderPanel({}));
+      for (let i = 0; i < times; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      return out;
+    };
+    await render(false, true);
+    findDangerButton(await step())?.props.onClick();
+    findButton(await step(), '确认删除')?.props.onClick();
+    for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+    const finalTree = await step();
+    return { text: textOf(finalTree), calls };
+  };
+  const trackedResult = await deleteWith(true);
+  check('删除真的走到了 POST /delete（前提成立）',
+    trackedResult.calls.some((line) => line.startsWith('POST') && line.includes('/delete')),
+    trackedResult.calls.join(' | '));
+  check('tracked=true → 提示里出现「已被 git 跟踪」与 git rm --cached',
+    trackedResult.text.includes('已被 git 跟踪') && trackedResult.text.includes('git rm --cached'),
+    `实际提示：${(trackedResult.text.match(/已删除[^。]*/) ?? ['(没渲染)'])[0].slice(0, 200)}`);
+  const untrackedResult = await deleteWith(false);
+  check('tracked=false → 不出现这句提示（不能无条件拼）',
+    !untrackedResult.text.includes('git rm --cached'),
+    `实际提示：${(untrackedResult.text.match(/已删除[^。]*/) ?? ['(没渲染)'])[0].slice(0, 200)}`);
+}
 
 /* ── 断言：面板文案三处错的修正（只读审查报告 6）────────────────────────────
  *  ① 全仓没有 clipboard 调用，却写着"找到的资料会自动复制，粘贴发送即可" → 必须删掉这个承诺；

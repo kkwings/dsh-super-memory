@@ -85,7 +85,7 @@ if (fs.existsSync(diagPath)) {
   for (const line of fs.readFileSync(diagPath, 'utf8').split('\n').filter(Boolean).slice(-12)) {
     const entry = JSON.parse(line);
     if (entry.event === 'recall') {
-      console.log(`  hit=${entry.hit} reason=${entry.reason} top=${entry.topScore} chars=${entry.injectedChars} est=${entry.injectedTokensEst} cum=${entry.sessionInjectedTokensEst} Q=${String(entry.queryHead).slice(0, 26)}`);
+      console.log(`  hit=${entry.hit} reason=${entry.reason} top=${entry.topScore} chars=${entry.injectedChars} est=${entry.injectedTokensEst} cum=${entry.sessionInjectedTokensEst} Q#${String(entry.queryHash ?? '')}/${entry.queryChars ?? '?'}（提问只落哈希，不落明文）`);
     } else if (entry.event === 'ingest') {
       console.log(`  [ingest/${entry.source}] ${String(entry.compactionId).slice(0, 8)} L1=${entry.layer?.summary} L2=${entry.layer?.raw} rawChars=${entry.rawChars} 模型调用=${entry.modelCalls}`);
     } else {

@@ -16,7 +16,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULTS, EDITABLE_FIELDS, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo } from '../lib/config.js';
+import { DEFAULTS, EDITABLE_FIELDS, INTEGER_BOUNDS, INTEGER_FIELDS, KNOWN_WORKSPACES_MAX, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo } from '../lib/config.js';
 import {
   MARKER, MARKER_END, containment, estimateTokens, extractTitle, neutralizeHeaderText,
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
@@ -1256,6 +1256,159 @@ console.log('\n=== 24. 注入行抽取口径：答优先 / 结论句优先 / 首
   check('闭合哨兵仍在（头部与末尾配对）',
     recallBuilt.text.split('\n')[0].startsWith(MARKER) && recallBuilt.text.trimEnd().endsWith(MARKER_END),
     recallBuilt.text.split('\n').slice(-1)[0]);
+}
+
+console.log('\n=== 25. load() 与 API 同口径：设置文件里的越界值必须被夹紧 ===');
+{
+  // 修的结构性缺口（2026-10-08）：API（`validatePatch`）一直有上下界，而 `load()`
+  // 原来只判"是不是数字" —— 手改设置文件塞 `maxRawCharsPerCompaction: 1e21`
+  // 就是"一次压缩往内存里灌 1e21 字符"，塞 `protectRecentDays: 1e15` 就是
+  // "保护期到永远、整会话永远删不掉"。现在两条路径共用 `INTEGER_BOUNDS` 这一张表。
+  //
+  // ⚠️ **能失败的验证**：把 `normalizeSettings` 里那个 `INTEGER_BOUNDS` 循环改回
+  // 只判数字（或删掉 max 夹紧），下面每一条都会红。
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-loadbounds-'));
+  const file = path.join(temp, 'dsh-super-memory.settings.json');
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    maxRawCharsPerCompaction: 1e21,
+    protectRecentDays: 1e15,
+    trashAutoPurgeDays: 1e15,
+    toolResultMaxChars: 1e30,
+    llmDailyCallCap: 1e9,
+    maxItems: 999,
+    // 下限方向也塞两个：不能被"夹上限"的逻辑顺手放过
+    maxCharsPerItem: -5,
+    llmIngestBatchBlocks: 0,
+  }), 'utf8');
+  const loaded = new SettingsStore({ path: file }).get().settings;
+  eq('1e21 的「单次压缩原文上限」被夹到上界 4000000',
+    loaded.maxRawCharsPerCompaction, INTEGER_BOUNDS.maxRawCharsPerCompaction.max);
+  eq('1e15 的「删除保护期」被夹到上界 365（不是"永远删不掉"）',
+    loaded.protectRecentDays, INTEGER_BOUNDS.protectRecentDays.max);
+  eq('1e15 的「回收站保留天数」被夹到上界 365', loaded.trashAutoPurgeDays, INTEGER_BOUNDS.trashAutoPurgeDays.max);
+  eq('1e30 的「单条工具结果上限」被夹到上界 20000', loaded.toolResultMaxChars, INTEGER_BOUNDS.toolResultMaxChars.max);
+  eq('1e9 的「每日调用上限」被夹到上界 100000', loaded.llmDailyCallCap, INTEGER_BOUNDS.llmDailyCallCap.max);
+  eq('999 的「单轮最多条数」被夹到上界 5', loaded.maxItems, INTEGER_BOUNDS.maxItems.max);
+  eq('负数被夹到下限（maxCharsPerItem -5 → 50）', loaded.maxCharsPerItem, INTEGER_BOUNDS.maxCharsPerItem.min);
+  eq('0 被夹到下限（每批块数 0 → 1）', loaded.llmIngestBatchBlocks, INTEGER_BOUNDS.llmIngestBatchBlocks.min);
+  check('夹紧后的值全部落在各自 [min, max] 区间内',
+    Object.entries(INTEGER_BOUNDS).every(([key, bound]) => {
+      const value = loaded[key];
+      return typeof value === 'number' && value >= bound.min && value <= bound.max;
+    }),
+    JSON.stringify(Object.fromEntries(Object.entries(INTEGER_BOUNDS).filter(([key, bound]) => {
+      const value = loaded[key];
+      return !(typeof value === 'number' && value >= bound.min && value <= bound.max);
+    }))));
+  check('非法类型不会被写进内存（字符串 → 保持默认值）',
+    (() => {
+      fs.writeFileSync(file, JSON.stringify({ version: 1, maxItems: 'many' }), 'utf8');
+      return new SettingsStore({ path: file }).get().settings.maxItems === DEFAULTS.maxItems;
+    })());
+  fs.rmSync(temp, { recursive: true, force: true });
+
+  // 同一张表的两条路径必须一致：文件里的极值被夹到 X，面板提交 X+1 会被拒
+  for (const key of Object.keys(INTEGER_BOUNDS)) {
+    const bound = INTEGER_BOUNDS[key];
+    const clamped = normalizeSettings({ [key]: 1e21 }, DEFAULTS)[key];
+    if (clamped !== bound.max) {
+      check(`${key}：越界值被夹到上界 ${bound.max}`, false, `实际=${clamped}`);
+    }
+    const rejected = typeof validatePatch({ [key]: bound.max + 1 }, DEFAULTS) === 'string';
+    const atBound = validatePatch({ [key]: bound.max }, DEFAULTS) === undefined;
+    if (!rejected || !atBound) {
+      check(`${key}：API 的上界与表一致（${bound.max} 收、${bound.max + 1} 拒）`, false,
+        `收=${atBound} 拒=${rejected}`);
+    }
+  }
+  check('每个整数字段都在表里，且 API 与 load() 用同一组上下界（含上面逐项）',
+    Object.keys(INTEGER_BOUNDS).length === Object.keys(INTEGER_FIELDS).length);
+
+  // 顺手钉住：面板 NumberRow 的 max 必须等于表里的 max（两处写不同数就是错的）
+  const clientSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'client.js'), 'utf8');
+  const numberRowRe = /h\((?:Audited)?NumberRow,\s*\{([\s\S]*?)\n\s*\}\)/g;
+  const panelMax = new Map();
+  let match;
+  while ((match = numberRowRe.exec(clientSource)) !== null) {
+    const label = /label:\s*'([^']+)'/.exec(match[1])?.[1] ?? '';
+    const max = Number(/max:\s*([0-9]+)/.exec(match[1])?.[1] ?? Number.NaN);
+    if (label !== '') panelMax.set(label, max);
+  }
+  // ⚠️ 键**必须带引号**：面板标题里有全角括号（`单次输出上限（扩写）`），
+  // 它不是合法的标识符字符 —— 不加引号会直接让脚本语法错误（实测踩过）。
+  const PANEL_LABEL_TO_KEY = {
+    '命中阈值': 'minScore',
+    '单轮注入上限': 'maxTokensPerTurn',
+    '单轮最多条数': 'maxItems',
+    '总量上限': 'compactionRecapMaxTokens',
+    '每条最大字符': 'maxCharsPerItem',
+    '查询携带最近几条提问': 'observationTurns',
+    '入库冷却': 'cooldownTurns',
+    '单次压缩原文上限': 'maxRawCharsPerCompaction',
+    '单条工具结果上限': 'toolResultMaxChars',
+    '工具结果总量上限': 'toolResultBudgetChars',
+    '删除保护期': 'protectRecentDays',
+    '回收站保留天数': 'trashAutoPurgeDays',
+    '入库调用超时': 'llmIngestTimeoutMs',
+    '每批块数': 'llmIngestBatchBlocks',
+    '每块送多少字符': 'llmIngestBlockChars',
+    '检索调用超时': 'llmRecallTimeoutMs',
+    '每日调用上限': 'llmDailyCallCap',
+    '单次输出上限（扩写）': 'llmIngestMaxTokens',
+    '单次输出上限（查询改写）': 'llmRewriteMaxTokens',
+  };
+  const mismatched = [];
+  for (const [label, key] of Object.entries(PANEL_LABEL_TO_KEY)) {
+    const value = panelMax.get(label);
+    if (value === undefined) { mismatched.push(`${label} 没扫到`); continue; }
+    if (INTEGER_BOUNDS[key] === undefined) continue; // 浮点字段（minScore）不在整数表里
+    if (value !== INTEGER_BOUNDS[key].max) mismatched.push(`${label}: 面板 ${value} / 表 ${INTEGER_BOUNDS[key].max}`);
+  }
+  check('面板每个整数数字框的 max 与 INTEGER_BOUNDS 完全一致（同一组上下界）',
+    mismatched.length === 0, mismatched.join('、'));
+}
+
+console.log('\n=== 26. 已知工作区名单：容量与"最近使用优先" ===');
+{
+  // 这里量的是 2026-10-08 修的那个坑的另一半：`knownWorkspaces` 只有 40 槽时，
+  // 每次 GET 都登记 + 落盘，用户的真实工作区被挤出去 → 面板与 ✕ 一律 403。
+  // 修法有两半：① GET 不再落盘（见 host-smoke 的 mtime 断言）；
+  // ② 容量放大到 200 且**按最近使用淘汰**（命中会被提到最前）。
+  check(`容量常量至少 200（当前 ${KNOWN_WORKSPACES_MAX}）`, KNOWN_WORKSPACES_MAX >= 200,
+    `实际=${KNOWN_WORKSPACES_MAX}`);
+  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-ws-'));
+  const file = path.join(temp, 'dsh-super-memory.settings.json');
+  // 先塞满 200 个"旧工作区"
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1,
+    knownWorkspaces: Array.from({ length: KNOWN_WORKSPACES_MAX }, (_, i) => `E:\\ws-${i}`),
+  }), 'utf8');
+  const store = new SettingsStore({ path: file });
+  eq('读盘时名单被截到容量上限', store.get().settings.knownWorkspaces.length, KNOWN_WORKSPACES_MAX);
+  eq('最旧的那个还在最前（读盘保持原顺序）', store.get().settings.knownWorkspaces[0], 'E:\\ws-0');
+  // 登记一个已被挤到最后的旧工作区 → 应被提到最前（最近使用优先），总数不变
+  store.rememberWorkspace(`E:\\ws-${KNOWN_WORKSPACES_MAX - 1}`, { persist: false });
+  eq('命中的工作区被提到最前（LRU）', store.get().settings.knownWorkspaces[0], `E:\\ws-${KNOWN_WORKSPACES_MAX - 1}`);
+  eq('只登记内存时总数仍是容量上限（不新增、不越界）',
+    store.get().settings.knownWorkspaces.length, KNOWN_WORKSPACES_MAX);
+  // 登记一个全新工作区 → 总数不变（挤掉最旧的一个）
+  store.rememberWorkspace('E:\\ws-new', { persist: false });
+  const after = store.get().settings.knownWorkspaces;
+  eq('新工作区排最前', after[0], 'E:\\ws-new');
+  eq('总数仍不超容量', after.length, KNOWN_WORKSPACES_MAX);
+  check('被挤掉的是最旧的、且"最近使用"的 ws-199 仍被保留',
+    after.includes(`E:\\ws-${KNOWN_WORKSPACES_MAX - 1}`) && after.includes('E:\\ws-1'),
+    after.slice(0, 3).join(','));
+  // `persist:false` 只动内存：文件里仍是原来那 200 个（没有被改写）
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8')).knownWorkspaces;
+  eq('persist:false 不写盘（文件里仍是读进来的顺序）', onDisk[0], 'E:\\ws-0');
+  check('persist:false 之后文件里没有新工作区', !onDisk.includes('E:\\ws-new'));
+  // 对照：默认（persist:true）会落盘
+  store.rememberWorkspace('E:\\ws-persist');
+  check('默认登记会落盘（写操作那一档）',
+    JSON.parse(fs.readFileSync(file, 'utf8')).knownWorkspaces[0] === 'E:\\ws-persist');
+  fs.rmSync(temp, { recursive: true, force: true });
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);

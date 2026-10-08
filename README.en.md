@@ -100,9 +100,18 @@ Day to day you only need three sentences: it stores what compaction drops, it ha
 
 > The panel UI text is Chinese only; plugin metadata (title/description) ships in both languages.
 
+## Data and privacy notes
+
+- **The plugin writes your worktree's `.gitignore` only when you click the button.** If the workspace is a git repository and the memory directory is not ignored yet, section ④ offers "add the ignore rule"; clicking it appends one line (`storeDir/`) to that workspace's `.gitignore` (creating the file with a one-line comment if needed) and records the action in `_audit.jsonl`. It never edits `.gitignore` on its own.
+- **Read-only requests (GET) have no persistent side effect.** Opening the panel issues `/session`, `/trash`, `/audit`, … which only remember the current session's cwd **in process memory**; the persisted "known workspaces" list is written on write operations only (delete / restore / purge / settings / ignore rule). It holds up to 200 entries, evicting the least recently used.
+- **The diagnostics log stores no question text.** `recall` entries carry a short hash and a character count (`queryHash`, `queryChars`) instead. For local debugging you can set `DSM_DIAG_QUERY_PLAINTEXT=1` to also write plaintext. Disclosure: versions up to 0.2.2 wrote `queryHead` (the first 60 plaintext characters) into that log, which lives in `$DSH_HOME` and aggregates across workspaces; lines already written by an older build stay in that file until you delete it (deleting it only loses diagnostic history, never memory data).
+- **Panel UI language:** Chinese only (the plugin metadata is bilingual; the settings panel itself is not localised).
+
 ## Notable fixes in the current version
 
 Path-traversal write via the session id in the excerpt filename; the ✕ material being visible only in the first step of a turn (clear point moved to `turn/end`); cross-session bleed in `/diagnose` (candidates are now filtered to the target session); a backfill `NaN` that kept cold-start blocks invisible; `outChars` always 0 for models that only emit reasoning; a millisecond-resolution staleness check that dropped fresh results (now a publish sequence number); hooks placed after an early return (the ✕ button vanished), and a TDZ crash in the ✕ click handler. `npm test` used to be unable to see the host half at all (a corrupted `lib/host.js` passed every test), so `scripts/host-smoke.mjs` now checks every file's bytes, syntax, loadability and export contract.
+
+Since 0.2.2 (version number unchanged): the injected line now prefers the **answer / conclusion sentence** over the question text; a failed `spawn` no longer kills the host (the async `error` event is always handled); deleting memory also removes that session's verbatim excerpts; memory writes are serialised with a file lock; `/diagnose` query rewriting is rate-limited (60s window); `outTokensEst` is accounted from real streamed output. `npm test` is now wired to the wiring layer too: `host-smoke.mjs` really calls `apply(ctx)` (context provider, `session/event` subscription, panel routes, `history_read`) and drives the `routes.js` request chain with synthetic req/res, the panel stub honours hook dependency arrays and runs cleanups, `load()` clamps settings with the same bounds as the panel API, and the diagnostics log stores a query hash instead of plaintext.
 
 ## Self-checks
 
