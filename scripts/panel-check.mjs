@@ -19,6 +19,10 @@ const routes = fs.readFileSync(path.join(lib, 'routes.js'), 'utf8');
 let problems = 0;
 const fail = (msg) => { problems += 1; console.log(`  ✗ ${msg}`); };
 const ok = (msg) => console.log(`  ✓ ${msg}`);
+const checkEq = (label, actual, expected) => {
+  if (actual === expected) { ok(label); return; }
+  fail(`${label} —— 实际=${JSON.stringify(actual)} 期望=${JSON.stringify(expected)}`);
+};
 
 /* ④ 会话内按钮的 TDZ 防线（实测踩过，且 node --check / 渲染自检都抓不到）
  *
@@ -42,8 +46,66 @@ console.log('\n① 设置键（client.js ↔ config.js）');
 const { DEFAULTS, EDITABLE_FIELDS } = await import('../lib/config.js');
 const known = new Set(Object.keys(DEFAULTS));
 const editable = new Set(EDITABLE_FIELDS);
+
+/**
+ * 剥掉 JS 注释（行注释与块注释两种写法），**保留字符串字面量与模板字面量**。
+ *
+ * 为什么必须有（2026-10-08 修的真缺陷）：`usedKeys` 原来是对**整份源码**跑
+ * `/effective\(\s*'([A-Za-z0-9_]+)'/g`，于是**注释里**写过的键也算"面板用到的键"。
+ * 当时统计出来的 41 个键里有 1 个假阳性：`llmAssistEnabled` —— 它只出现在 client.js
+ * 第 600 行那句注释（"这里原先是 effective('llmAssistEnabled', false) === true"）里，
+ * 面板早就不读它了。后果是报告数字虚高，且"注释里写什么键都不报警"＝这类检查永远发现不了
+ * "注释与实际代码不一致"。
+ *
+ * 字符串不能被误伤：字符串字面量与模板字面量里出现的注释符号必须原样保留 ——
+ * 所以这里是一个**最小词法扫描**，不是正则替换。
+ * 代价（可接受）：区分不了正则字面量；本文件里没有任何"含注释符号的正则字面量"。
+ * @param {string} source - 源码。
+ * @returns {string} 注释已替换为空白的源码（保留换行，行号不变）。
+ */
+function stripComments(source) {
+  const s = String(source ?? '');
+  let out = '';
+  let i = 0;
+  let quote = null; // 当前字符串引号：' " 或 `
+  while (i < s.length) {
+    const ch = s[i];
+    const next = s[i + 1];
+    if (quote !== null) {
+      out += ch;
+      if (ch === '\\') { out += next ?? ''; i += 2; continue; }
+      if (ch === quote) quote = null;
+      i += 1;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === '`') { quote = ch; out += ch; i += 1; continue; }
+    if (ch === '/' && next === '/') {
+      while (i < s.length && s[i] !== '\n') i += 1;
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      i += 2;
+      while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) { if (s[i] === '\n') out += '\n'; i += 1; }
+      i += 2;
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+// 自检（**能失败**）：把 stripComments 换回"原样返回"，下面第 1/2 条立刻红。
+{
+  checkEq('stripComments 去掉行注释', stripComments("a; // effective('x')\nb;"), 'a; \nb;');
+  checkEq('stripComments 去掉块注释（保留换行、不留字符）', stripComments("a; /* effective('x')\n effective('y') */ b;"), 'a; \n b;');
+  checkEq('stripComments 不误伤字符串里的注释符号', stripComments("const u = 'http://x'; const v = '/* 不是注释 */';"),
+    "const u = 'http://x'; const v = '/* 不是注释 */';");
+  checkEq('stripComments 不误伤模板字面量', stripComments('const t = `a // b`;'), 'const t = `a // b`;');
+  checkEq('stripComments 不误伤字符串里的转义引号', stripComments("const q = 'it\\'s // fine';"), "const q = 'it\\'s // fine';");
+}
+const clientCode = stripComments(client);
 const usedKeys = new Set();
-for (const m of client.matchAll(/effective\(\s*'([A-Za-z0-9_]+)'/g)) usedKeys.add(m[1]);
+for (const m of clientCode.matchAll(/effective\(\s*'([A-Za-z0-9_]+)'/g)) usedKeys.add(m[1]);
 
 /**
  * 取出 `client.js` 里所有 `patch({ … })` 的**全部**键名（含跨行 / 多键）。
@@ -88,7 +150,7 @@ function patchKeys(source) {
     ok('patchKeys 能抓到 patch({…}) 的全部键（含跨行、多键）');
   }
 }
-for (const key of patchKeys(client)) usedKeys.add(key);
+for (const key of patchKeys(clientCode)) usedKeys.add(key);
 const unknown = [...usedKeys].filter((k) => !known.has(k));
 const blocked = [...usedKeys].filter((k) => known.has(k) && !editable.has(k));
 console.log(`  面板用到 ${usedKeys.size} 个键：${[...usedKeys].sort().join(', ')}`);
@@ -101,10 +163,11 @@ if (notInPanel.length > 0) console.log(`  · 可编辑但面板没暴露（可�
 
 /* ② CSS 类 */
 console.log('\n② CSS 类（h(...) 用到 ↔ CSS 里定义）');
-const cssStart = client.indexOf('const CSS = `');
-const cssEnd = client.indexOf('`;', cssStart);
-const css = client.slice(cssStart, cssEnd);
-const code = client.slice(0, cssStart) + client.slice(cssEnd);
+// 同样在**剥掉注释之后**的源码上做：注释里写过的 `dsm-*` 不该算"用到"（会掩盖死样式）。
+const cssStart = clientCode.indexOf('const CSS = `');
+const cssEnd = clientCode.indexOf('`;', cssStart);
+const css = clientCode.slice(cssStart, cssEnd);
+const code = clientCode.slice(0, cssStart) + clientCode.slice(cssEnd);
 const defined = new Set([...css.matchAll(/\.(dsm-[a-z0-9-]+)/g)].map((m) => m[1]));
 // 用到的地方不止 className：也有 'dsm-cost dsm-cost-free' 这种拼在变量里的。
 const used = new Set([...code.matchAll(/(dsm-[a-z0-9-]+)/g)].map((m) => m[1]));
@@ -117,7 +180,8 @@ if (missing.length === 0 && unused.length === 0) ok('类名双向一致');
 
 /* ③ API 路径 */
 console.log('\n③ API 路径（client.js ↔ routes.js）');
-const paths = new Set([...client.matchAll(/\bapi\(\s*[`']([^`'?${]+)/g)].map((m) => m[1].trim()));
+// 同样剥注释：注释里提到的路径不该算"客户端请求了它"。
+const paths = new Set([...clientCode.matchAll(/\bapi\(\s*[`']([^`'?${]+)/g)].map((m) => m[1].trim()));
 const declared = new Set([...routes.matchAll(/'(\/api\/dsh-super-memory\/[a-z/-]*?)'/g)].map((m) => m[1]));
 const missingPaths = [...paths].filter((p) => !declared.has(`/api/dsh-super-memory${p}`));
 console.log(`  客户端请求 ${paths.size} 条：${[...paths].sort().join(', ')}`);
@@ -127,7 +191,7 @@ if (missingPaths.length === 0) ok('请求的路径在 routes.js 里都有分支'
 /* ④ 三板块编号 */
 console.log('\n④ 功能板块');
 for (const no of ['①', '②', '③']) {
-  if (client.includes(`no: '${no}'`)) ok(`板块 ${no} 在位`);
+  if (clientCode.includes(`no: '${no}'`)) ok(`板块 ${no} 在位`);
   else fail(`缺少板块 ${no}`);
 }
 
@@ -140,11 +204,11 @@ for (const no of ['①', '②', '③']) {
  * 这里跟着改成只要求当前仅剩的小数项 `minScore`（step 0.01）。将来再加小数项，请把它的
  * step 一并加进下面的清单——**不要**把这条断言删掉或改成恒真。 */
 console.log('\n⑤ 数字框精度（源码级回归守卫）');
-const numberRowSrc = client.slice(client.indexOf('function NumberRow'), client.indexOf('function Card'));
+const numberRowSrc = clientCode.slice(clientCode.indexOf('function NumberRow'), clientCode.indexOf('function Card'));
 const DECIMAL_FIELDS = [
   { key: 'minScore', step: 'step: 0.01' },
 ];
-const missingStep = DECIMAL_FIELDS.filter((item) => !client.includes(item.step));
+const missingStep = DECIMAL_FIELDS.filter((item) => !clientCode.includes(item.step));
 if (/let next = Math\.floor\(parsed\)/.test(numberRowSrc)) {
   fail('NumberRow 仍在无条件取整（0.28 会被抹成 0）');
 } else if (!/decimalsOf\(|toFixed\(/.test(numberRowSrc)) {

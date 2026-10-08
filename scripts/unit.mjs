@@ -22,7 +22,7 @@ import {
   tokenize,
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
 } from '../lib/text.js';
-import { conversationTurns, rawRecords, summaryRecords } from '../lib/ingest.js';
+import { conversationTurns, rawRecords, summaryRecords, clampToolText, toolRecordText, toolRecords, toolBodyOf, selfSourcePath } from '../lib/ingest.js';
 import { MemoryIndex, localTopScore, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import {
@@ -315,12 +315,35 @@ console.log('\n=== 10. 成本默认值（B/C 项：不许悄悄回到改前）==
   eq('normalizeSettings 把 0 夹到下限 1', normalizeSettings({ llmIngestBatchBlocks: 0 }, DEFAULTS).llmIngestBatchBlocks, 1);
 }
 
-console.log('\n=== 11. 「强命中跳过改写」的门槛 ===');
+console.log('\n=== 11. 「强命中跳过改写」的门槛（按新分数尺度重新标定）===');
 {
   // 这条判据坏了的后果：要么"本来找得到也要花钱改写"（浪费），
-  // 要么"本地已经很确定还去改写/或干脆不查了"（降智）。
-  check('默认 minScore=0.28 → 分数线是 1.5×（浮点误差内）', Math.abs(strongHitScore(0.28) - 0.42) < 1e-9, `实际=${strongHitScore(0.28)}`);
-  eq('倍数是 1.5（与注释、报告里的标定一致）', STRONG_HIT_RATIO, 1.5);
+  // 要么"本地已经很擦边还去跳过改写"（那才是真正需要辅助模型的场景，跳过 = 降智）。
+  //
+  // **2026-10-08 重标定**：上一轮把归一化从"查询全部 token 的 IDF"改成"库内可匹配的 IDF 质量"，
+  // 同一份样本上分数整体上移（实测中位抬升 2.04×；正样本中位 0.211 → 0.430）。于是
+  // 1.5 × minScore = 0.42 这个**旧尺度**上的标定必须用新数据复核。实测（两个真实库 592 块、
+  // 154 条真实历史提问，逐字自污染的提问已剔除；脚本口径见 README「强命中跳过改写」节）：
+  //   · 正样本（本地确实可注入）72 条：top-1 min=0.301 p25=0.373 中位=0.430 p75=0.507 max=1.763
+  //   · 负样本（本地不可注入）  82 条：top-1 min=0.000 p25=0.217 中位=0.254 max=0.329
+  //   · 1.5×（0.420）→ 38/154 跳过（25%），负样本被误判 0/82，证据不足（matched<4）却被跳过 0
+  //   · 2×（0.560）→ 15/154 跳过（10%），同样 0 误判、0 证据不足
+  // 结论：**保持 1.5×**，但理由从旧的"省下 2 条改写"改成新数据下的两条硬性质——
+  //   ① 它高于负样本上界（0.42 > 0.329）：**没有一条"本来找不到"的提问会被跳过改写**；
+  //   ② 它高于全部擦边正样本（擦边 = 刚过 0.28 的那 34 条，最高 0.417）：**擦边命中不会被当成强命中**。
+  // 取 2×/3× 只会多花改写钱（跳过的都是同一批"本来就找得到"的），不换来任何安全性，所以不动。
+  check('默认 minScore=0.28 → 分数线仍是 1.5×（浮点误差内）', Math.abs(strongHitScore(0.28) - 0.42) < 1e-9, `实际=${strongHitScore(0.28)}`);
+  eq('倍数是 1.5（新尺度实测支持它；依据见上面注释与 README）', STRONG_HIT_RATIO, 1.5);
+  // 新尺度的实测分布（上面那两组数）钉成常量断言：将来若有人把倍率调到 ≤1.17，
+  // 它就会掉到负样本上界（0.329 ÷ 0.28 = 1.175）以下 —— 这条会红，提醒他重做标定。
+  const MEASURED_NEGATIVE_CEILING = 0.329;
+  const MEASURED_BORDERLINE_POSITIVE_TOP = 0.417;
+  check('分数线高于实测负样本上界（没有"本来找不到"的提问会被跳过改写）',
+    strongHitScore(0.28) > MEASURED_NEGATIVE_CEILING,
+    `分数线=${strongHitScore(0.28)} 负样本上界=${MEASURED_NEGATIVE_CEILING}`);
+  check('分数线高于实测擦边正样本上界（擦边命中不会被当成强命中）',
+    strongHitScore(0.28) > MEASURED_BORDERLINE_POSITIVE_TOP,
+    `分数线=${strongHitScore(0.28)} 擦边上界=${MEASURED_BORDERLINE_POSITIVE_TOP}`);
   eq('阈值被设成 0 时有下限（0 → 0，不会"任何候选都算强命中"）', strongHitScore(0), 0);
   eq('负数阈值也不产生负分数线', strongHitScore(-1), 0);
   check('非数字阈值退化为 0（而不是 NaN 让所有比较都为假）', strongHitScore(undefined) === 0 && Number.isFinite(strongHitScore('x')));
@@ -341,6 +364,17 @@ console.log('\n=== 11. 「强命中跳过改写」的门槛 ===');
   check('相关查询的最高分 ≥ 默认分数线（该跳过改写）', best >= strongHitScore(0.28), `实际最高分=${best.toFixed(3)}`);
   const miss = localTopScore(index.search('明天北京天气预报怎么样', { limit: 5 }).map((hit) => ({ score: hit.score })));
   check('不相关查询的最高分 < 分数线（不该跳过改写）', miss < strongHitScore(0.28), `实际最高分=${miss.toFixed(3)}`);
+  /* **擦边样本不许触发跳过**（这条是"跳过 = 本来就能找到"的守卫，能失败）：
+   * 造一条"刚过 minScore 一点点"的候选（0.30，正是实测擦边正样本的量级），
+   * 断言它**低于**分数线 —— 即它仍然会被送去改写。
+   * 把 STRONG_HIT_RATIO 调成 1.0（或把 thresholds 口径改成 >= minScore）→ 这一条立刻红。 */
+  const borderline = 0.30;
+  check('擦边命中（刚过 minScore 的 0.30）不会被当成强命中而跳过改写',
+    borderline >= 0.28 && borderline < strongHitScore(0.28),
+    `擦边=${borderline} 分数线=${strongHitScore(0.28)} —— 分数线下调会让"擦边"也跳过改写`);
+  // 对照：真正的强命中（实测正样本里 top-1 ≥ 0.42 的那 38 条）必须能跳过，否则"跳过"永不发生
+  check('强命中（0.42 以上）仍然跳过改写（否则这条省钱路径形同不存在）',
+    0.43 >= strongHitScore(0.28), `0.43 vs 分数线=${strongHitScore(0.28)}`);
 }
 
 console.log('\n=== 12. 同一轮里不注入近重复的块（真实浪费：约 195 token/轮）===');
@@ -1602,6 +1636,136 @@ console.log('\n=== 29. C2.3：「恢复默认设置」逐键重置，但保留�
   eq('档位本来是 off → 重置后仍是 off', after2.llmMode, 'off');
   eq('且开关仍是关的', after2.llmAssistEnabled, false);
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n=== 30. 入库体积收口：每条工具结果 ≤ toolResultMaxChars ===');
+{
+  /* 真实缺陷（2026-10-08 修）：`toolRecords` 早先是**先切后拼** ——
+   *   text = `${text.slice(0, maxChars)}…（原 N 字符，已截断）``，落盘时再拼上 `【工具 …】` 首行,
+   * 于是记录 text 的长度 = maxChars + 60~70。真实夹具库里实测 22/210 条越界，最大 4068（上限 4000）。
+   * 现在收口在一个纯函数（`clampToolText` + `toolRecordText`），并在 `rawRecords` 的合并出口
+   * **再收口一次**（那是唯一绕不过去的点）。
+   * 能失败：把 `toolRecords` 里的 `toolRecordText(...)` 换回 `text.slice(0, maxChars) + 首行`
+   * （或把出口那行 `clampToolRecord` 删掉），下面第 1/2/6/7 条立刻红。 */
+  const longTarget = `E:\\项目\\docs\\${'很长的目录名'.repeat(12)}\\spec.md`;
+  const tinyTarget = `E:\\项目\\${'很长的目录名'.repeat(30)}\\spec.md`; // 目标长到标题被 slice(0, 60) 截断
+  const huge = '工具结果正文。'.repeat(40000); // 28 万字符（任务要求量级的 40 万字符同口径）
+  const huge400k = '工具结果正文。'.repeat(60000); // 42 万字符
+  const settings = {
+    includeToolResults: true, toolResultNames: 'read, grep, glob, web_fetch, history_read',
+    toolResultMaxChars: 4000, toolResultBudgetChars: 120000, maxRawCharsPerCompaction: 400000,
+  };
+  const call = (id, name, filePath) => ({
+    type: 'tool/call', seq: 1, data: { callId: id, name, arguments: JSON.stringify({ file_path: filePath }) },
+  });
+  const result = (id, text, seq = 2) => ({
+    type: 'tool/result', seq, data: { message: { toolCallId: id, content: [{ type: 'text', text }] } },
+  });
+  const ingest = (events, overrides = {}) => rawRecords({
+    session: { snapshotEvents: () => events }, sessionId: 's', compactionId: 'c1', at: '2026-10-08T00:00:00.000Z',
+    range: { start: 1, end: 99 }, settings: { ...settings, ...overrides }, cwd: 'E:\\项目',
+  });
+
+  // ① 40 万字符 → 入库记录 ≤ 上限（且真的还是"截断过"的那条）
+  const big = ingest([call('c1', 'read', longTarget), result('c1', huge400k)]);
+  eq('40 万字符的工具结果仍然入库（不是被整条丢掉）', big.records.length, 1);
+  check('入库记录 ≤ toolResultMaxChars（4000）', big.records[0].text.length <= 4000,
+    `实际=${big.records[0].text.length}`);
+  eq('长度恰好用满上限（不是"提前砍一大截"）', big.records[0].text.length, 4000);
+  eq('截断计数照旧 +1', big.toolTruncatedItems, 1);
+  // ② 上限设成 200（面板下限）也要 ≤ 200；目标长到标题被截断时同样成立
+  const small = ingest([call('c2', 'read', tinyTarget), result('c2', huge, 3)], { toolResultMaxChars: 200 });
+  check('上限 200 时记录 ≤ 200（含首行与截断说明）', small.records[0].text.length <= 200,
+    `实际=${small.records[0].text.length}`);
+  // ③ 量级守恒：上限越大留下的正文越多（不是"一律砍到同一长度"）
+  const mid = ingest([call('c3', 'read', longTarget), result('c3', huge, 5)], { toolResultMaxChars: 800 });
+  check('上限 800 与 4000 留下不同长度的正文（说明上限真的在起作用）',
+    mid.records[0].text.length > 200 && mid.records[0].text.length <= 800,
+    `800→${mid.records[0].text.length}`);
+  // ④ **另一条出口**（被压掉那段只有工具结果、没有对话轮）也必须 ≤ 上限
+  const toolsOnly = ingest([call('c4', 'web_fetch', 'https://example.com/a'), result('c4', huge, 7)]);
+  check('"只有工具结果"那条出口同样 ≤ 上限', toolsOnly.records[0].text.length <= 4000,
+    `实际=${toolsOnly.records[0].text.length}`);
+  // ⑤ 自指噪声：读本插件自己的文件不入 L2，但**诊断计数照记**
+  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const self = ingest([
+    call('c5', 'read', path.join(pluginRoot, 'scripts', 'harness.mjs')), result('c5', huge, 9),
+    call('c6', 'read', 'E:\\项目\\src\\app.ts'), result('c6', '用户项目的源码正文'.repeat(200), 11),
+  ]);
+  eq('读插件自己的源码 → 不入 L2', self.records.length, 1);
+  eq('留下来的那条是用户项目的文件', self.records[0].title.includes('app.ts'), true);
+  eq('诊断计数 selfSourceSkipped=1（跳过不是静默的）', self.toolSelfSourceSkipped, 1);
+  eq('用户项目那条照常入库（没有扩大成"排除所有代码文件"）', self.toolKept, 1);
+  // 相对路径（工作区 cwd = 插件根）同样算自指
+  const relativeSelf = ingest([
+    { type: 'tool/call', seq: 13, data: { callId: 'c7', name: 'read', arguments: JSON.stringify({ file_path: 'lib/ingest.js' }) } },
+    result('c7', '插件源码', 14),
+  ]);
+  const relativeSelfWithCwd = rawRecords({
+    session: {
+      snapshotEvents: () => [
+        { type: 'tool/call', seq: 13, data: { callId: 'c7', name: 'read', arguments: JSON.stringify({ file_path: 'lib/ingest.js' }) } },
+        result('c7', '插件源码', 14),
+      ],
+    },
+    sessionId: 's', compactionId: 'c1', at: 'x', range: { start: 13, end: 14 }, settings, cwd: pluginRoot,
+  });
+  eq('相对路径 + cwd 在插件内 → 也算自指（不入 L2）', relativeSelfWithCwd.records.length, 0);
+  eq('（对照）相对路径但 cwd 是用户项目 → 照常入库', relativeSelf.records.length, 1);
+  // ── 纯函数（不经过 rawRecords 也能钉住口径）──
+  eq('clampToolText 是硬上限（40 万 → 4000）', clampToolText(huge400k, 4000).text.length, 4000);
+  eq('clampToolText 在限内不动（幂等）', clampToolText('短正文', 4000).text, '短正文');
+  /* 构造处（`toolRecords`）本身也必须收口 —— 不能只靠 `rawRecords` 的出口兜底：
+   * 出口是防御性的第二道；第一道在构造处。能失败：把 `toolRecords` 里的 `toolRecordText(...)`
+   * 换回 `text.slice(0, maxChars)` + 首行拼接（旧写法）→ 下面两条红（实测旧写法落盘 4066）。
+   * 同时给出**旧行为的量级证据**：上限 4000 时旧写法会多出首行 + 截断说明 ≈ 60~70 字符。 */
+  const builtDirect = toolRecords({ events: [call('c10', 'read', longTarget), result('c10', huge, 23)], settings });
+  eq('（前提）构造处产出了 1 条工具记录', builtDirect.records.length, 1);
+  check('构造处（toolRecords）本身就 ≤ 上限（不依赖出口兜底）',
+    builtDirect.records[0].text.length <= 4000, `实际=${builtDirect.records[0].text.length}`);
+  check('（对照）旧写法在同一份输入上会越界（说明这条断言不是恒真）',
+    4000 + `【工具 read 的结果 · ${longTarget.replace(/\\/g, '/').split('/').slice(-2).join('/')}】\n`.length
+      + '…（原 420000 字符，已截断）'.length > 4000,
+    '旧写法落盘长度 = maxChars + 首行 + 截断说明');
+  const assembled = toolRecordText('read', 'a/b.md', 'hello', 4000);
+  check('toolBodyOf 能把首行还原掉（出口二次收口靠它）', toolBodyOf(assembled.text) === 'hello',
+    JSON.stringify(toolBodyOf(assembled.text)));
+  /* 出口收口的**幂等性**（不幂等会把刚夹好的记录又改小，等于静默丢内容）：
+   * 出口拿到"已经夹好"的记录必须原样返回。判据用"落盘记录相对上限的占用率"——
+   * 若出口把截断说明重新当成正文装配，占用率会掉到 ~3982/4000 = 99.5%，正文被静默削掉 18 字符。
+   * 能失败：把 `clampToolRecord` 里"已在上限内就原样返回"的早返回删掉 → 占用率 < 99.8% → 红。 */
+  const large = ingest([call('c8', 'read', longTarget), result('c8', huge, 17)]);
+  const occupancy = large.records[0].text.length / 4000;
+  check('出口收口对"已经夹好"的记录是幂等的（占用率不下降，正文不被静默削掉）',
+    occupancy >= 0.998, `占用率=${(occupancy * 100).toFixed(2)}%（长度 ${large.records[0].text.length}）`);
+  /* 出口收口必须真的在起作用：把"未经收口"的超长文本当正文喂进管线（模拟将来新增的生成路径），
+   * 断言落盘记录 ≤ 上限。删掉 `rawRecords` 合并出口那行 `clampToolRecord` → 这一条红。 */
+  const overlong = '越界正文。'.repeat(3000); // 1.5 万字符，远超 4000
+  const bypass = rawRecords({
+    session: {
+      snapshotEvents: () => [
+        { type: 'tool/call', seq: 21, data: { callId: 'c9', name: 'read', arguments: JSON.stringify({ file_path: 'E:\\项目\\a\\b.md' }) } },
+        result('c9', overlong, 22),
+      ],
+    },
+    sessionId: 's', compactionId: 'c1', at: 'x', range: { start: 21, end: 22 }, settings, cwd: 'E:\\项目',
+  });
+  check('1.5 万字符的工具结果落盘 ≤ 4000（出口收口在起作用）',
+    bypass.records.length === 1 && bypass.records[0].text.length <= 4000,
+    `条数=${bypass.records.length} 长度=${bypass.records[0]?.text.length}`);
+  // `selfSourcePath` 的窄口径：只认插件目录，别的一律放行
+  eq('selfSourcePath：插件内绝对路径命中', selfSourcePath({ file_path: path.join(pluginRoot, 'lib', 'host.js') }, 'E:\\项目', pluginRoot) !== '', true);
+  eq('selfSourcePath：用户项目相对路径不命中', selfSourcePath({ file_path: 'src/app.ts' }, 'E:\\项目', pluginRoot), '');
+  eq('selfSourcePath：没有路径参数（如 web_fetch）不命中', selfSourcePath({ url: 'https://x/y' }, 'E:\\项目', pluginRoot), '');
+  eq('selfSourcePath：参数是坏 JSON 字符串时不抛错', selfSourcePath('{不是 JSON', 'E:\\项目', pluginRoot), '');
+  // ⑥ 摘要块是"软上限"的另一件事：maxChars 900 + 并入碎片（`mergeTinyBlocks` 的 minChars 80）
+  const summary = summaryRecords({
+    sessionId: 's', compactionId: 'c', at: 'x',
+    summary: [{ type: 'text', text: `## 标题\n${'正文段落。'.repeat(4000)}` }],
+  });
+  check('摘要块有上限（口径是 maxChars + minChars = 980，不是硬 900）',
+    summary.every((record) => record.text.length <= 980),
+    `最大=${Math.max(...summary.map((record) => record.text.length))}`);
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);
