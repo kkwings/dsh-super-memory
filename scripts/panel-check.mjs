@@ -44,7 +44,51 @@ const known = new Set(Object.keys(DEFAULTS));
 const editable = new Set(EDITABLE_FIELDS);
 const usedKeys = new Set();
 for (const m of client.matchAll(/effective\(\s*'([A-Za-z0-9_]+)'/g)) usedKeys.add(m[1]);
-for (const m of client.matchAll(/patch\(\s*\{\s*([A-Za-z0-9_]+)/g)) usedKeys.add(m[1]);
+
+/**
+ * 取出 `client.js` 里所有 `patch({ … })` 的**全部**键名（含跨行 / 多键）。
+ *
+ * 2026-10-08 改：原先是 `client.matchAll(/patch\(\s*\{\s*([A-Za-z0-9_]+)/g)` ——
+ * **只抓第一个键**。今天 40 个调用点恰好都是单键，所以它看起来是对的；但只要有人写成
+ * `patch({ minScore: v, maxItems: n })`，第二个键就完全不检查 —— 一个"面板改不动"的
+ * 键（不在 EDITABLE_FIELDS 里）会被静默放行，用户点了没反应且没有任何提示。
+ * 这里改成"定位 `patch({` → 花括号配对 → 取对象体内所有 `键:`"。
+ * @param {string} source - client.js 源码。
+ * @returns {Set<string>} 键名集合。
+ */
+function patchKeys(source) {
+  const keys = new Set();
+  const re = /patch\(\s*\{/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    let i = m.index + m[0].length;
+    let depth = 1;
+    let body = '';
+    for (; i < source.length && depth > 0; i += 1) {
+      const ch = source[i];
+      if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) break;
+      }
+      body += ch;
+    }
+    for (const hit of body.matchAll(/([A-Za-z_][A-Za-z0-9_]*)\s*:/g)) keys.add(hit[1]);
+    re.lastIndex = i + 1;
+  }
+  return keys;
+}
+// 自检（**能失败**）：把上面换回"只抓第一个键"的正则，这一条立刻红。
+// 用途：client.js 目前所有 patch({…}) 都是单键，"漏抓多键"这个 bug 在真实源码上看不出来。
+{
+  const multi = patchKeys('patch({ a: 1, b: two,\n  c: three, })');
+  if (multi.size !== 3 || !multi.has('b') || !multi.has('c')) {
+    fail(`patchKeys 抓不到 patch({…}) 里的全部键（抓到：${[...multi].join(',') || '空'}）—— 面板键检查会漏检多键调用`);
+  } else {
+    ok('patchKeys 能抓到 patch({…}) 的全部键（含跨行、多键）');
+  }
+}
+for (const key of patchKeys(client)) usedKeys.add(key);
 const unknown = [...usedKeys].filter((k) => !known.has(k));
 const blocked = [...usedKeys].filter((k) => known.has(k) && !editable.has(k));
 console.log(`  面板用到 ${usedKeys.size} 个键：${[...usedKeys].sort().join(', ')}`);

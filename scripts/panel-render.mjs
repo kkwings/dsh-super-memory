@@ -642,6 +642,13 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   check('⑥ 展开后有 storeDir「记忆目录」输入框与「恢复默认设置」按钮',
     diagText.includes('记忆目录') && diagText.includes('恢复默认设置'),
     '这两项属于 ⑥（诊断与路径），不该跟着「参数设置」走');
+  /* 「恢复默认设置」的行为提示必须先写清楚（2026-10-08）：
+   * 它现在是"逐键重置 + 保留模型档位"，不再是删掉整个设置文件。按钮上只有四个字，
+   * 用户点之前必须能知道"模型选择不会被清掉"，否则要么不敢点、要么点了才发现差别。
+   * 能失败：把 client.js 里那句 dsm-hint 删掉 / 改成不提"保留模型选择"，这一条立刻红。 */
+  check('⑥ 的「恢复默认设置」写明了会重置参数但保留模型选择',
+    diagText.includes('会重置所有参数，但保留模型选择'),
+    '按钮 hint 丢失 —— 用户无从得知模型档位不会被清掉（2026-10-08 就是这么丢的）');
   check('⑥ 展开后有「写打分日志」与「启动时回填」两个开关',
     diagText.includes('写打分日志') && diagText.includes('启动时回填'),
     '找不到 ⑥ 的两个开关');

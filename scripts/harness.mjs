@@ -104,6 +104,10 @@ const { mergeKeywords, parseJsonArray, parseJsonObject } = await import('../lib/
 const { diagnoseMiss } = await import('../lib/diagnose.js');
 const { toolRecords } = await import('../lib/ingest.js');
 const { RECALL_HEAD_PREFIX } = await import('../lib/recall.js');
+// ③ 段要用它直接查库（钉住"夹具自污染"这个原因）；⑥ 段原来在这里再 import 一次，
+// 已上移 —— 重复声明同一常量会直接 SyntaxError。
+const { MemoryIndex } = await import('../lib/retrieval.js');
+const { readRecords } = await import('../lib/store.js');
 
 /**
  * 假模型服务：由测试用例在 `apply()` **之前**设置，用来跑失败矩阵。
@@ -268,7 +272,23 @@ const second = injected(session);
 console.log('第二次注入文本是否完全相同（应当相同 → 不追加快照）:', first === second);
 
 /* ── ③ 提问命中注入 / 未命中 0 token ────────────────────────────────────── */
-console.log('\n=== ③ 提问命中 / 未命中 ===');
+console.log('\n=== ③ 提问命中 / 未命中（真断言：正样本必须注入、负样本必须 0 字符）===');
+/* 这一段 2026-10-08 从"只打印诊断"改成**真断言**：
+ *   ① 正样本（夹具里真实的历史提问，relevantQuestions 全部 5 条）→ 必须含召回块；
+ *   ② 负样本（12 条与本库无关的日常问题）→ 召回块字符数必须为 0；
+ * 任一条不成立就 process.exitCode = 1（自检失败 = 1，与脚本头的退出码约定一致）。
+ * 能失败：把 `lib/retrieval.js` 的命中证据门 `MIN_MATCHED_TERMS` 改成 0 → 负样本立刻注入
+ * （它们在新口径下的相对分是 1.0 上下）；把 minScore 抬到 2 → 正样本立刻全部漏掉。 */
+let d3Passed = 0;
+let d3Failed = 0;
+const expect3 = (label, condition, detail = '') => {
+  if (condition) { d3Passed += 1; console.log(`  ✓ ${label}`); return; }
+  d3Failed += 1; process.exitCode = 1;
+  console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
+};
+/** 注入文本里"召回块"部分的字符数（0 = 没有召回块）。 */
+const recallCharsOf = (out) => (out.includes(RECALL_HEAD_MARK) ? out.split(RECALL_HEAD_MARK)[1].length : 0);
+
 const relevantQuestions = [];
 for (const event of events) {
   if (event.type === 'user/message' && event.data?.source?.kind === 'user' && Number(event.seq) < 2000) {
@@ -277,25 +297,72 @@ for (const event of events) {
   }
 }
 let seqCursor = 900000;
-for (const question of [relevantQuestions[2], relevantQuestions[9]]) {
-  if (question === undefined) continue;
-  const s = sessionWithQuestion(question, seqCursor++);
-  const out = injected(s);
-  const hasRecall = out.includes(RECALL_HEAD_MARK);
-  const recallPart = hasRecall ? out.split(RECALL_HEAD_MARK)[1] : '';
-  console.log(`\nQ: ${question.replace(/\s+/g, ' ').slice(0, 40)}`);
-  console.log(`   总注入 ${out.length} 字符；含召回块: ${hasRecall}`);
-  const lines = (recallPart ?? '').split('\n').filter((l) => l.startsWith('- '));
-  console.log(`   召回条数 ${lines.length}；每条最长 ${Math.max(0, ...lines.map((l) => l.length - 2))} 字符（上限 300，已减去"- "项目符号）`);
-}
-
-console.log('\n不相关问题（用干净会话状态：召回块应当为空 → 0 额外 token）：');
-for (const question of ['明天北京天气预报怎么样', '帮我写一首关于春天的五言绝句']) {
+for (const question of relevantQuestions) {
+  // 每条探针都用一份**干净的会话状态**（复制库 + 新会话 id）：排除冷却/去重/粘住的参考块，
+  // 否则"这一条没注入"可能只是被上一条的冷却挡住了，断言会变成假绿。
   const s = cloneSession(question, seqCursor++);
   const out = injected(s);
-  const hasRecall = out.includes(RECALL_HEAD_MARK);
-  console.log(`   Q: ${question} → 总注入 ${out.length} 字符，召回块 ${hasRecall ? '✗ 竟然注入了' : '✓ 空'}`);
+  const recallChars = recallCharsOf(out);
+  const lines = out.split(RECALL_HEAD_MARK)[1]?.split('\n').filter((l) => l.startsWith('- ')) ?? [];
+  console.log(`   Q: ${question.replace(/\s+/g, ' ').slice(0, 40)}`);
+  console.log(`      总注入 ${out.length} 字符；召回块 ${recallChars} 字符 / ${lines.length} 条`);
+  expect3(`相关提问必须注入召回块：${question.replace(/\s+/g, ' ').slice(0, 24)}…`, recallChars > 0, `召回块 ${recallChars} 字符`);
 }
+
+/* 负样本探针（2026-10-08 标定用的 24 条里挑 12 条，全部与本库内容无关）。
+ *
+ * ⚠️ 这里**故意不用**早先那两条（"明天北京天气预报怎么样" / "帮我写一首关于春天的五言绝句"）：
+ * 它们逐字出现在本文件自己里面（就是原来 ③ 段那两行字符串），而夹具会话读过 harness.mjs、
+ * 工具结果原文已经入库（L2 的 `工具 read：scripts/harness.mjs`，4 万字符）。于是
+ * "用户问的那句话逐字躺在一篇已入库文档里" —— **任何词法检索都必然命中**，与阈值无关：
+ * 实测这两条 mc=8 / 13（命中 8 / 13 个不同 token）、score=0.89，远在 minScore 之上。
+ * 在**真实库**（那份没有把 harness.mjs 源码读进库）上，同样两条探针 = 0.000 / 0.000，不注入
+ * （`%TEMP%\dsm-c1-*` 的标定脚本可复现）。所以它们是**夹具自污染**，不是阈值问题；
+ * 这里改成"钉住原因"的断言（见下面的 containsProbeAssertion），而不是假装它们应当为空。 */
+const NEGATIVE_PROBES = [
+  '晚饭吃什么比较好',
+  '帮我订一张下周三去上海的机票',
+  '今天股市收盘了吗',
+  '推荐几部好看的科幻电影',
+  '怎么种小番茄',
+  '狗一天要喂几次',
+  '洗衣机不排水是什么原因',
+  '红烧肉怎么做才不腻',
+  '感冒了吃什么药好得快',
+  '吉他新手先练什么和弦',
+  '马拉松赛前一周怎么吃',
+  '帮我把这段话翻译成法语',
+  /* 硬负样本（**这一条让断言对阈值敏感**）：上面 12 条都是被"命中证据门"挡住的
+   * （命中 ≤2 个 token），所以把 minScore 调到 0.01 也不会注入它们；这一条不同 ——
+   * 它是一句话题空转的日常话，却与库里那块 4 万字符的工具结果共享 6 个通用 bigram，
+   * **过了证据门**，只靠阈值挡住（实测 top-1 = 0.276，阈值 0.28 的下沿）。
+   * 于是：把 minScore 调到 0.01 → 它立刻注入 → 本条断言变红。 */
+  '帮我看看这个问题现在到底是怎么处理的我有点搞不清楚',
+];
+console.log('\n负样本（与本库无关；每条都用干净会话状态：召回块必须为 0 字符）：');
+for (const question of NEGATIVE_PROBES) {
+  const s = cloneSession(question, seqCursor++);
+  const out = injected(s);
+  const recallChars = recallCharsOf(out);
+  console.log(`   Q: ${question} → 总注入 ${out.length} 字符，召回块 ${recallChars === 0 ? '✓ 空' : `✗ ${recallChars} 字符`}`);
+  expect3(`不相关提问必须不注入：${question}`, recallChars === 0, `召回块 ${recallChars} 字符`);
+}
+
+/* 夹具自污染的**可失败**断言：那两条历史探针之所以被召回，是因为库里有一篇逐字包含它们的
+ * 文档。这条断言钉住这个原因 —— 若哪天工具结果不再入库（或探针不再出现在 harness.mjs 里），
+ * 它会变红，提醒把这行诊断重新升级成"应当为空"的断言。 */
+const CONTAMINATED_PROBES = ['明天北京天气预报怎么样', '帮我写一首关于春天的五言绝句'];
+{
+  const probeIndex = new MemoryIndex(readRecords(root, sessionId));
+  for (const probe of CONTAMINATED_PROBES) {
+    const top = probeIndex.search(probe, { limit: 1 })[0];
+    const verbatim = String(top?.record?.text ?? '').includes(probe);
+    console.log(`   （历史探针）"${probe}" → 库里逐字包含它的记录：${verbatim ? `${top.record.title}（mc=${top.matched}，score=${top.score.toFixed(3)}）` : '没有'}`);
+    expect3(`历史"不相关"探针的命中来自夹具自污染（库里有逐字包含它的文档，不是阈值问题）：${probe}`,
+      verbatim, '库里找不到逐字包含它的记录 —— 说明污染已消失，请把这两条改回"必须为空"的断言');
+  }
+}
+console.log(`  ③ 段累计：通过 ${d3Passed} 条，失败 ${d3Failed} 条。`);
 
 /* 同一轮重复调用（工具循环多步）不应产生新文本 */
 const repeatSession = sessionWithQuestion(relevantQuestions[2], seqCursor++);
@@ -625,7 +692,7 @@ console.log('\n原始会话日志是否被动过（只做 stat，不会写）:',
 console.log('DSH_HOME（测试用）:', home);
 
 /* ── ⑥ 验收补充：入库开关 / 工作区隔离 / 回收站自动清理 ─────────────────── */
-const { readRecords } = await import('../lib/store.js');
+/* `readRecords` 已在上面的 import 块里引入（③ 段也要用它）。 */
 console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）===');
 
 // 18) 关掉 L2 入库 → 投递压缩事件不新增 layer:"raw"；重新打开 → 新增（用**空库**，

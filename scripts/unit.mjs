@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url';
 import { DEFAULTS, EDITABLE_FIELDS, INTEGER_BOUNDS, INTEGER_FIELDS, KNOWN_WORKSPACES_MAX, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo } from '../lib/config.js';
 import {
   MARKER, MARKER_END, containment, estimateTokens, extractTitle, neutralizeHeaderText,
+  tokenize,
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords } from '../lib/ingest.js';
@@ -166,9 +167,16 @@ console.log('\n=== 3. 检索与注入上限 ===');
     makeRecord({ layer: 'raw', title: '电影清单', text: '周末想看的两部片子已经加到清单里了，都是老片。', compactionId: 'c1' }),
   ];
   const index = new MemoryIndex(records);
-  const ranked = index.search('命中阈值是怎么定的', { limit: 3 });
+  // 排序口径与闸门无关：这里显式关掉命中证据门（`minMatchedTerms: 0`）只测排序。
+  // 闸门本身在下面与本文件 §27 有独立断言（"改坏就会红"的证据在 §27）。
+  const ranked = index.search('命中阈值是怎么定的', { limit: 3, minMatchedTerms: 0 });
   eq('相关块排在第一位', ranked[0]?.record?.title, '压缩策略');
-  const gated = retrieveTwoTier(index, '命中阈值是怎么定的', { minScore: 0.05, maxItems: 2 });
+  // 2026-10-08：命中证据门生效后，这条问法在这份小语料上只命中 3 个不同 token
+  // （命中 / 中阈 / 阈值），会被门挡住 —— 与阈值无关。所以下面测"阈值放低"要换一条
+  // 命中 ≥ min(4, token 数) 的问法，否则这条断言测的就变成了闸门而不是阈值。
+  eq('（前提）旧问法只命中 3 个 token → 被证据门挡住（放低阈值也没用，挡住它的不是阈值）',
+    retrieveTwoTier(index, '命中阈值是怎么定的', { minScore: 0.01, maxItems: 2 }).hits.length, 0);
+  const gated = retrieveTwoTier(index, '命中阈值定为多少', { minScore: 0.05, maxItems: 2 });
   check('阈值放低后能命中', gated.tier !== 'none', `tier=${gated.tier} top=${gated.topScore}`);
   const strict = retrieveTwoTier(index, '明天北京天气预报怎么样', { minScore: 0.28, maxItems: 2 });
   eq('不相关问题在默认阈值下不命中', strict.tier, 'none');
@@ -327,7 +335,9 @@ console.log('\n=== 11. 「强命中跳过改写」的门槛 ===');
     makeRecord({ layer: 'raw', title: '天气闲聊', text: '今天天气不错，适合出门散步，顺便买点水果回来。', compactionId: 'c1' }),
   ];
   const index = new MemoryIndex(records);
-  const best = localTopScore(index.search('命中阈值是怎么定的', { limit: 5 }).map((hit) => ({ score: hit.score })));
+  // 2026-10-08：`search()` 现在默认带命中证据门（见 §27），所以这两条问法都要过门 ——
+  // "命中阈值定为多少"在这份小语料上命中 5 个不同 token（命中/中阈/阈值/值定/定为）。
+  const best = localTopScore(index.search('命中阈值定为多少', { limit: 5 }).map((hit) => ({ score: hit.score })));
   check('相关查询的最高分 ≥ 默认分数线（该跳过改写）', best >= strongHitScore(0.28), `实际最高分=${best.toFixed(3)}`);
   const miss = localTopScore(index.search('明天北京天气预报怎么样', { limit: 5 }).map((hit) => ({ score: hit.score })));
   check('不相关查询的最高分 < 分数线（不该跳过改写）', miss < strongHitScore(0.28), `实际最高分=${miss.toFixed(3)}`);
@@ -348,7 +358,10 @@ console.log('\n=== 12. 同一轮里不注入近重复的块（真实浪费：约
   /** 走一遍真实管线：检索 → 同轮筛选 → 拼装（两处的 maxCharsPerItem 必须同口径）。 */
   const recall = (records, query, options = {}) => {
     const maxChars = options.maxCharsPerItem ?? 300;
-    const pairs = new MemoryIndex(records).search(query, { limit: 6 });
+    // 本节测"同轮近重复去重"，候选必须**都进得来**才测得到：显式关掉命中证据门
+    // （`minMatchedTerms: 0`）。闸门本身见 §27；这里开着门会把"内容不同的那块"
+    // 提前挡掉，让这条断言变成恒真。
+    const pairs = new MemoryIndex(records).search(query, { limit: 6, minMatchedTerms: 0 });
     const ranked = pairs.map((hit) => ({ ...hit, fp: String(hit.record.fp ?? '') }))
       .sort((a, b) => b.score - a.score);
     const selected = selectFreshHits(ranked, {
@@ -593,7 +606,10 @@ console.log('\n=== 15. 「✕」的 boost 与同轮召回不许重复投喂同�
       text: `结论：晚上做番茄炒蛋与青椒肉丝，米饭多煮一点，别放太多盐。${filler(0x5e00, 60)}`,
     }),
   ];
-  const ranked = new MemoryIndex(records).search('单轮注入上限与晚饭菜单', { limit: 6 })
+  // 这一节测的是 `selectFreshHits` 的去重口径，**不是**检索闸门：候选由测试自己造，
+  // 所以显式关掉命中证据门（`minMatchedTerms: 0`），否则"晚饭菜单"这块（与查询只有
+  // 1–2 个巧合 bigram）会被门挡掉，这一节就测不到 boost 去重了。闸门本身见 §27。
+  const ranked = new MemoryIndex(records).search('单轮注入上限与晚饭菜单', { limit: 6, minMatchedTerms: 0 })
     .map((hit) => ({ ...hit, fp: String(hit.record.fp ?? '') }))
     .sort((a, b) => b.score - a.score);
   check('两块都被检索到（前提成立）', ranked.length >= 2, `实际候选=${ranked.length}`);
@@ -856,6 +872,10 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
       minScore: 0.01,
       protectRecentDays: 0,
       storeDir: '.dsh-compaction-memory',
+      // 2026-10-08：✕ 路径的"允不允许调用"判据统一成 `llmMode !== 'off'`（原先判
+      // `llmAssistEnabled`），所以这一节的夹具必须给出模型档位；下面的"档位关闭"用例
+      // 也跟着改成传 `llmMode: 'off'`（那才是"档位关着"的唯一表达方式）。
+      llmMode: 'custom',
       llmAssistEnabled: true,
       llmRecallRewrite: true,
       ...overrides,
@@ -916,7 +936,7 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
     const offCount = { calls: 0 };
     let last = null;
     for (let i = 0; i < 3; i += 1) {
-      last = await driveDiagnose({ settings: { llmAssistEnabled: false }, count: offCount, session, body: { workspace, session, query: UNRELATED, rewrite: true, boost: true } });
+      last = await driveDiagnose({ settings: { llmMode: 'off' }, count: offCount, session, body: { workspace, session, query: UNRELATED, rewrite: true, boost: true } });
     }
     eq('模型档位关闭：一次都没调用模型', offCount.calls, 0);
     eq('模型档位关闭：回执里没有改写结果', last?.value?.assist?.rewrite ?? null, null);
@@ -1021,7 +1041,9 @@ console.log('\n=== 22. outTokensEst：流结束后按真实输出记账 ===');
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-usage-'));
   const usagePath = path.join(dir, 'usage.json');
-  let settingsValue = { ...DEFAULTS, llmAssistEnabled: true, llmCacheEnabled: false };
+  // 2026-10-08：网关的闸门判据改成 `llmMode !== 'off'`（见 §28），所以这里必须同时给出档位 ——
+  // 只写 `llmAssistEnabled: true` 已经**不再**代表"允许调用"（那正是本次要修的不一致）。
+  let settingsValue = { ...DEFAULTS, llmMode: 'custom', llmAssistEnabled: true, llmCacheEnabled: false };
   /** 假模型流：吐两个正文分片 + 一个思考分片，然后 finish。 */
   const streamOf = async function* streamOf() {
     yield { type: 'reasoning-delta', text: '想'.repeat(20) };
@@ -1431,6 +1453,155 @@ console.log('\n=== 26. 已知工作区名单：容量与"最近使用优先" ===
   check('默认登记会落盘（写操作那一档）',
     JSON.parse(fs.readFileSync(file, 'utf8')).knownWorkspaces[0] === 'E:\\ws-persist');
   fs.rmSync(temp, { recursive: true, force: true });
+}
+
+/* ── 2026-10-08 新增：C1 检索口径 + C2 三个便宜修复 ───────────────────────── */
+
+console.log('\n=== 27. C1：按"可匹配 IDF 质量"归一 + 命中证据门 ===');
+{
+  /* 这一节盯的是两个**实测**缺陷（标定脚本与数据见报告；harness ③ 段是端到端版本）：
+   *   ① 长提问被系统性惩罚 —— 旧分母是"查询里**全部** token 的 IDF 之和"，库里根本没出现过的
+   *      词照样进分母且 IDF 最高（df=0 → idf≈log(1+2n)）。实测：同一条相关问题粘一段无关长尾，
+   *      分数从 1.479 掉到 0.210（掉出阈值 → 漏检）。现在分母只算**库里出现过**的 token。
+   *   ② 1–2 个巧合 bigram 就能过阈值 —— 中文按 bigram 分词，日常词在窄领域小库里 IDF 反而高。
+   *      实测两个真实库：26 条无关问题命中 token 数 ≤2，长相关提问 ≥4 → 加"命中 ≥min(4, token 数)"。
+   * 每条都按"改坏就会红"写：
+   *   · 分母改回全量 ideal → 第 1 条红；
+   *   · 删掉 `minMatchedTerms`（或把 MIN_MATCHED_TERMS 改成 1）→ 第 3/4/5 条红。 */
+  const corpus = [
+    makeRecord({ layer: 'summary', title: '命中阈值标定', text: '结论：命中阈值 minScore 定为 0.28，依据是正负样本的 top-1 分数分布。', compactionId: 'c1' }),
+    makeRecord({ layer: 'raw', title: '注入成本账', text: '问：我们刚才定的注入成本账是多少？ 答：单轮注入上限 700 token，最多两条，每条 300 字符。', compactionId: 'c1' }),
+    makeRecord({ layer: 'raw', title: '天气闲聊', text: '今天天气比较好，适合出门散步，顺便买点水果回来。', compactionId: 'c1' }),
+    makeRecord({ layer: 'raw', title: '晚饭菜单', text: '晚上做番茄炒蛋和青椒肉丝，米饭多煮一点。', compactionId: 'c1' }),
+  ];
+  const index = new MemoryIndex(corpus);
+  const RELEVANT = '我们刚才定的注入成本账是多少';
+  const UNRELATED = '晚饭吃什么比较好';
+  // 长尾必须是"库里一个 token 都不出现"的词：只要粘的词在库里出现过，
+  // 新口径的分母也会跟着变大（那是"库确实多提供了一点可匹配质量"，不是长度漂移）。
+  // 两段互不重复的日常长尾，合计 ≈30 个库内不存在的 token —— 足够把旧口径压到 0.28 以下。
+  const FILLER = '明天去菜市场买排骨和冬瓜炖汤喝 把自行车链条上点油再换个新坐垫子';
+
+  const base = index.search(RELEVANT, { limit: 1 })[0];
+  const padded = index.search(`${RELEVANT} ${FILLER}`, { limit: 1 })[0];
+  check('（前提）相关提问确实命中「注入成本账」', base?.record?.title === '注入成本账', `top=${base?.record?.title}`);
+  check('长尾词（库里没有的词）不再稀释分数：加长后 top-1 分数不降',
+    padded !== undefined && base !== undefined && padded.score >= base.score * 0.99,
+    `base=${base?.score?.toFixed(4)} padded=${padded?.score?.toFixed(4)}`);
+  eq('加长不改变命中的是哪一条', padded?.record?.title, base?.record?.title);
+  // 前后对照（**同一条提问、同一个库**）：旧口径的分母含"库里根本没有的词"，
+  // 加长后直接掉到默认阈值以下 —— 这就是被修掉的漏检。旧口径在本文件里按公式复算。
+  const oldIdeal = (query) => { let sum = 0; for (const token of new Set(tokenize(query))) sum += index.idf(token); return sum; };
+  const oldBase = base.raw / oldIdeal(RELEVANT);
+  const oldPadded = padded.raw / oldIdeal(`${RELEVANT} ${FILLER}`);
+  check('（对照）旧口径下同一条提问加长后会掉到 0.28 以下（漏检），新口径不动',
+    oldBase >= 0.28 && oldPadded < 0.28 && padded.score >= 0.28,
+    `旧 base=${oldBase.toFixed(4)} 旧 padded=${oldPadded.toFixed(4)}；新 base=${base.score.toFixed(4)} 新 padded=${padded.score.toFixed(4)}`);
+  eq('分母只算库内出现过的 token（matchableTerms ≤ queryTerms）',
+    base.matchableTerms <= base.queryTerms && base.matchableTerms > 0, true);
+
+  // 短查询（≤4 个 token）闸门取 min(4, token 数)：2 个 token 全命中就放行 —— 别把短问句误杀。
+  const short = retrieveTwoTier(index, '注入成本', { minScore: 0.28, maxItems: 1 });
+  check('短查询（2 个 token）不会被"≥4"误杀', short.hits.length > 0, `tier=${short.tier} top=${short.topScore}`);
+
+  // 不相关短问句：库里只有 1 个巧合 bigram（"比较好"）→ 证据门必须挡住它，
+  // 而且**阈值放到 0.01 也挡得住**（说明真正起作用的是证据门，不是阈值）。
+  // 前提断言要关掉闸门才看得见"确实有巧合命中"（否则它是 0 命中，断言会变成假绿）。
+  const loose = index.search(UNRELATED, { limit: 3, minMatchedTerms: 0 })[0];
+  check('（前提）不相关短问句在库里确有 1 个巧合 bigram（不是 0 命中，否则这条断言是假绿）',
+    loose !== undefined && loose.matched >= 1 && loose.matched < 4, `matched=${loose?.matched}`);
+  eq('证据门（≥3 个不同 token）把它挡在候选之外', index.search(UNRELATED, { limit: 3, minMatchedTerms: 3 }).length, 0);
+  eq('两层检索：阈值放到 0.01 也不注入（挡住它的是证据门）',
+    retrieveTwoTier(index, UNRELATED, { minScore: 0.01, maxItems: 2 }).hits.length, 0);
+  check('相关提问在默认阈值下照旧注入',
+    retrieveTwoTier(index, RELEVANT, { minScore: 0.28, maxItems: 2 }).hits.length > 0, 'recall 被闸门误伤');
+}
+
+console.log('\n=== 28. C2.1：「是否允许调用模型」的唯一判据是 llmMode ===');
+{
+  /* 复现用户报的矛盾设置：手改设置文件让 `llmMode:'off'` 与 `llmAssistEnabled:true` 并存。
+   * 旧代码 `check()` 只看 `llmAssistEnabled` → **真的调用模型**，而面板按 llmMode 显示"不调用"。
+   * 现在网关、status()、面板三处都只认 `llmMode !== 'off'`。
+   * 能失败：把 `check()` 改回 `settings.llmAssistEnabled !== true` → 第 1/2 条立刻红。 */
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-llmmode-'));
+  const calls = { n: 0 };
+  const settings = {
+    ...DEFAULTS,
+    llmMode: 'off',
+    llmAssistEnabled: true,
+    llmIngestExpand: true,
+    llmRecallRewrite: true,
+    llmCacheEnabled: false,
+    // 路由也要能解出来：否则扩写路径会先以 NO_ROUTE 返回，测不到"网关闸门"这一层。
+    llmProvider: 'p',
+    llmModel: 'm',
+  };
+  const gateway = createLlmGateway({
+    getLlm: () => ({
+      async *stream() { calls.n += 1; yield { type: 'text-delta', text: '收到' }; yield { type: 'finish', kind: 'stop' }; },
+      listProviders: async () => [],
+    }),
+    getSettings: () => settings,
+    diag: { write: () => {} },
+    usagePath: path.join(dir, 'usage.json'),
+    cachePath: path.join(dir, 'cache.json'),
+  });
+  const test = await gateway.testConnection(null, { provider: 'p', model: 'm' });
+  eq('矛盾设置（llmMode:off + llmAssistEnabled:true）→ 一次都不调用模型', calls.n, 0);
+  eq('回执是 UNAVAILABLE（不是静默成功）', test.code, 'UNAVAILABLE');
+  eq('status().enabled 与面板同源：按 llmMode 报 false', gateway.status().enabled, false);
+  const expand = await gateway.expandKeywords({ session: null, blocks: [{ text: '这一段够长，用来触发一次扩写调用。'.repeat(10) }] });
+  eq('入库扩写路径同样一次不调用', calls.n, 0);
+  eq('扩写回执也是 UNAVAILABLE', expand.code, 'UNAVAILABLE');
+  // 对照：档位打开 → 真的调用（证明上一条不是因为"整条链路坏了"才没调用）
+  settings.llmMode = 'custom';
+  const on = await gateway.testConnection(null, { provider: 'p', model: 'm' });
+  eq('对照：llmMode:custom → 调用一次', calls.n, 1);
+  check('对照：调用成功', on.ok === true, JSON.stringify(on).slice(0, 100));
+  eq('status().enabled 跟着变 true', gateway.status().enabled, true);
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log('\n=== 29. C2.3：「恢复默认设置」逐键重置，但保留模型档位 ===');
+{
+  /* 复现用户今天踩到的坑：点一次「恢复默认设置」= 删掉整个设置文件 → 模型选择一起丢。
+   * 现在只把可编辑字段逐个恢复为 DEFAULTS，保留 `llmMode/llmProvider/llmModel`（显式配置）
+   * 与 `knownWorkspaces`（登记信息），并把重置结果落盘。
+   * 能失败：把 `reset()` 改回 `unlinkSync(this.path)` + 不带 kept → 第 2/3/4/5 条红。 */
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-reset-'));
+  const file = path.join(dir, 'settings.json');
+  const store = new SettingsStore({ path: file });
+  store.update({
+    llmMode: 'custom', llmProvider: 'zhipu-glm', llmModel: 'glm-5.3-flash',
+    minScore: 0.5, maxItems: 1, injectRecall: false, observationTurns: 5,
+  });
+  const before = store.get().settings;
+  eq('（前提）模型档位已写入', `${before.llmMode}/${before.llmProvider}/${before.llmModel}`, 'custom/zhipu-glm/glm-5.3-flash');
+  eq('（前提）参数也确实被改过', `${before.minScore}/${before.maxItems}/${before.injectRecall}/${before.observationTurns}`, '0.5/1/false/5');
+  store.rememberWorkspace('E:\\ws-reset');
+  const after = store.reset().settings;
+  eq('重置后：模型档位原样保留（llmMode）', after.llmMode, 'custom');
+  eq('重置后：provider 保留', after.llmProvider, 'zhipu-glm');
+  eq('重置后：model 保留', after.llmModel, 'glm-5.3-flash');
+  eq('重置后：其余参数逐个回到默认值（minScore）', after.minScore, DEFAULTS.minScore);
+  eq('重置后：maxItems 回默认', after.maxItems, DEFAULTS.maxItems);
+  eq('重置后：injectRecall 回默认', after.injectRecall, DEFAULTS.injectRecall);
+  eq('重置后：observationTurns 回默认', after.observationTurns, DEFAULTS.observationTurns);
+  eq('重置后：knownWorkspaces 保留（面板列表不许突然变空）', after.knownWorkspaces.includes('E:\\ws-reset'), true);
+  // 保留档位 = 保留它派生出来的三个开关（llmMode 是唯一判据，见 §28）
+  eq('重置后：档位派生出的 llmAssistEnabled 仍为 true（与 llmMode 一致）', after.llmAssistEnabled, true);
+  // 磁盘断言写成"存在 + 内容"，而不是直接 readFileSync：旧实现（删掉设置文件）下
+  // 直接读会抛 ENOENT 把整轮测试打断，看不到完整的失败清单。
+  check('重置结果会落盘（盘上文件仍在）', fs.existsSync(file), '设置文件被删掉了（旧实现就是 unlink 整个文件）');
+  const onDisk = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+  eq('盘上写着保留后的模型档位与重置后的参数', `${onDisk.llmMode}/${onDisk.llmModel}/${onDisk.minScore}`, `custom/glm-5.3-flash/${DEFAULTS.minScore}`);
+  // 反过来：档位本来就是默认 off 时，重置后也必须是 off（不许凭空"保留"出一个档位）
+  const store2 = new SettingsStore({ path: path.join(dir, 'settings2.json') });
+  store2.update({ minScore: 0.9 });
+  const after2 = store2.reset().settings;
+  eq('档位本来是 off → 重置后仍是 off', after2.llmMode, 'off');
+  eq('且开关仍是关的', after2.llmAssistEnabled, false);
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);
