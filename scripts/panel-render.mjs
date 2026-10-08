@@ -68,9 +68,20 @@ function sameDeps(previous, next) {
  */
 const controls = { audit: [] };
 
-/** 从本次审计表里按标签取控件。 */
+/**
+ * 从本次审计表里按标签取控件。
+ *
+ * ⚠️ 取**最后一条**，不是第一条（2026-10-08 修）：`render()` 会稳定迭代最多 8 轮，
+ * 每轮都往审计表里追加一份条目，而设置/提供方清单是**异步落地**的（第一轮还只是初值）。
+ * 原来取第一条 = 断言读的是**第一轮**的过期快照 —— 于是"下拉里有哪些选项"这类断言
+ * 在变异实验里完全测不红（把兜底项改成无条件显示都全绿）。最后一轮才对应屏幕上那一帧。
+ * @param {string} label - 控件的 auditLabel。
+ * @returns {{kind:string,label:string,value:unknown,options?:string[]}|null} 最后一个同名控件。
+ */
 function controlByLabel(label) {
-  return controls.audit.find((item) => item.label === label) ?? null;
+  let found = null;
+  for (const item of controls.audit) if (item.label === label) found = item;
+  return found;
 }
 
 /** 解析过程中"当前控件"的祖先链（`resolveTree` 维护；控件原型据此找自己的标签）。 */
@@ -497,6 +508,12 @@ check('⑦ 三种选择都在', text.includes('不调用大模型') && text.incl
  * 桩 React 不会点按钮，所以展开态是**直接往 hook 槽位里种**（见下 slots 表）。
  * `openLlm=false` 用来验证「⑦ 收起时统计照样在」——⑦ 自身也有一个折叠按钮。 */
 const STABLE_PASSES = 8;
+/**
+ * 本次 `render()` 要种进「已配置提供方清单」的桩数据（`null` = 不种，走 /llm/providers 的
+ * 正常路径）。桩渲染没有真正的重渲染，effect 里 `setState` 的结果回灌不进下一轮 —— 所以那份
+ * 清单**只能在种 hook 槽位时**喂进去（面板为此提供 `window.__dsmProviders` 这个只改初值的口）。
+ */
+let seedProviders = null;
 async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   const panelKey = [...hookStore.keys()].find((key) => key.startsWith('root<PanelBoundary>.0<Panel>#'));
   if (panelKey === undefined) {
@@ -520,6 +537,8 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
     if (key.startsWith(base)) hookStore.delete(key);
   }
   initialSlots.forEach((value, index) => hookStore.set(`${base}#${index}`, value));
+  // 提供方清单只能在这一刻种（面板的初值读的就是 window.__dsmProviders）
+  window.__dsmProviders = Array.isArray(seedProviders) ? seedProviders : undefined;
   /* ⚠️ 槽位下标是**数组下标**，不是"第几个 useState"。实际顺序（与 lib/client.js 里
    * `React.useState` 的出现顺序一致，加字段时请同步更新这张表）： */
   const SLOTS = {
@@ -702,21 +721,46 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
       control !== null && control.kind === 'select' && String(control.value) === value,
       `控件=${JSON.stringify(control)}（若绑到已删除的 llmIngest*/llmRecall* 键，这里会读到空串）`);
   }
-  /** 取出某个 `AuditedSelectRow` 块的源码（从标签行到 `}),` 收尾）。 */
+  /**
+   * 取两个下拉**各自**在 `client.js` 里的源码块（从块的唯一标记到 `}),` 收尾）。
+   *
+   * ⚠️ 三个坑（2026-10-08 实测各踩过）：
+   *   ① 必须 `lastIndexOf`：`client.js` 的源码拼在**本测试文件之后**，而这段断言自己也会写
+   *      字面量 `auditLabel: '模型'` —— 用 `indexOf` 会切到断言自己身上（报"没找到 patch"）；
+   *   ② 起点不能停在 `auditLabel` 那一行：模型块里 `hint: modelHintFor(scope),` 自身就以
+   *      `}),` 收尾，从 `auditLabel` 往后找第一个 `}),` 会**在 hint 行截断**，把后面的
+   *      `onCommit: (value) => patch(...)` 整段切掉 → 两条"补丁键"断言假红；
+   *   ③ 两个下拉的收尾 `}),` 都不是字符串字面量，切片不会误伤（切到 `}),` 前一位为止）。
+   */
   const blockOf = (label) => {
-    const start = source.indexOf(`auditLabel: '${label}'`);
+    const marker = label === '提供方' ? "onCommit: (value) => patch(providerChangePatch(value))" : 'hint: modelHintFor(scope),';
+    const start = source.lastIndexOf(marker);
     if (start < 0) return '';
     const end = source.indexOf('}),', start);
     return end < 0 ? '' : source.slice(start, end);
   };
-  for (const [label, key] of [['提供方', 'llmProvider'], ['模型', 'llmModel']]) {
-    const block = blockOf(label);
-    // 取 `patch({ … })` 里写进去的**全部键名**（`\}` 收尾即可命中被截断的块尾）
-    const patched = [...block.matchAll(/patch\(\{([^}]*)/g)]
+  /* 两个下拉的提交补丁各钉一条。
+   *
+   *   · 「提供方」：补丁由 `providerChangePatch()` 生成 —— 修法要求"换提供方时，若型号不属于
+   *     新提供方，**同一次补丁**里带上 `llmModel: ''`"。所以这里不能再要求
+   *     `patch({ llmProvider: value })`（那是修复前的写法），改成钉死"就走这个函数"；
+   *     真正的键集合（含 `llmModel: ''`）由下面 `llmModelScope` 那节按**行为**断言。
+   *     （旧影子键 `llmIngest…` / `llmRecall…` 也不许写回去：`providerChangePatch` 的返回值里
+   *      只有 `llmProvider` / `llmModel` 两个键，`panel-check.mjs` 的 patchKeys 会把
+   *      每个键拿去与 EDITABLE_FIELDS 比对。）
+   *   · 「模型」：仍是"只含新键 `llmModel`"。**必须按块单独断言** —— 2026-10-08 起自动清空
+   *     那条 effect 也会 `patch({ llmModel: '' })`，按标签取块会把两处混在一起。 */
+  {
+    const providerBlock = blockOf('提供方');
+    check('⑦「提供方」的提交走 providerChangePatch()（换提供方时同一次补丁清空不属于它的型号）',
+      providerBlock.includes('patch(providerChangePatch(value))'),
+      `提供方块：${providerBlock.replace(/\s+/g, ' ').slice(0, 160)}`);
+    const modelBlock = blockOf('模型');
+    const keys = [...modelBlock.matchAll(/patch\(\{([^}]*)/g)]
       .flatMap((m) => m[1].split(',').map((item) => item.trim().split(':')[0].trim()).filter(Boolean));
-    check(`⑦「${label}」提交的补丁只含 ${key}（旧键已被删除，写回去会被宿主 API 拒掉）`,
-      patched.length === 1 && patched[0] === key,
-      `patch 到：${patched.join(',') || '(没找到 patch)'}`);
+    check('⑦「模型」提交的补丁仍只含 llmModel（自动清空那处在别的块里，不在这块）',
+      keys.length === 1 && keys[0] === 'llmModel',
+      `模型块 patch 到：${keys.join(',') || '(没找到 patch)'}（块：${modelBlock.replace(/\s+/g, ' ').slice(0, 160)}）`);
   }
   const offText = await (async () => {
     settingsPayload.value = {
@@ -729,6 +773,377 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   })();
   check('⑦ off 档位下不显示提供方/型号下拉（它们只在 custom 下有意义）',
     !offText.includes('下拉里是你在「设置 → 模型」里配好的提供方'), 'off 档位下不该出现提供方下拉');
+}
+
+/* ── 断言：「模型」下拉的作用域 + 换提供方后的清空（2026-10-08，用户报告）───────────
+ * 用户原话：把模型提供方改成 deepseek 之后，模型下拉里**不该**再有
+ * 「跟随主模型」和旧提供方的 `glm-5.3-flash`；提供方改成其它时同理。
+ *
+ * 这里用**桩提供方清单**（`/llm/providers` 的返回形状：`{ provider, models }`）把四种状态
+ * 一次测清：
+ *   ① 提供方非空 + 一个**不属于它**的型号 → 下拉里既没有旧型号也不出现「跟随主模型」；
+ *   ② 切提供方 → 同一个补丁里带上了 `llmModel: ''`（换提供方的联动）；
+ *   ③ 提供方为空 → 首项是「跟随主模型」；提供方非空且型号为空 → 首项**不是**它；
+ *   ④ 清单为空（读不到型号清单）→ **保留**原值、不下发清空补丁，且原值仍显示在下拉里。
+ *
+ * 桩数据里的三个型号名是**专供本段**的哨兵（`selftest` / 其它脚本不会用到），
+ * 免得与别处的 `glm-*` 桩值互相干扰。 */
+{
+  const STUB_PROVIDERS = [
+    { provider: 'stub-zhipu', models: ['stub-glm-5.3-flash', 'stub-glm-4.6'] },
+    { provider: 'stub-deepseek', models: ['stub-ds-v4-flash', 'stub-ds-v4-pro'] },
+  ];
+  /**
+   * 找到某个标签所在行里**真正渲染出来的** `<select>`，并抽出它的 `<option>` 取值。
+   *
+   * 为什么不能只看控件审计里的 `options`（2026-10-08 实测踩过）：那是**传进来的 prop**，
+   * 不是最终 DOM 的子节点 —— 把 `SelectRow` 的兜底项改成"无条件把当前值也加一项"，
+   * 审计里的 options 一个字都不变，于是"下拉里没有旧型号"这条断言**测不红**（假的守卫）。
+   * 这条按 DOM 走：标签 → 同一行 → select → option，多一项就露馅。
+   * @param {object} tree - 已解析的渲染树。
+   * @param {string} label - 行标签（如「模型」）。
+   * @returns {string[]|null} option 的 value 列表（找不到返回 null）。
+   */
+  const renderedOptionValues = (tree, label) => {
+    const findByLabel = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object') return null;
+      if (Array.isArray(node)) { for (const item of node) { const hit = findByLabel(item); if (hit) return hit; } return null; }
+      const own = textOf(node.props?.children);
+      const isRow = String(node.props?.className ?? '') === 'dsm-row' && own.startsWith(label);
+      if (isRow) return node;
+      for (const child of Array.isArray(node.props?.children) ? node.props.children : [node.props?.children]) {
+        const hit = findByLabel(child);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const findSelect = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object') return null;
+      if (Array.isArray(node)) { for (const item of node) { const hit = findSelect(item); if (hit) return hit; } return null; }
+      if (node.type === 'select') return node;
+      for (const child of Array.isArray(node.props?.children) ? node.props.children : [node.props?.children]) {
+        const hit = findSelect(child);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    const row = findByLabel(tree);
+    const select = row === null ? null : findSelect(row);
+    if (select === null) return null;
+    const values = [];
+    const walk = (node) => {
+      if (node === null || node === undefined || typeof node !== 'object') return;
+      if (Array.isArray(node)) { for (const item of node) walk(item); return; }
+      if (node.type === 'option') values.push(String(node.props?.value ?? ''));
+      for (const child of Array.isArray(node.props?.children) ? node.props.children : [node.props?.children]) walk(child);
+    };
+    walk(select);
+    return values;
+  };
+  const stubOriginalValue = settingsPayload.value;
+  const stubOriginalSettings = stubOriginalValue.settings;
+  const stubOriginalFetch = globalThis.fetch;
+  /* 先把"提供方清单"这个种子显式种上：本段必须从一开始就在"读得到清单"的状态下渲染，
+   * 否则面板里 `llmProviders` 的初值是空数组，前几步渲染就把空数组写进 hook 槽位了
+   *（实测踩过：`providerChangePatch` 拿到的是空清单 → 断言假红）。 */
+  seedProviders = STUB_PROVIDERS;
+  /** 观察到的「写设置」请求体（含别处 effect 顺带触发的）：用来证明"清空"真的写盘了。 */
+  const stubPuts = [];
+  const stubWith = (providers) => {
+    /* 桩渲染不会把 effect 里的 setState 结果回灌到下一轮渲染（没有真正的重渲染），
+     * 于是 `/llm/providers` 的返回在渲染断言里永远看不见 —— 用**种槽位时**的初值口
+     * 把清单喂进去（`render()` 读 `seedProviders` 写 `window.__dsmProviders`；
+     * 真机不设它，走 `/llm/providers` 的正常路径）。 */
+    seedProviders = providers;
+    globalThis.fetch = async (url, options = {}) => {
+      const target = String(url);
+      if (options?.method === 'PUT' && target.includes('/settings')) stubPuts.push(String(options.body ?? ''));
+      if (target.includes('/llm/providers')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, value: { serviceAvailable: true, providers } }) };
+      }
+      return stubOriginalFetch(url, options);
+    };
+  };
+  /** 带一段提供方清单渲染面板，返回「模型」下拉控件（含本次渲染的 options 清单）。
+   * `seenPuts` 传数组时只收**本次渲染窗口内**的写设置请求体 —— 断言因此能精确到
+   * "这一种状态有没有触发清空"，不受别处 effect 的异步写盘干扰。
+   * （面板的 hook 槽位是共享的：两个渲染不能并行跑，否则会互相覆盖状态。） */
+  const renderModelControl = async (settingsPatch, providers, seenPuts = null) => {
+    settingsPayload.value = { ...stubOriginalValue, settings: { ...stubOriginalSettings, llmMode: 'custom', ...settingsPatch } };
+    const before = stubPuts.length;
+    stubWith(providers);
+    const tree = await render(false, true);
+    const mine = stubPuts.slice(before);
+    if (Array.isArray(seenPuts)) seenPuts.push(...mine);
+    settingsPayload.value = stubOriginalValue;
+    globalThis.fetch = stubOriginalFetch;
+    return { tree, control: controlByLabel('模型'), puts: mine };
+  };
+  try {
+    /* ① 提供方非空 + 型号不属于它 → 下拉里没有旧型号，也没有「跟随主模型」；
+     *    并且**真的写盘清空**（不是只是不显示）。 */
+    {
+      const seen = [];
+      const { tree, control } = await renderModelControl(
+        { llmProvider: 'stub-deepseek', llmModel: 'stub-glm-5.3-flash' }, STUB_PROVIDERS, seen);
+      const options = control?.options ?? [];
+      const shown = textOf(tree);
+      const domOptions = renderedOptionValues(tree, '模型');
+      check('⑦ 换提供方后：旧提供方的型号不再出现在模型下拉的选项里',
+        !options.includes('stub-glm-5.3-flash') && !options.includes('stub-glm-4.6'),
+        `选项=${JSON.stringify(options)}（提供方 stub-deepseek，型号清单里不该有 glm）`);
+      /* DOM 侧再钉一遍（这条才是真守卫：变异实验里只有它会红）。 */
+      check('⑦ 换提供方后：**渲染出来的**模型下拉里没有旧型号那一项（DOM 级，不只看 prop）',
+        domOptions !== null && !domOptions.includes('stub-glm-5.3-flash') && !domOptions.includes('stub-glm-4.6'),
+        `DOM option 值=${JSON.stringify(domOptions)}`);
+      check('⑦ 换提供方后：下拉里不再出现「跟随主模型」（提供方已选定，这句不成立）',
+        !shown.includes('（跟随主模型）'),
+        `实际下拉文本含：${(shown.match(/（[^）]*模型[^）]*）/g) ?? ['(没有)']).join(' / ')}`);
+      check('⑦ 换提供方后：模型下拉只列该提供方公布的型号',
+        options.length === 2 && options.includes('stub-ds-v4-flash') && options.includes('stub-ds-v4-pro'),
+        `选项=${JSON.stringify(options)}`);
+      /* 必须有这一条，前面那条才不是"空断言"：当前值确实是一个**非空的旧型号**，
+       * 而它不在作用域清单里 —— 这正是"兜底项要不要显示"的判定场景。
+       * 当前值为空时 `current !== ''` 不成立，`keepUnknown` 改回旧写法也不会露馅
+       *（2026-10-08 实测：少了这条，变异①测不出来）。 */
+      check('⑦ 前提：当前值是一个**非空**的旧提供方型号（否则"不显示旧型号"是空断言）',
+        String(control?.value ?? '') === 'stub-glm-5.3-flash',
+        `控件值=${JSON.stringify(control?.value)} 选项=${JSON.stringify(options)}`);
+      check('⑦ 清单非空且型号不属于该提供方时，配置里也真的**清空**了（下发了 llmModel:"" 的 PUT，不是只是不显示）',
+        seen.some((body) => body.includes('"llmModel":""')),
+        `本次渲染窗口内的 PUT：${seen.length === 0 ? '(一个都没有)' : seen.join(' | ')}`);
+    }
+    /* ② 切提供方 → 同一个补丁里带上 llmModel: ''（这就是"清空"那条修法）
+     *
+     * ⚠️ 这里**不通过** `window.__dsmTestHooks.providerChangePatch` 调 —— 那是个闭包，
+     * 桩渲染每跑完一轮都会重新登记，而 `render()` 结尾会把 hook 槽位重置成初值，
+     * 于是"事后调它"用到的是**某一轮渲染**捕获的 `llmProviders`，不一定是我刚种的那份
+     *（2026-10-08 实测：槽位里是种子、闭包里却是空数组，断言假红）。
+     * 改成直接钉**它内部的纯判据** `selectModelScope`（同一份作用域也真的在渲染里用了，
+     * 见 ① 的选项断言），并在下面按源码钉"提供方提交走的就是 providerChangePatch"。
+     * 行为侧（真的下发 llmModel:"" 的 PUT）由 ① 的渲染窗口断言负责 —— 那条是端到端的。 */
+    {
+      const { control } = await renderModelControl(
+        { llmProvider: 'stub-zhipu', llmModel: 'stub-glm-5.3-flash' }, STUB_PROVIDERS);
+      const hooks = globalThis.window?.__dsmTestHooks;
+      check('⑦ 面板导出了模型作用域纯函数（本段断言的前提）',
+        hooks !== undefined && typeof hooks.selectModelScope === 'function',
+        `hooks=${hooks === undefined ? 'undefined' : Object.keys(hooks).join(',')}`);
+      const scopeFn = hooks?.selectModelScope;
+      check('⑦ 前提成立：这一步渲染的当前型号确实是 stub-glm-5.3-flash（否则下面两条是空的）',
+        String(control?.value ?? '') === 'stub-glm-5.3-flash', `控件=${JSON.stringify(control)}`);
+      const nextScope = scopeFn?.('stub-deepseek', 'stub-glm-5.3-flash', STUB_PROVIDERS);
+      check('⑦ 切到别的提供方时：该型号不在新提供方的清单里 → `keepUnknown:false`（= 补丁里会带上 llmModel:""）',
+        nextScope?.keepUnknown === false && nextScope?.known === true,
+        `scope=${JSON.stringify(nextScope)}（"提供方已切、型号没清"就是用户报的那个 bug）`);
+      /* 反向：新提供方的清单里**有**这个型号时不许清（正常换型号不该丢配置） */
+      const keepScope = scopeFn?.('stub-zhipu', 'stub-glm-5.3-flash', STUB_PROVIDERS);
+      check('⑦ 型号属于新提供方时**不清空**（keepUnknown:true，补丁里不含 llmModel）',
+        keepScope?.keepUnknown === true,
+        `scope=${JSON.stringify(keepScope)}`);
+      /* 清空决策的写法必须与 `providerChangePatch` 的返回值一致：两个键都在同一个对象里。 */
+      const block = source.slice(source.lastIndexOf('function providerChangePatch'), source.indexOf('测试钩子', source.lastIndexOf('function providerChangePatch')));
+      check('⑦ 清空是写在**同一个补丁对象**里的（`{ llmProvider, llmModel: \'\' }`），不是两次写盘',
+        /llmProvider:\s*value,\s*llmModel:\s*''/.test(block.replace(/\s+/g, ' ')),
+        `providerChangePatch 片段：${block.replace(/\s+/g, ' ').slice(0, 160)}`);
+    }
+    /* ③ 首项文案：提供方为空 → 「跟随主模型」；提供方非空且型号为空 → 不是它 */
+    {
+      const { tree } = await renderModelControl({ llmProvider: '', llmModel: '' }, STUB_PROVIDERS);
+      const shown = textOf(tree);
+      check('⑦ 提供方为空 → 模型下拉第一项是「跟随主模型」', shown.includes('（跟随主模型）'),
+        `实际下拉文本含：${(shown.match(/（[^）]*）/g) ?? ['(没有)']).slice(0, 8).join(' ')}`);
+    }
+    {
+      const { tree, control } = await renderModelControl({ llmProvider: 'stub-zhipu', llmModel: '' }, STUB_PROVIDERS);
+      const shown = textOf(tree);
+      check('⑦ 提供方非空且型号为空 → 第一项不是「跟随主模型」', !shown.includes('（跟随主模型）'),
+        '提供方已选定，这里只能写"用该提供方的默认模型"之类');
+      check('⑦ 提供方非空且型号为空 → 第一项写成「用该提供方的默认模型」',
+        shown.includes('（用该提供方的默认模型）'), `选项=${JSON.stringify(control?.options ?? [])}`);
+    }
+    /* ④ 清单为空 → 保留原值、不清空、原值仍显示在下拉里 */
+    {
+      const seen = [];
+      const { tree, control } = await renderModelControl(
+        { llmProvider: 'stub-zhipu', llmModel: 'stub-glm-5.3-flash' }, [], seen);
+      check('⑦ 提供方清单为空：原值**仍显示**在模型下拉里（查不到 ≠ 用户配错了）',
+        (control?.options ?? []).includes('stub-glm-5.3-flash') || textOf(tree).includes('stub-glm-5.3-flash'),
+        `选项=${JSON.stringify(control?.options ?? [])}`);
+      check('⑦ 提供方清单为空：不下发任何清空补丁（"查不到清单"绝不能清掉用户配置）',
+        !seen.some((body) => body.includes('"llmModel":""')),
+        `本次渲染窗口内的 PUT：${seen.length === 0 ? '(一个都没有)' : seen.join(' | ')}`);
+    }
+  } finally {
+    settingsPayload.value = stubOriginalValue;
+    globalThis.fetch = stubOriginalFetch;
+  }
+  /* 行为级反向守卫：那两个"配置里也清空了 / 没有清空"的断言已经在 ①/④ 的渲染窗口里量过
+   *（`renderModelControl` 会把窗口内的 PUT 请求体带回来）—— 这里不再重复一遍。 */
+}
+
+/* ── 断言：✕ 的结果块**不得跨轮残留**（2026-10-08 回归修复）────────────────────────
+ * 用户实测回归：上一轮点 ✕ 之后出现的结果块（以及"检索中"那块）跟到了下一轮回答后面。
+ *
+ * 取证结论（写在这里，免得以后又被猜成别的原因）：
+ *   · `MissAction` 探测 `/diagnostics` 时**带了**自定义头与 `?session=`，
+ *     宿主（`lib/routes.js` 1315–1345）在"点名 session"时也**确实回** `lastQuery`
+ *     —— 所以"请求没带 session / 被 guard 抹空导致 lastQuery 恒为空"这个怀疑**不成立**；
+ *   · 真正的原因是**陈旧判定用的是提问文本**：旧代码 `if (now !== lastSeenQuery.current)`
+ *     靠 `lastQuery` 变没变来决定要不要清上一轮的结果。用户按 ✕ 的文案
+ *     "直接继续提问即可"再问一遍**同一句话**时文本不变 → 永远不清 → 结果块跟着走。
+ *
+ * 修法：结果发布时记下它属于哪一轮（`turnTail` 槽位给的 `turn`），渲染时按轮次取
+ *（`missResultFor`）——不再依赖提问文本。下面三条分别钉住：跨轮不显示、pending 同理、
+ * 同一句话重复提问也得清。 */
+{
+  const hooks = globalThis.window?.__dsmTestHooks ?? {};
+  /** 找可点元素（本段自备一份：别处的同名工具在别的块作用域里）。 */
+  const findClickable = (node, out = []) => {
+    if (node === null || node === undefined || typeof node !== 'object') return out;
+    if (Array.isArray(node)) { for (const item of node) findClickable(item, out); return out; }
+    if (node.type === 'button' && typeof node.props?.onClick === 'function') out.push(node);
+    const children = node.props?.children;
+    for (const child of Array.isArray(children) ? children : [children]) findClickable(child, out);
+    return out;
+  };
+  check('✕ 结果按轮次判定的钩子已导出（本段断言的前提）',
+    typeof hooks.missResultFor === 'function' && typeof hooks.publishMiss === 'function' && typeof hooks.resetMiss === 'function',
+    `hooks=${Object.keys(hooks).join(',') || '(空)'}`);
+  const missSession = 'session-regression';
+  /**
+   * 渲染一次 `turnTail` 那一块（每次都从干净槽位开始，等价于"新一轮挂载"）。
+   *
+   * ⚠️ 这一段**不能**留着 `seedProviders`（见上）：它会把"已配置提供方清单"这个种子
+   * 带到后面所有渲染里 —— 两块状态互相串味（2026-10-08 实测：⑦ 的切提供方断言因此变红）。
+   * 所以进这一段先清掉它，走 `/llm/providers` 的正常路径。
+   */
+  seedProviders = null;
+  const renderTailFor = async (sessionId, turn, key) => {
+    hookIndex = 0;
+    currentComponent = key;
+    const out = withComponent(key, () => renderMissTail({ sessionId, turn, seq: turn }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return { text: textOf(out), tree: out };
+  };
+  const renderTail = (turn, key) => renderTailFor(missSession, turn, key);
+  hooks.resetMiss?.(missSession);
+  hooks.publishMiss?.(missSession, { found: true, model: 'stub-model', excerpt: '上一轮找到的资料', file: 'E:\\w\\a.md' }, 1);
+  check('✕ 前提：刚发布的结果属于第 1 轮（`missResultFor(session, 1)` 能拿到）',
+    hooks.missResultFor?.(missSession, 1)?.turn === 1,
+    `stored=${JSON.stringify(hooks.missResultFor?.(missSession, 1))}`);
+  /* 先把"轮次判定"这条判据**在渲染之前**钉死（渲染会把陈旧项清掉，事后就测不到了）：
+   * 仓库里明明躺着第 1 轮的结果，"第 2 轮"必须取不到；同一轮必须取得到。
+   * 能失败：把 `missResultFor` 的轮次比较撤掉（`return stored`）→ 第一条立刻红。 */
+  check('✕ 判据本身：轮次不同的仓库项取不到（这就是"不得跨轮显示"的根）',
+    hooks.missResultFor?.(missSession, 2) === null,
+    `第 2 轮取到=${JSON.stringify(hooks.missResultFor?.(missSession, 2))}（它明明属于第 1 轮）`);
+  check('✕ 判据本身：同一轮的仓库项取得到（不能把正常显示一起修没）',
+    hooks.missResultFor?.(missSession, 1)?.found === true,
+    `第 1 轮取到=${JSON.stringify(hooks.missResultFor?.(missSession, 1))}`);
+  check('✕ 参考点：同一轮（turn=1）**仍然显示**结果块（不能把正常显示一起修没）',
+    (await renderTail(1, 'missTurnSame')).text.includes('找到相关内容'),
+    '同一轮必须照常显示，否则这条修复等于把功能关掉了');
+  const nextTurn = await renderTail(2, 'missTurnNext');
+  check('✕ 核心回归：上一轮的结果块**不得出现在新一轮**（turn=2 渲染不出上一轮的内容）',
+    !nextTurn.text.includes('找到相关内容') && !nextTurn.text.includes('上一轮找到的资料'),
+    `新一轮实际渲染：${nextTurn.text.slice(0, 120) || '(空)'}`);
+  /* 同一句话重复提问：文本判据永远触发不了，只有轮次判据能拦住 —— 这条专门钉住那个洞。 */
+  hooks.resetMiss?.(missSession);
+  hooks.publishMiss?.(missSession, { pending: true, model: 'stub-model' }, 7);
+  check('✕ 前提：pending（"检索中"）已发布在第 7 轮',
+    hooks.missResultFor?.(missSession, 7)?.pending === true,
+    `stored=${JSON.stringify(hooks.missResultFor?.(missSession, 7))}`);
+  check('✕ 同一轮仍然显示"检索中"（用户点了 ✕ 要立刻有反馈）',
+    (await renderTail(7, 'missPendSame')).text.includes('检索中'),
+    '同一轮的 pending 必须显示');
+  const pendingNext = await renderTail(8, 'missPendNext');
+  check('✕ 上一轮的"检索中"也不得跟到下一轮（pending 与最终结果同等对待）',
+    !pendingNext.text.includes('检索中'),
+    `新一轮实际渲染：${pendingNext.text.slice(0, 120) || '(空)'}`);
+
+  /* ── 第二条路径：`MissAction` 的"新问题一到就清"（同一句话重复提问）──────────
+   * 旧代码 `if (now !== lastSeenQuery.current)` 拿**提问文本**当轮次判据：用户按 ✕ 的
+   * 文案"直接继续提问即可"再问一遍同一句话时文本不变 → 永远不触发 → 结果块跟着走。
+   * 新代码的判据抽成 `missActionDecide(探测到的提问, 挂载时的提问)`，这里直接钉它：
+   * 文本相同也必须判"新问题已到"（因为**动作栏实例换了一个**，说明又答了一轮）。
+   * ⚠️ 为什么不整条渲染出来测：桩渲染不会自动重渲染，异步回来的 `ready.lastQuery`
+   * 进不了 effect 的第二次执行（实测：effect 只跑到 `ready` 落地那次）。 */
+  {
+    check('✕ 旧写法的判据就是"提问文本变没变"（取证件：源码里不再有那个按文本比较的 ref）',
+      !source.includes('lastSeenQuery'),
+      '还在用按提问文本比较的 ref —— 陈旧判定仍依赖提问文本');
+    /* 交互面：真的渲染一次 `MissAction`、真的点一次 ✕ —— 保证"发布结果"这条路径
+     * 在加了轮次归属之后**没被修坏**（本轮必须能显示；能失败：把结果块整块吞掉就会红）。
+     * 顺序说明：`missActionDecide` 是在 `MissAction` 渲染时才登记的，所以判据断言放在**后面**。 */
+    const originalFetch = globalThis.fetch;
+    const session = 'session-q-repeat';
+    const reply = (value) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) });
+    globalThis.fetch = async (url) => {
+      const target = String(url);
+      if (target.includes('/diagnostics')) {
+        return reply({ runtime: [{ sessionId: session, workspace: 'E:\\w', knownCompactions: 2, hits: 1, misses: 1, lastQuery: '同一句话' }] });
+      }
+      if (target.includes('/diagnose')) {
+        return reply({ boosting: true, found: true, material: '【对话】找到的资料', model: 'stub-model', file: 'E:\\w\\a.md' });
+      }
+      if (target.includes('/settings')) return settingsPayload;
+      if (target.includes('/overview')) return overviewPayload;
+      return reply({});
+    };
+    try {
+      hooks.resetMiss?.(session);
+      const key = 'missRepeat';
+      /* 先渲染一次"本轮的尾巴"，把这一轮的轮次身份登记进去 —— 真机上点 ✕ 时这一轮的
+       * `turnTail` 一定已经挂载（`assistant-actions` 是它的子节点），所以这是**更真实**的顺序：
+       * 结果发布时就带上轮次，而不是靠后面渲染尾巴时才补。 */
+      await renderTailFor(session, 1, 'missRepeatTail');
+      /** 渲染一次动作栏（沿用同一路径 = 同一个实例），渲染两轮让异步 `ready` 落地。 */
+      const renderAction = async () => {
+        let out = null;
+        for (let round = 0; round < 2; round += 1) {
+          hookIndex = 0;
+          currentComponent = key;
+          out = withComponent(key, () => renderMiss({ sessionId: session }));
+          for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+        return out;
+      };
+      const first = await renderAction();
+      const button = findClickable(first).find((node) => String(textOf(node.props.children) ?? '').includes('✕')) ?? null;
+      check('✕ 前提：拿到了 ✕ 按钮（否则下面"点了之后有结果"是空的）', button !== null,
+        `可点元素=${findClickable(first).length}`);
+      button?.props.onClick();
+      for (let i = 0; i < 30; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+      const published = hooks.missResultFor?.(session, 1);
+      check('✕ 点 ✕ 之后结果块真的发布了（并且打上了轮次归属 —— 交互路径没被修坏）',
+        published !== null && published !== undefined,
+        `stored=${JSON.stringify(published)}`);
+      check('✕ 结果块挂在这一轮上（第 1 轮渲染得出来；跨轮才不显示）',
+        (await renderTailFor(session, 1, 'missRepeatSame')).text.includes('找到相关内容'),
+        '同一轮必须显示 —— 若这里也空，说明把功能整体关掉了，不是修好');
+
+      const decide = globalThis.window?.__dsmTestHooks?.missActionDecide;
+      check('✕ `MissAction` 的陈旧判据已导出（渲染过动作栏之后才登记）', typeof decide === 'function',
+        `hooks=${Object.keys(globalThis.window?.__dsmTestHooks ?? {}).join(',')}（这里是 ${typeof decide}）`);
+      check('✕ 判据：文本**不变**时也算"新问题已到"（同一句话重复提问 = 又答了一轮）',
+        decide?.('同一句话', '同一句话', 2) === true,
+        `decide('同一句话','同一句话',2)=${String(decide?.('同一句话', '同一句话', 2))}（旧写法这里是 false，正是那个回归）`);
+      check('✕ 判据：文本变了 → 清（正常路径不受影响）',
+        decide?.('下一句', '上一句', 1) === true, `decide=${String(decide?.('下一句', '上一句', 1))}`);
+      check('✕ 判据：还没认清"这一轮问的是什么"（挂载时为空）→ 先不动',
+        decide?.('第一句', null, 1) === false, `decide=${String(decide?.('第一句', null, 1))}`);
+      check('✕ 判据：读不到提问（空串）→ 不动（不能凭空调掉用户刚看到的结果）',
+        decide?.('', '上一句', 2) === null, `decide=${String(decide?.('', '上一句', 2))}`);
+      check('✕ 判据：只是同一次探测重复执行（文本不变、次数仍为 1）→ 不误清',
+        decide?.('同一句话', '同一句话', 1) === false,
+        `decide=${String(decide?.('同一句话', '同一句话', 1))}（误清会把刚显示的结果立刻抹掉）`);
+      hooks.resetMiss?.(session);
+    } finally {
+      globalThis.fetch = originalFetch;
+      hooks.resetMiss?.(session);
+    }
+  }
 }
 /* ── 断言：桩 React 的依赖数组语义 + useRef 跨渲染复用（2026-10-08）──────────
  * 这里量的是**桩本身**的行为（不是面板文案）：依赖不变 → effect 不重跑；
