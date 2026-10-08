@@ -177,9 +177,9 @@ const settingsPayload = {
       observationTurns: 3, cooldownTurns: 1, preferSummaryChunks: true, storeDir: '.dsh-compaction-memory',
       trashEnabled: true, protectRecentDays: 7, trashAutoPurgeEnabled: true, trashAutoPurgeDays: 7,
       logScores: true, backfillOnStart: true, includePrune: false, maxRawCharsPerCompaction: 400000,
-      llmAssistEnabled: true, llmIngestExpand: true, llmIngestProvider: 'zai', llmIngestModel: 'glm-5.3-flash',
+      llmAssistEnabled: true, llmIngestExpand: true, llmMode: 'custom', llmProvider: 'zai', llmModel: 'glm-5.3-flash',
       llmIngestTimeoutMs: 8000, llmIngestBatchBlocks: 8, llmIngestBlockChars: 600, llmIngestMaxTokens: 240,
-      llmRecallRewrite: true, llmRecallProvider: '', llmRecallModel: '',
+      llmRecallRewrite: true,
       llmRecallTimeoutMs: 8000, llmRewriteMaxTokens: 120, llmDailyCallCap: 0, llmCacheEnabled: true,
     },
   },
@@ -674,30 +674,55 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
 }
 
 
-/* ── 断言：⑦ 在 off 档位下要把"设置文件里还记着哪套型号"说出来（2026-10-08）────
- * 修的是什么：`llmMode:'off'` 时面板**不显示**提供方/型号下拉（它们只在 custom 下有意义），
- * 但设置文件里的旧字段（`llmIngest*`）可能还留着上次配的型号 —— 而用户一改选
- * 「调用指定模型」，宿主就会把它当作回落值重新用上。不说这一句，用户会以为早配好的型号没了。
- * 两条断言都要能失败：文案删掉 → 第一条红；无条件拼上这句话 → 第二条（空配置时不该出现）红。 */
+/* ── 断言：⑦ 的"提供方 / 模型 / 测试连接"只认单一字段集（2026-10-08）───────────
+ * 收敛后只有一对模型字段（`llmProvider`/`llmModel`）；旧的两对影子键
+ * （`llmIngest*` / `llmRecall*`）已从设置里删除，设置文件里即使残留也会在 load() 时
+ * 被搬进新键并丢弃。这一节钉死两条，每条都能失败：
+ *   ① 控件的取值来自新键（绑到旧键 → 值对不上 → 红）；
+ *   ② 提交的补丁**只含新键**（把旧键一起写回去的那种补丁 → 红）。
+ * ② 只能看源码：桩渲染不产生 DOM，"点一下下拉"在这里没有真实的交互对象。 */
 {
   const originalValue = settingsPayload.value;
-  const renderWith = async (settings) => {
-    settingsPayload.value = { ...originalValue, settings: { ...originalValue.settings, ...settings } };
-    const tree = await render(false, true);
-    return tree === null ? '' : textOf(tree);
+  settingsPayload.value = {
+    ...originalValue,
+    settings: { ...originalValue.settings, llmMode: 'custom', llmProvider: 'zai', llmModel: 'glm-5.3-flash' },
   };
-  const offWithLegacy = await renderWith({ llmMode: 'off', llmAssistEnabled: false, llmIngestProvider: 'zai', llmIngestModel: 'glm-5.3-flash' });
-  check('⑦ off + 旧字段非空 → 提示"设置文件里还记着 zai / glm-5.3-flash，改选「调用指定模型」会重新用上"',
-    offWithLegacy.includes('设置文件里还记着 zai / glm-5.3-flash，改选「调用指定模型」会重新用上'),
-    `实际：${(offWithLegacy.match(/当前：纯本地[^。]*。[^。]*。?/) ?? ['(没渲染)'])[0]}`);
-  check('⑦ off 时确实不显示提供方/型号下拉（所以只能靠上面那句话告知）',
-    !offWithLegacy.includes('下拉里是你在「设置 → 模型」里配好的提供方'), 'off 档位下不该出现提供方下拉');
-  const offWithoutLegacy = await renderWith({ llmMode: 'off', llmAssistEnabled: false, llmIngestProvider: '', llmIngestModel: '', llmRecallProvider: '', llmRecallModel: '' });
-  check('⑦ off 且什么都没配过 → 不出现"还记着"那句话（不能无条件拼）',
-    !offWithoutLegacy.includes('设置文件里还记着'), '空配置下不该出现"还记着…"');
+  await render(false, true);
   settingsPayload.value = originalValue;
+  for (const [label, value] of [['提供方', 'zai'], ['模型', 'glm-5.3-flash']]) {
+    const control = controlByLabel(label);
+    check(`⑦「${label}」控件读的是新键（值 = ${value}）`,
+      control !== null && control.kind === 'select' && String(control.value) === value,
+      `控件=${JSON.stringify(control)}（若绑到已删除的 llmIngest*/llmRecall* 键，这里会读到空串）`);
+  }
+  /** 取出某个 `AuditedSelectRow` 块的源码（从标签行到 `}),` 收尾）。 */
+  const blockOf = (label) => {
+    const start = source.indexOf(`auditLabel: '${label}'`);
+    if (start < 0) return '';
+    const end = source.indexOf('}),', start);
+    return end < 0 ? '' : source.slice(start, end);
+  };
+  for (const [label, key] of [['提供方', 'llmProvider'], ['模型', 'llmModel']]) {
+    const block = blockOf(label);
+    // 取 `patch({ … })` 里写进去的**全部键名**（`\}` 收尾即可命中被截断的块尾）
+    const patched = [...block.matchAll(/patch\(\{([^}]*)/g)]
+      .flatMap((m) => m[1].split(',').map((item) => item.trim().split(':')[0].trim()).filter(Boolean));
+    check(`⑦「${label}」提交的补丁只含 ${key}（旧键已被删除，写回去会被宿主 API 拒掉）`,
+      patched.length === 1 && patched[0] === key,
+      `patch 到：${patched.join(',') || '(没找到 patch)'}`);
+  }
+  const offText = await (async () => {
+    settingsPayload.value = {
+      ...originalValue,
+      settings: { ...originalValue.settings, llmMode: 'off', llmAssistEnabled: false, llmProvider: 'zai', llmModel: 'glm-5.3-flash' },
+    };
+    const tree = await render(false, true);
+    settingsPayload.value = originalValue;
+    return tree === null ? '' : textOf(tree);
+  })();
+  check('⑦ off 档位下不显示提供方/型号下拉（它们只在 custom 下有意义）',
+    !offText.includes('下拉里是你在「设置 → 模型」里配好的提供方'), 'off 档位下不该出现提供方下拉');
 }
-
 /* ── 断言：桩 React 的依赖数组语义 + useRef 跨渲染复用（2026-10-08）──────────
  * 这里量的是**桩本身**的行为（不是面板文案）：依赖不变 → effect 不重跑；
  * 依赖变了 → 先跑上一轮的 cleanup 再跑新的；useRef 同一个槽位返回同一个对象。
@@ -754,7 +779,11 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
     maxRawCharsPerCompaction: 123456,
     // 文本框 / 下拉
     toolResultNames: 'read, grep',
-    llmMode: 'main',
+    // 下拉：种 custom 档（这样「使用方式 / 提供方 / 模型」三个下拉都会渲染出来），
+    // 值都与默认不同 → 绑错键必然对不上。
+    llmMode: 'custom',
+    llmProvider: 'seeded-provider',
+    llmModel: 'seeded-model',
     llmAssistEnabled: true,
   };
   settingsPayload.value = { ...originalValue, settings: seeded };
@@ -771,6 +800,8 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
     ['单次压缩原文上限', 'maxRawCharsPerCompaction', 'number'],
     ['收哪些工具', 'toolResultNames', 'text'],
     ['使用方式', 'llmMode', 'select'],
+    ['提供方', 'llmProvider', 'select'],
+    ['模型', 'llmModel', 'select'],
   ];
   // 前提：每个标签都真的被采集到了（没采集到就看不见，等于这条断言形同虚设）
   const missing = expected.filter(([label]) => controlByLabel(label) === null).map(([label]) => label);

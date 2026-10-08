@@ -441,52 +441,74 @@ console.log('\n=== 12. 同一轮里不注入近重复的块（真实浪费：约
   eq('fps 与 lines 一一对应', longRound.built.fps.length, longRound.built.lines.length);
 }
 
-console.log('\n=== 13. ⑦ 模型档位：off 时旧字段非空，改选「调用指定模型」不许清空 ===');
+console.log('\n=== 13. ⑦ 模型字段：单一字段集（llmMode + llmProvider + llmModel）与旧键一次性迁移 ===');
 {
-  // 真实场景（2026-10-08 用户实测）：设置文件里 `llmMode:'off'`，但旧字段
-  // （`llmIngestProvider/llmIngestModel`）还留着上次配好的型号。改前的两个坑：
-  //   ① 面板在 off 下不显示型号下拉 → 用户完全看不到这套配置还在；
-  //   ② 一改选「调用指定模型」，`applyLlmMode` 从**空的** `llmProvider/llmModel` 派生
-  //      → 把旧字段静默清空（下拉里刚出现就变空）。
-  // 这一节钉死"回落 + off 不清空"，两条都是能红的（删掉修复即失败）。
+  // 2026-10-08 收敛：早先并存"入库/检索各配一套"的四个影子键
+  // （`llmIngestProvider/llmIngestModel/llmRecallProvider/llmRecallModel`）已删除。
+  // 这一节钉死三件事，每条都能红：
+  //   ① 带旧键的设置文件读回后 → 新键被填充、旧键消失、`llmMode` 语义不变；
+  //   ② **删掉迁移即失败**（红）：读回后新键为空；
+  //   ③ custom 下新键就是生效路由（不回落到旧键、也不会被静默清空）；main 仍清空这一对。
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-llm-'));
   const file = path.join(temp, 'dsh-super-memory.settings.json');
+  // 旧设置文件：两对旧键都有值（旧版"入库/检索各配一套"的形态），llmMode 停在 off。
   fs.writeFileSync(file, JSON.stringify({
-    version: 1, llmMode: 'off', llmIngestProvider: 'zhipu-glm', llmIngestModel: 'glm-5.3-flash',
+    version: 1,
+    llmMode: 'off',
+    llmIngestProvider: 'zhipu-glm', llmIngestModel: 'glm-5.3-flash',
+    llmRecallProvider: 'zhipu-glm', llmRecallModel: 'glm-5.3-flash',
   }), 'utf8');
   const store = new SettingsStore({ path: file });
   const loaded = store.get().settings;
-  eq('① 读回来的 llmMode 仍是 off', loaded.llmMode, 'off');
-  eq('① 旧字段原样保留（面板据此提示"设置里还记着 …"）',
-    `${loaded.llmIngestProvider} / ${loaded.llmIngestModel}`, 'zhipu-glm / glm-5.3-flash');
+  eq('① 迁移：llmProvider 被旧键填充', loaded.llmProvider, 'zhipu-glm');
+  eq('① 迁移：llmModel 被旧键填充', loaded.llmModel, 'glm-5.3-flash');
+  eq('① 语义不变：llmMode 仍是 off', loaded.llmMode, 'off');
+  eq('① off 不因迁移而打开任何调用开关', loaded.llmAssistEnabled, false);
+  check('① 旧键**不再存在于内存设置对象里**（单一字段集）',
+    !('llmIngestProvider' in loaded) && !('llmIngestModel' in loaded)
+    && !('llmRecallProvider' in loaded) && !('llmRecallModel' in loaded),
+    `实际键=${Object.keys(loaded).filter((k) => k.includes('Ingest') || k.includes('Recall')).join(',') || '(无)'}`);
+  check('① 旧键也不在 DEFAULTS / EDITABLE_FIELDS 里（没有影子键）',
+    !('llmIngestProvider' in DEFAULTS) && !EDITABLE_FIELDS.includes('llmIngestModel')
+    && !('llmRecallProvider' in DEFAULTS) && !EDITABLE_FIELDS.includes('llmRecallModel'),
+    `DEFAULTS=${Object.keys(DEFAULTS).filter((k) => /llm(Ingest|Recall)/.test(k)).join(',') || '(无)'}`);
 
   const custom = store.update({ llmMode: 'custom' }).settings;
-  eq('② 切成 custom：provider 回落到旧字段（不是从空的 llmProvider 派生）', custom.llmIngestProvider, 'zhipu-glm');
-  eq('② 切成 custom：model 同理', custom.llmIngestModel, 'glm-5.3-flash');
-  eq('② 检索那一对一起派生', `${custom.llmRecallProvider}/${custom.llmRecallModel}`, 'zhipu-glm/glm-5.3-flash');
-  eq('② 回落**不回写**新字段（llmProvider 仍为空 —— 用户没做过这个选择）', custom.llmProvider, '');
+  eq('② 切 custom：生效路由就是迁移过来的 llmProvider', custom.llmProvider, 'zhipu-glm');
+  eq('② 切 custom：生效路由就是迁移过来的 llmModel', custom.llmModel, 'glm-5.3-flash');
   eq('② 模式真的生效：辅助开关打开', custom.llmAssistEnabled, true);
+  check('② 落盘时旧键已从盘上删除（下次打开设置文件不会看到死旋钮）',
+    (() => {
+      const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+      return onDisk.llmIngestProvider === undefined && onDisk.llmIngestModel === undefined
+        && onDisk.llmRecallProvider === undefined && onDisk.llmRecallModel === undefined;
+    })(),
+    `盘上实际=${JSON.stringify(Object.keys(JSON.parse(fs.readFileSync(file, 'utf8'))).filter((k) => /llm(Ingest|Recall)/.test(k)))}`);
+  eq('② 新键真的落盘了（重启后仍记得）', JSON.parse(fs.readFileSync(file, 'utf8')).llmProvider, 'zhipu-glm');
 
   const off = store.update({ llmMode: 'off' }).settings;
-  eq('③ off 不再清空旧字段（清掉就再也找不回来）',
-    `${off.llmIngestProvider}/${off.llmIngestModel}`, 'zhipu-glm/glm-5.3-flash');
+  eq('③ off 不再清空新键（清掉就再也找不回来）', `${off.llmProvider}/${off.llmModel}`, 'zhipu-glm/glm-5.3-flash');
   eq('③ off 仍然真的不调用模型（三个开关压回 false）', off.llmAssistEnabled, false);
   const again = store.update({ llmMode: 'custom' }).settings;
-  eq('③ 再切回 custom 仍保留 zhipu-glm / glm-5.3-flash',
-    `${again.llmIngestProvider} / ${again.llmIngestModel}`, 'zhipu-glm / glm-5.3-flash');
-  eq('③ 落盘后仍是它（重启后也记得）',
-    `${JSON.parse(fs.readFileSync(file, 'utf8')).llmIngestProvider}`, 'zhipu-glm');
+  eq('③ 再切回 custom 仍保留 zhipu-glm / glm-5.3-flash', `${again.llmProvider} / ${again.llmModel}`, 'zhipu-glm / glm-5.3-flash');
 
-  // 对照两条：回落不会无中生有；main 仍然必须清空（否则"跟随主模型"会错调自定义模型）
+  // 对照两条：不会无中生有；main 仍然必须清空（否则"跟随主模型"会错调自定义模型）
   const bare = normalizeSettings({ llmMode: 'custom' }, DEFAULTS, { deriveMode: true });
-  eq('（对照）从没配过型号时 custom 仍是空串 —— 回落不会无中生有',
-    `${bare.llmIngestProvider}/${bare.llmIngestModel}`, '/');
+  eq('（对照）从没配过型号时 custom 仍是空串（空 = 跟随主模型，不是无中生有）',
+    `${bare.llmProvider}/${bare.llmModel}`, '/');
   const main = normalizeSettings(
-    { llmMode: 'main', llmIngestProvider: 'zhipu-glm', llmIngestModel: 'glm-5.3-flash' },
+    { llmMode: 'main', llmProvider: 'zhipu-glm', llmModel: 'glm-5.3-flash' },
     DEFAULTS, { deriveMode: true },
   );
-  eq('（对照）main 仍清空 provider/model（空的语义是"跟随当前会话主模型"）',
-    `${main.llmIngestProvider}/${main.llmIngestModel}`, '/');
+  eq('（对照）main 清空 provider/model（空的语义是"跟随当前会话主模型"）', `${main.llmProvider}/${main.llmModel}`, '/');
+
+  // 对照：新键已有值时不拿旧键覆盖（迁移只在"新键为空"时搬运）
+  fs.writeFileSync(file, JSON.stringify({
+    version: 1, llmMode: 'custom', llmProvider: 'new-provider', llmModel: 'new-model',
+    llmIngestProvider: 'stale-provider', llmIngestModel: 'stale-model',
+  }), 'utf8');
+  const both = new SettingsStore({ path: file }).get().settings;
+  eq('（对照）新键已有值时 migration 不覆盖（新键优先）', `${both.llmProvider}/${both.llmModel}`, 'new-provider/new-model');
   fs.rmSync(temp, { recursive: true, force: true });
 }
 

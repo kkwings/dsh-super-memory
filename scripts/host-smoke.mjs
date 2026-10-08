@@ -159,8 +159,13 @@ for (const [name, keys] of CONTRACTS) {
 }
 
 // 已按用户决定删掉的设置键不许偷偷回来（插件不再有"思考强度"这个概念，
-// 用户要调就去 DSH 官方「设置 → 模型」页调）。
-for (const key of ['llmReasoningEffort']) {
+// 用户要调就去 DSH 官方「设置 → 模型」页调）。最后四个是 2026-10-08 收敛为
+// 单一字段集（`llmMode` + `llmProvider` + `llmModel`）时删除的"入库/检索各配一套"影子键：
+// 它们只允许出现在 `config.js` 的 `load()` 一次性迁移（读取）与 `save()`（删除）里。
+for (const key of [
+  'llmReasoningEffort',
+  'llmIngestProvider', 'llmIngestModel', 'llmRecallProvider', 'llmRecallModel',
+]) {
   const config = loaded.get('config.js');
   check(`config.js 不再有 ${key} 设置键`, config?.DEFAULTS !== undefined && !(key in config.DEFAULTS));
   check(`config.js 的可编辑字段里也没有 ${key}`, Array.isArray(config?.EDITABLE_FIELDS) && !config.EDITABLE_FIELDS.includes(key));

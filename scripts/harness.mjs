@@ -588,7 +588,10 @@ console.log('越界工作区 delete →', outside.status, outside.body.error?.co
     data: { header: { config: { provider: 'fake-provider', model: 'fake-model', reasoningEffort: 'max', maxTokens: 256000 } } },
   })}\n`, 'utf8');
 
-  await put({ llmAssistEnabled: true, llmIngestProvider: '', llmIngestModel: '', llmIngestTimeoutMs: 3000 });
+  // 不显式配 provider/model：`llmMode:'main'` + 空的新键 = 跟随会话事件里的主模型。
+  // （`llmAssistEnabled` 由 `llmMode` 派生 —— `main` 会打开调用并把 provider/model 清空，
+  // 正是"路由必须来自会话事件"这个探针需要的状态；这里不再手塞派生开关。）
+  await put({ llmMode: 'main', llmProvider: '', llmModel: '', llmIngestTimeoutMs: 3000 });
   behavior.mode = 'ok';
   behavior.lastInput = null;
   const inherited = await call('POST', '/api/dsh-super-memory/llm/test', { session: inheritProbe });
@@ -598,10 +601,13 @@ console.log('越界工作区 delete →', outside.status, outside.body.error?.co
   expect('解析出的路线里也不带 reasoningEffort（连留痕都不留这个字段）', !JSON.stringify(inherited.body?.value?.route ?? {}).includes('reasoningEffort'), `实际 route=${JSON.stringify(inherited.body?.value?.route ?? null)}`);
 
   behavior.lastInput = null;
-  await put({ llmIngestProvider: 'fake-provider', llmIngestModel: 'fake-model' });
+  await put({ llmMode: 'custom', llmProvider: 'fake-provider', llmModel: 'fake-model' });
   const explicit = await call('POST', '/api/dsh-super-memory/llm/test', { provider: 'fake-provider', model: 'fake-model', session: inheritProbe });
   expect('显式配了提供方/型号时也不传 reasoningEffort', explicit.status === 200 && behavior.lastInput !== null && !('reasoningEffort' in behavior.lastInput));
-  await put({ llmAssistEnabled: false, llmIngestProvider: '', llmIngestModel: '' });
+  expect('「调用指定模型」档位下解析出的路由 = 设置里的 llmProvider/llmModel（单一字段集）',
+    explicit.body?.value?.route?.provider === 'fake-provider' && explicit.body?.value?.route?.model === 'fake-model',
+    `实际 route=${JSON.stringify(explicit.body?.value?.route ?? null)}`);
+  await put({ llmMode: 'off', llmProvider: '', llmModel: '' });
   console.log(`  ④ 段累计：通过 ${smokePassed} 条，失败 ${smokeFailed} 条（其中工作区自动识别 ${workspaceChecks} 条、思考强度 ${smokePassed - workspaceChecks} 条）。`);
 }
 
@@ -714,8 +720,7 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
   const settle = () => new Promise((r) => setTimeout(r, 80));
 
   await put({
-    llmAssistEnabled: true, llmIngestExpand: true,
-    llmIngestProvider: 'fake-provider', llmIngestModel: 'fake-model',
+    llmMode: 'custom', llmProvider: 'fake-provider', llmModel: 'fake-model',
     llmIngestTimeoutMs: 3000, llmIngestBatchBlocks: 5, llmDailyCallCap: 50,
   });
 
