@@ -16,7 +16,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULTS, EDITABLE_FIELDS, INTEGER_BOUNDS, INTEGER_FIELDS, KNOWN_WORKSPACES_MAX, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo } from '../lib/config.js';
+import { DEFAULTS, EDITABLE_FIELDS, INTEGER_BOUNDS, INTEGER_FIELDS, KNOWN_WORKSPACES_MAX, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo, shortHash } from '../lib/config.js';
 import {
   MARKER, MARKER_END, containment, estimateTokens, extractTitle, neutralizeHeaderText,
   tokenize,
@@ -26,8 +26,11 @@ import { conversationTurns, rawRecords, summaryRecords, clampToolText, toolRecor
 import { MemoryIndex, localTopScore, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import {
-  NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, questionTextOf, queryTextOf, selectFreshHits,
+  NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, queryForMessage, questionTextOf, queryTextOf, selectFreshHits,
 } from '../lib/recall.js';
+import {
+  buildPage, formatPage, buildPagePrompt, pagePickSystem, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
+} from '../lib/diagnose.js';
 import { mergeUsage, createLlmGateway } from '../lib/llm.js';
 import { STRONG_HIT_RATIO, RateLimiter, makeRoutes, rewriteRateLimits, sessionLogSizeHint, spawnDetached, strongHitScore } from '../lib/routes.js';
 import { shouldExpand, sessionLogSizeGuard, SESSION_LOG_MAX_MB } from '../lib/host.js';
@@ -1277,8 +1280,15 @@ console.log('\n=== 23. 死旋钮 llmRecallRerank 不许回来 ===');
   const routesSource = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'routes.js'), 'utf8');
   check('routes.js 里不再有 llmRecallRerank（只剩解释性注释）',
     (routesSource.match(/llmRecallRerank/g) ?? []).length <= 1, `出现 ${(routesSource.match(/llmRecallRerank/g) ?? []).length} 次`);
-  check('✕ 路径的强相关判定走 deps.llm.rerank —— 那条必须还在',
-    routesSource.includes('deps.llm?.rerank'), '强相关判定被误删了');
+  check('✕ 路径的强相关判定走 deps.llm.selectPages —— 分页挑选必须真的接上',
+    routesSource.includes('deps.llm?.selectPages'), '分页挑选没有接上（✕ 会退回"只看 3 条"的老路）');
+  // 意图更新说明（2026-10-08）：这一条原先钉的是 `deps.llm?.rerank`（"只给 3 条 × 100 字"
+  // 的那条老路）。老路正是用户实测失效的根因：正确答案字面不含查询词 → 分数排第 4 名之后
+  // → **根本没进候选** → 模型只能在错的里挑。现在 ✕ 通道改走 `selectPages`（每页 30 条、
+  // 可翻页），所以断言跟着**行为**更新，意图不变：**"✕ 的强相关判定必须由宿主注入的模型
+  // 能力来做"**。旧 `rerank` 保留实现但没有调用方（见 lib/llm.js 的注释）。
+  check('✕ 路径不再用"只喂 3 条"的旧重排判定',
+    !/deps\.llm\?\.rerank\s*\(/.test(routesSource), '又在 ✕ 通道里调 rerank 了（等于退回旧候选口径）');
 }
 
 console.log('\n=== 24. 注入行抽取口径：答优先 / 结论句优先 / 首末取样 / 恒 ≤ 上限 ===');
@@ -1959,6 +1969,436 @@ console.log('\n=== 26. 摘抄写盘必须走 assertInside（含 realpath 校验�
   }
   fs.rmSync(ws, { recursive: true, force: true });
   fs.rmSync(outside, { recursive: true, force: true });
+}
+
+console.log('\n=== 27. ✕：提问归属（messageId → 该轮提问）+ 候选分页（30 条/页）===');
+{
+  /* 这一节盯的是**用户实测的失效案例**：
+   *   用户问"我最早对设置面板要求的原话是什么？"——他要找的是**本会话第一条消息**
+   *   （"必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理…"）；
+   *   插件返回的却是后一条（"控制面板的 UI…做成三个板块…"），并报"找到相关内容"。
+   * 两个根因，本节各钉一个：
+   *   ① ✕ 拿的是"会话最后一条提问" → 用户在点 ✕ 前又问过别的，就**查错问题**；
+   *   ② 候选只喂 3 条 × 100 字 → 正确的那条（字面没有"最早"二字）**根本没进候选**。
+   * 每条断言都写成"改坏就红"的形状（见各条下面的 ⚠️ 说明）。 */
+
+  // ── 27.1 页构造：条数、字符上限、序号、时间、标题、首句 ──────────────────
+  {
+    const many = Array.from({ length: 35 }, (_, i) => makeRecord({
+      layer: 'summary',
+      title: `块 ${i + 1}`,
+      compactionId: `p${i}`,
+      text: `第 ${i + 1} 条正文。${'填充'.repeat(60)}`,
+      at: `2026-10-0${(i % 9) + 1}T0${i % 10}:00:00.000Z`,
+    }));
+    const first = buildPage(many, 0, { pageSize: 30 });
+    const second = buildPage(many, 30, { pageSize: 30 });
+    eq('每页最多 30 条（第一页满页）', first.items.length, 30);
+    eq('第二页只剩 5 条（35 − 30）', second.items.length, 5);
+    eq('页序号（0 起）', `${first.page}/${second.page}`, '0/1');
+    check('每页字符数都在上限内（4000）', first.chars <= 4000 && second.chars <= 4000,
+      `first=${first.chars} second=${second.chars}`);
+    check('第一页第一条 = 池里第 1 条（顺序即本地分数序，不被重排）',
+      first.items[0].title === '块 1' && first.items[29].title === '块 30',
+      `${first.items[0].title} … ${first.items[29].title}`);
+    check('第二页第一条 = 池里第 31 条（偏移算对，序号仍是页内的 1）',
+      second.items[0].title === '块 31', second.items[0].title);
+    check('条目带来源时间（YYYY-MM-DD HH:mm）', /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(first.items[0].time),
+      first.items[0].time);
+    check('条目带首句（截断后 ≤ 60 + 1 个省略号）',
+      first.items[0].snippet.length <= 61 && first.items[0].snippet.startsWith('第 1 条正文。'),
+      first.items[0].snippet);
+    const listed = formatPage(first);
+    check('清单每行以页内序号开头（[1] …）', listed.split('\n')[0].startsWith('[1] '), listed.split('\n')[0].slice(0, 40));
+    check('清单末行是页内第 30 条（不是第 60 条 —— 序号只在页内有意义）',
+      listed.split('\n').slice(-1)[0].startsWith('[30] '), listed.split('\n').slice(-1)[0].slice(0, 20));
+
+    // 空块被跳过；`more` 正确表示"池里还有没装下的"
+    const withEmpty = buildPage([
+      makeRecord({ layer: 'summary', title: '空块', compactionId: 'e1', text: '   ' }),
+      makeRecord({ layer: 'summary', title: '有正文', compactionId: 'e2', text: '这一条有正文。' }),
+    ], 0, { pageSize: 30 });
+    eq('空块不进页（喂空行只浪费 token）', withEmpty.items.length, 1);
+    eq('空块被计入 skipped', withEmpty.skipped, 1);
+    // 单条超长：仍要放进去（否则这一页什么都看不到），靠首句截断控制字符数
+    const huge = buildPage([makeRecord({ layer: 'summary', title: '超长', compactionId: 'h1', text: '很长'.repeat(5000) })], 0, { pageSize: 30 });
+    eq('超长块仍然进页（首句已截断）', huge.items.length, 1);
+    check('超长块那一页字符数仍然很小（≈首句 + 标题 + 时间）', huge.chars < 200, String(huge.chars));
+    eq('池尾之后没有更多页', buildPage(many, 35, { pageSize: 30 }).items.length, 0);
+  }
+
+  // ── 27.2 提示词：查询词只经"用户消息"，系统提示词是固定文本 ──────────────
+  {
+    const probePage = [
+      makeRecord({ layer: 'summary', title: '甲', compactionId: 'x1', text: '甲的第一句。后面还有很多字。' }),
+      makeRecord({ layer: 'summary', title: '乙', compactionId: 'x2', text: '乙的第一句。后面还有很多字。' }),
+    ];
+    const page = buildPage(probePage, 0, { pageSize: 30 });
+    const query = '我最早对设置面板要求的原话是什么？';
+    const prompt = buildPagePrompt(query, page);
+    check('用户消息里带**提问原文**（一字不改）', prompt.startsWith(`问题：${query}`), prompt.slice(0, 40));
+    const promptLines = prompt.split('\n');
+    const line1 = promptLines.find((line) => line.includes('甲：')) ?? '';
+    const line2 = promptLines.find((line) => line.includes('乙：')) ?? '';
+    check('用户消息里带本页编号（模型回的是页内序号）',
+      line1.startsWith('[1] ') && line2.startsWith('[2] '),
+      `第一行=${line1.slice(0, 30)} 第二行=${line2.slice(0, 30)}`);
+    check('用户消息里要求"本页都没有就回答 NONE"', prompt.includes('NONE'), prompt.slice(-60));
+    /* ⚠️ 提示词**不许含任何非用户提供的查询词**（用户明确否决"主模型/插件编词"——
+     * 那等于把污染源请进检索）。判据：查询的每个 token（长度 ≥ 2、去重）都不许出现在
+     * **系统提示词**里。`tokenize` 是中文 bigram，"要求/问题"这类功能词天然会与那段
+     * 说明文字撞车，所以这里的查询刻意用**只属于它自己**的词（`菠萝蜜` / `量子纠缠`）：
+     * 真把查询词写进系统提示词（哪怕是以"关注 X"的形式）就会红。
+     * 另配一条反向自指：往系统提示词里拼一个内容词，同一条判据必须能抓住。 */
+    const system = pagePickSystem();
+    const probeQuery = '菠萝蜜与量子纠缠的第十七号备注';
+    const probeTokens = [...new Set(tokenize(probeQuery))].filter((token) => token.length >= 2);
+    check('（前提）探测用的查询确实有 ≥4 个 token（否则这条断言可能是空转）',
+      probeTokens.length >= 4, `tokens=${JSON.stringify(probeTokens)}`);
+    eq('系统提示词里不含查询里的任何 token（没有偷偷加词）',
+      probeTokens.filter((token) => system.includes(token)), []);
+    check('（自指）把查询词拼进系统提示词 → 同一条判据会红',
+      probeTokens.some((token) => `${system} 特别关注：${probeQuery}`.includes(token)),
+      `tokens=${JSON.stringify(probeTokens)}`);
+    check('系统提示词里不出现"最早"这类**语义**词（意思是模型判的，不是词面判的）',
+      !system.includes('最早'), system.slice(0, 80));
+    // 自指校验：上面那条断言真的能抓到"加了词"（否则它是恒真的）
+    const forged = `${system} 特别关注：设置面板`;
+    check('（自指）把查询词塞进系统提示词 → 同一条判据会红',
+      [...new Set(tokenize(query))].filter((token) => forged.includes(token)).length > 0,
+      '这条自指没抓住，说明上面的判据恒真');
+  }
+
+  // ── 27.3 序号解析 / NONE 语义 ────────────────────────────────────────────
+  {
+    eq('回 "7" → 命中第 7 条', parsePagePick('7', 30).kind, 'found');
+    eq('回编号的数值', parsePagePick('7', 30).index, 7);
+    eq('回 " 12\\n" 也认（允许空白）', parsePagePick(' 12\n', 30).index, 12);
+    eq('回 NONE → 本页没有', parsePagePick('NONE', 30).kind, 'none');
+    eq('回 "none"（小写）也认', parsePagePick('none', 30).kind, 'none');
+    eq('回 "是 NONE。" 这类噪声也认', parsePagePick('是 NONE。', 30).kind, 'none');
+    eq('空输出 → empty', parsePagePick('   ', 30).kind, 'empty');
+    eq('越界编号（31 > 30 条）→ unclear（不硬取）', parsePagePick('31', 30).kind, 'unclear');
+    eq('0 不是合法编号（编号从 1 起）→ unclear', parsePagePick('0', 30).kind, 'unclear');
+    eq('多个数字（模型在解释）→ unclear（替它选一个等于编答案）', parsePagePick('7 和 8', 30).kind, 'unclear');
+    eq('纯文字 → unclear', parsePagePick('都不太相关', 30).kind, 'unclear');
+  }
+
+  // ── 27.4 分页循环：NONE 翻页 / 页数上限 / 未找到返回空 / 失败即停 ─────────
+  {
+    const mk = (n, prefix) => Array.from({ length: n }, (_, i) => makeRecord({
+      layer: 'summary', title: `${prefix}${i + 1}`, compactionId: `${prefix}-${i}`, text: `${prefix} 第 ${i + 1} 条的正文。`,
+    }));
+    // 90 条候选 → 三页（每页 30 条）。页序号 0/1/2 由偏移算出。
+    const pool = [
+      ...mk(30, 'A'), ...mk(30, 'B'), ...mk(30, 'C'),
+    ];
+    const pages = [
+      buildPage(pool, 0, { pageSize: 30 }),
+      buildPage(pool, 30, { pageSize: 30 }),
+      buildPage(pool, 60, { pageSize: 30 }),
+    ];
+    eq('（前提）三页各自 30 条、页序号 0/1/2',
+      `${pages[0].items.length}/${pages[1].items.length}/${pages[2].items.length}/${pages.map((p) => p.page).join('')}`,
+      '30/30/30/012');
+    // 第一页 NONE → 第二页命中第 4 条
+    const asked = [];
+    const two = await pickAcrossPages({
+      pages,
+      pageLimit: 4,
+      ask: async (page) => {
+        asked.push(page.page);
+        return page.page === 0 ? { ok: true, text: 'NONE' } : { ok: true, text: '4' };
+      },    });
+    eq('第一页 NONE → 翻第二页', asked, [0, 1]);
+    eq('命中在第 2 页', two.page, 2);
+    eq('命中页内第 4 条', two.index, 4);
+    eq('返回的是那一页第 4 条的记录本体（带 fp）',
+      String(two.record?.fp ?? ''), String(pages[1].items[3].record.fp));
+    /* ⚠️ 底下这条是"编号 ↔ 正文"配错的回归：`buildPage` 会**跳过空块**，所以
+     * "页内第 N 条"与"池里第 N 条"不是一回事。曾经用 `poolSlice[offset + index]` 反查记录，
+     * 一旦前面有空块就会张冠李戴（把 A 的正文配到 B 的编号上）—— 这正是用户那个案例的
+     * 姊妹 bug（"选对了编号、给错了正文"）。判据：页内每条的 `.record` 必须与"池里那条"
+     * 是同一条记录（按 fp 比）。 */
+    const withHole = [
+      makeRecord({ layer: 'summary', title: '空一', compactionId: 'z1', text: '  ' }),
+      makeRecord({ layer: 'summary', title: '有正文甲', compactionId: 'z2', text: '甲正文。' }),
+      makeRecord({ layer: 'summary', title: '空二', compactionId: 'z3', text: '' }),
+      makeRecord({ layer: 'summary', title: '有正文乙', compactionId: 'z4', text: '乙正文。' }),
+    ];
+    const holePage = buildPage(withHole, 0, { pageSize: 30 });
+    eq('空块被跳过后，页内条目仍然各自挂着自己的记录',
+      holePage.items.map((item) => item.record.title).join(','), '有正文甲,有正文乙');
+    check('页内条目的 record 与它的 fp 一致（不许张冠李戴）',
+      holePage.items.every((item) => String(item.record.fp) === item.fp), JSON.stringify(holePage.items.map((i) => i.fp)));
+    eq('总共问了 2 次（= 调用次数上限的依据）', two.asked, 2);
+    eq('没被页数上限截住', two.limitReached, false);
+
+    // 每页都 NONE → 扫到上限就停，如实返回"没找到"
+    const noneAsked = [];
+    const none = await pickAcrossPages({
+      pages, pageLimit: 2,
+      ask: async (page) => { noneAsked.push(page.page); return { ok: true, text: 'NONE' }; },
+    });
+    eq('全是 NONE 时只翻到页数上限（2 页）就停', noneAsked, [0, 1]);
+    eq('未找到 → found=false', none.found, false);
+    eq('未找到 → 不返回任何记录（绝不硬凑）', none.record, null);
+    eq('如实带出"还有候选没看"（被上限截住）', none.limitReached, true);
+    eq('问了 2 次', none.asked, 2);
+
+    // 页数上限取最小值：pages 有 3 页、上限 4 → 三页都会被看到
+    const allAsked = [];
+    await pickAcrossPages({
+      pages, pageLimit: 4,
+      ask: async (page) => { allAsked.push(page.page); return { ok: true, text: 'NONE' }; },
+    });
+    eq('页数上限大于实际页数时，每页都看一遍', allAsked.length, 3);
+
+    // 模型调用失败（超时/限流）→ 立刻停，不再翻页花钱
+    const failAsked = [];
+    const failedPick = await pickAcrossPages({
+      pages, pageLimit: 4,
+      ask: async (page) => { failAsked.push(page.page); return { ok: false, code: 'TIMEOUT' }; },
+    });
+    eq('调用失败 → 只问了 1 次就停（不继续翻页烧钱）', failAsked, [0]);
+    eq('调用失败 → found=false', failedPick.found, false);
+    eq('调用失败 → 带出稳定 code', failedPick.stopped, 'TIMEOUT');
+
+    // 空页被跳过（不浪费一次调用）
+    const emptyAsked = [];
+    await pickAcrossPages({
+      pages: [buildPage([], 0, { pageSize: 30 }), pages[0]],
+      pageLimit: 4,
+      ask: async (page) => { emptyAsked.push(page.page); return { ok: true, text: 'NONE' }; },
+    });
+    eq('空页不消耗调用次数', emptyAsked, [0]);
+  }
+
+  // ── 27.5 messageId → turn → 该轮提问（纯函数）─────────────────────────────
+  {
+    /** 造一条"人类提问"的 user/message（必须带 rpcId，否则不算提问 —— P1-C 判据）。 */
+    const userEvent = (seq, text) => ({
+      type: 'user/message', seq, data: { role: 'user', content: [{ type: 'text', text }], source: { kind: 'user', rpcId: `rpc-${seq}` } },
+    });
+    const assistantEvent = (seq, turn, id, text) => ({
+      type: 'assistant/message', seq, data: { turn, step: 1, message: { id, role: 'assistant', content: [{ type: 'text', text }] } },
+    });
+    const events = [
+      { type: 'turn/start', seq: 5, data: { turn: 1 } },
+      userEvent(9, '第一轮的提问 A'),
+      assistantEvent(12, 1, 'msg-a', 'A 的回答'),
+      { type: 'turn/end', seq: 14, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'turn/start', seq: 15, data: { turn: 2 } },
+      userEvent(18, '第二轮的提问 B'),
+      assistantEvent(21, 2, 'msg-b', 'B 的回答'),
+      { type: 'turn/end', seq: 23, data: { turn: 2, reason: { kind: 'completed' } } },
+    ];
+    const first = queryForMessage(events, 'msg-a');
+    const later = queryForMessage(events, 'msg-b');
+    eq('第 1 轮回答的 messageId → 第 1 轮的提问', first.text, '第一轮的提问 A');
+    eq('并且带出轮次（面板/诊断要看得出是哪一轮）', first.turn, 1);
+    eq('第 2 轮回答的 messageId → 第 2 轮的提问', later.text, '第二轮的提问 B');
+    eq('第 2 轮的轮次', later.turn, 2);
+    eq('返回的 seq 是该条提问的 seq（不是回答的）', first.seq, 9);
+    /* ⚠️ **能失败**：把 `inTurn` 改成"取最后一条提问"（即旧的 bug 口径）→ 上面这条
+     * `first.text` 会变成"第二轮的提问 B"，立刻红。 */
+
+    // 没有 turn/start 的日志（少数老日志）：退化用"该轮第一条助手消息之前最近的一条提问"
+    const noTurnStart = [
+      userEvent(9, '第一轮的提问 A'),
+      assistantEvent(12, 1, 'x-a', 'A'),
+      userEvent(18, '第二轮的提问 B'),
+      assistantEvent(21, 2, 'x-b', 'B'),
+    ];
+    eq('没有 turn/start 时退化为"该轮第一条回答之前的最近一条提问"',
+      queryForMessage(noTurnStart, 'x-a').text, '第一轮的提问 A');
+    eq('同一条口径对第二轮也成立', queryForMessage(noTurnStart, 'x-b').text, '第二轮的提问 B');
+
+    // 查不到 / 该轮没有人类提问 / 空输入：**绝不猜**
+    eq('未知 messageId → 不猜（message-not-found）', queryForMessage(events, 'nope').reason, 'message-not-found');
+    eq('空 messageId → empty-id', queryForMessage(events, '').reason, 'empty-id');
+    eq('没有事件 → no-events', queryForMessage([], 'msg-a').reason, 'no-events');
+    const hostTask = [
+      { type: 'turn/start', seq: 5, data: { turn: 1 } },
+      // 宿主代发的任务提示：kind=user 但**没有 rpcId** → 不是人类提问
+      { type: 'user/message', seq: 8, data: { content: [{ type: 'text', text: '子代理派单' }], source: { kind: 'user' } } },
+      assistantEvent(11, 1, 'msg-task', '回答'),
+    ];
+    eq('该轮只有宿主代发的任务提示（无 rpcId）→ 视为没有提问（退回旧口径）',
+      queryForMessage(hostTask, 'msg-task').reason, 'no-question');
+  }
+
+  // ── 27.6 端到端：用户的真实例子（✕ 必须查到第 1 条，不是后一条）───────────
+  {
+    const workspace2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-missbind-'));
+    const root2 = storeRoot(workspace2, '.dsh-compaction-memory');
+    const session2 = `session-missbind-${Date.now()}`;
+    const qA = '必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理';
+    const qB = '控制面板的 UI 做成三个板块，开关都要能点';
+    // 第 1 轮的提问/回答（用户真正要找的那条）
+    const aQuestion = '第一轮我提的要求原话：必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理…';
+    const aEvent = {
+      type: 'assistant/message', seq: 12, data: { turn: 1, step: 1, message: { id: 'msg-turn-1', content: [{ type: 'text', text: 'A 的回答' }] } },
+    };
+    const bEvent = {
+      type: 'assistant/message', seq: 30, data: { turn: 2, step: 1, message: { id: 'msg-turn-2', content: [{ type: 'text', text: 'B 的回答' }] } },
+    };
+    const sessionEvents = [
+      { type: 'turn/start', seq: 5, data: { turn: 1 } },
+      { type: 'user/message', seq: 7, data: { content: [{ type: 'text', text: aQuestion }], source: { kind: 'user', rpcId: 'rpc-7' } } },
+      aEvent,
+      { type: 'turn/start', seq: 18, data: { turn: 2 } },
+      { type: 'user/message', seq: 20, data: { content: [{ type: 'text', text: '控制面板的 UI 改一下' }], source: { kind: 'user', rpcId: 'rpc-20' } } },
+      { type: 'user/message', seq: 22, data: { content: [{ type: 'text', text: qB }], source: { kind: 'user', rpcId: 'rpc-22' } } },
+      bEvent,
+    ];
+    appendRecords(root2, session2, [
+      // 第 1 条（用户要找的）：字面**不含**"最早"，词面分数更低
+      makeRecord({
+        layer: 'summary', session: session2, title: '用户最初的设置面板要求', compactionId: 'c1',
+        text: `用户第一轮的原话：${qA}。`, at: '2026-10-01T01:00:00.000Z',
+      }),
+      // 后一条：字面含"面板 / UI / 板块 / 开关"，词面分数更高
+      makeRecord({
+        layer: 'summary', session: session2, title: '控制面板 UI 三个板块', compactionId: 'c2',
+        text: `${qB}。三个板块：注入、入库、成本上限。`, at: '2026-10-02T02:00:00.000Z',
+      }),
+    ]);
+    const routes2 = makeRoutes({
+      settings: { get: () => ({ settings: { ...DEFAULTS, minScore: 0.01, protectRecentDays: 0, storeDir: '.dsh-compaction-memory', llmMode: 'custom', llmAssistEnabled: true, llmRecallRewrite: true } }) },
+      diag: { write: () => {} },
+      states: new Map(),
+      knownWorkspaces: () => [workspace2],
+      build: 'test',
+      llm: {
+        // 本地已强命中（分很高）→ 改写会被跳过，这次只有分页挑选在花钱
+        rewriteQuery: async () => ({ ok: true, terms: [qA], cached: false }),
+        // 假模型：只挑**带"用户第一轮的原话"标记**的那一条（模拟"按意思挑对"）
+        selectPages: async ({ pages }) => {
+          for (let i = 0; i < pages.length; i += 1) {
+            const index = pages[i].items.findIndex((item) => String(item.snippet ?? '').includes('用户第一轮的原话'));
+            if (index >= 0) return { ok: true, found: true, index: index + 1, item: pages[i].items[index].record, page: i + 1, asked: i + 1, pages: pages.length, truncated: false };
+          }
+          return { ok: true, found: false, index: 0, item: null, page: pages.length, asked: pages.length, pages: pages.length, truncated: false };
+        },
+        status: () => ({ enabled: true }),
+      },
+      dataHome: workspace2,
+      findSession: (id) => (id === session2
+        ? { id, header: { cwd: workspace2 }, snapshotEvents: () => sessionEvents }
+        : null),
+      boostFor: () => true,
+    });
+    const callDiagnose = async (body) => {
+      const out = [];
+      const req = {
+        url: '/api/dsh-super-memory/diagnose',
+        method: 'POST',
+        headers: { 'x-dsh-super-memory': '1', 'content-type': 'application/json' },
+        async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body), 'utf8'); },
+      };
+      const res = { status: 0, writeHead: (status) => { res.status = status; }, end: (text) => out.push(JSON.parse(text)) };
+      await routes2.handler(req, res);
+      return out[0];
+    };
+    // ① 用户在第 1 轮回答下面点 ✕，但请求里带的是**会话最后一条提问**（B，旧口径）
+    const bound = await callDiagnose({ workspace: workspace2, session: session2, messageId: 'msg-turn-1', query: qB, limit: 8, rewrite: true, boost: true });
+    const boundValue = bound?.value ?? {};
+    eq('✕ 回执里带提问归属凭据（via=message）', boundValue.query?.via, 'message');
+    eq('✕ 回执里的轮次 = 那条回答所属的轮次', boundValue.query?.turn, 1);
+    check('✕ 真正查的是**第 1 轮的提问**（不是请求里带的那条 B）',
+      boundValue.material.includes('必须带设置面板'), String(boundValue.material).slice(0, 120));
+    check('✕ 没有查成后一条（B 的正文不该出现在资料里）',
+      !boundValue.material.includes('三个板块'), String(boundValue.material).slice(0, 160));
+    check('✕ 找到了内容（found=true）', boundValue.found === true, `found=${JSON.stringify(boundValue.found)}`);
+    eq('分页回执里带上了池大小与页大小', `${boundValue.paging?.pageSize}/${boundValue.paging?.pool}`, '30/2');
+    /* ⚠️ **能失败**（两次独立验证，见交付说明）：
+     *   ① 把路由里 `messageId` 那段删掉 → `via` 变 'body'、material 变成 B 的正文 → 上面两条红；
+     *   ② 把分页挑选换回"只喂 3 条"（只把 `localFallback` 交给模型）→ 库大的时候正确的那条
+     *      会落在第 4 名之后、模型永远看不到它 → harness 的两页用例红。 */
+
+    // ② 老宿主没传 messageId：退回请求体里的提问（旧行为），并如实标出来源
+    const fallback = await callDiagnose({ workspace: workspace2, session: session2, query: qB, limit: 8, rewrite: true, boost: true });
+    eq('没传 messageId 时如实标出来源（body）', fallback?.value?.query?.via, 'body');
+
+    // ③ 模型说"本页都没有"，但**本地已经强命中** → 保留本地结果（不许静默变空）
+    {
+      let pickCalls = 0;
+      const routesSkip = makeRoutes({
+        settings: { get: () => ({ settings: { ...DEFAULTS, minScore: 0.02, protectRecentDays: 0, storeDir: '.dsh-compaction-memory', llmMode: 'custom', llmAssistEnabled: true } }) },
+        diag: { write: () => {} },
+        states: new Map(),
+        knownWorkspaces: () => [workspace2],
+        build: 'test',
+        llm: {
+          rewriteQuery: async () => ({ ok: true, terms: [], cached: false }),
+          selectPages: async () => { pickCalls += 1; return { ok: true, found: false, index: 0, item: null, page: 1, asked: 1, pages: 1, truncated: false }; },
+          status: () => ({ enabled: true }),
+        },
+        dataHome: workspace2,
+        findSession: (id) => (id === session2 ? { id, header: { cwd: workspace2 }, snapshotEvents: () => sessionEvents } : null),
+        boostFor: () => true,
+      });
+      const outSkip = [];
+      const reqSkip = {
+        url: '/api/dsh-super-memory/diagnose', method: 'POST',
+        headers: { 'x-dsh-super-memory': '1', 'content-type': 'application/json' },
+        async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ workspace: workspace2, session: session2, messageId: 'msg-turn-1', query: qA, limit: 8, rewrite: true, boost: true }), 'utf8'); },
+      };
+      await routesSkip.handler(reqSkip, { status: 0, writeHead: () => {}, end: (text) => outSkip.push(JSON.parse(text)) });
+      check('（前提）模型确实被问过一次', pickCalls === 1, `pickCalls=${pickCalls}`);
+      eq('模型说"本页都没有"、但本地已强命中 → 保留本地结果（found=true，不静默变空）',
+        outSkip[0]?.value?.found, true);
+      check('保留的本地结果就是本地为这个提问找到的那几条',
+        String(outSkip[0]?.value?.material ?? '').includes('用户第一轮的原话'),
+        String(outSkip[0]?.value?.material ?? '').slice(0, 100));
+    }
+
+    // ④ 完全不相关的问题：库里一条候选都没有 → 既不硬凑、也不白花一次调用
+    {
+      // 这一条必须让**该轮提问本身**与库不相关（而不是拿一句无关的话当 body.query：
+      // 宿主只认 messageId 对应那一轮的提问，body.query 根本不参与）。
+      const qWeak = '关于量子纠缠与菠萝蜜的第十七号备注，请随便说说';
+      const sessionWeak = `${session2}-weak`;
+      const weakEvents = [
+        { type: 'turn/start', seq: 5, data: { turn: 1 } },
+        { type: 'user/message', seq: 7, data: { content: [{ type: 'text', text: qWeak }], source: { kind: 'user', rpcId: 'rpc-w7' } } },
+        { type: 'assistant/message', seq: 9, data: { turn: 1, step: 1, message: { id: 'weak-turn-1-msg', content: [{ type: 'text', text: '回答' }] } } },
+      ];
+      let pickCalls4 = 0;
+      const routes3 = makeRoutes({
+        settings: { get: () => ({ settings: { ...DEFAULTS, minScore: 0.02, protectRecentDays: 0, storeDir: '.dsh-compaction-memory', llmMode: 'custom', llmAssistEnabled: true } }) },
+        diag: { write: () => {} },
+        states: new Map(),
+        knownWorkspaces: () => [workspace2],
+        build: 'test',
+        llm: {
+          rewriteQuery: async () => ({ ok: true, terms: [], cached: false }),
+          selectPages: async ({ pages }) => { pickCalls4 += 1; return { ok: true, found: false, index: 0, item: null, page: pages.length, asked: pages.length, pages: pages.length, truncated: false }; },
+          status: () => ({ enabled: true }),
+        },
+        dataHome: workspace2,
+        findSession: (id) => (id === sessionWeak ? { id, header: { cwd: workspace2 }, snapshotEvents: () => weakEvents } : null),
+        boostFor: () => true,
+      });
+      const out3 = [];
+      const req3b = {
+        url: '/api/dsh-super-memory/diagnose', method: 'POST',
+        headers: { 'x-dsh-super-memory': '1', 'content-type': 'application/json' },
+        async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ workspace: workspace2, session: sessionWeak, messageId: 'weak-turn-1-msg', query: qB, limit: 8, rewrite: true, boost: true }), 'utf8'); },
+      };
+      await routes3.handler(req3b, { status: 0, writeHead: () => {}, end: (text) => out3.push(JSON.parse(text)) });
+      eq('（前提）宿主解析出的确实是那一轮的提问（不是 body.query）',
+        out3[0]?.value?.query?.hash, shortHash(qWeak));
+      /* 本地检索对这一问**一条候选都没有**（查询词全不在库里）→ 没有页可喂、一次都不调用。
+       * 这是"完全不相关的问题"的诚实行为：既不该硬凑，也不该白花一次调用。 */
+      eq('库里一条都不沾 → 连页都没有（不白花调用）', pickCalls4, 0);
+      eq('→ 没找到（如实）', out3[0]?.value?.found, false);
+      eq('→ 资料为空（不塞本地粗筛）', out3[0]?.value?.material, '');
+      eq('→ 没有排进下一轮', out3[0]?.value?.boosting, false);
+    }
+    fs.rmSync(workspace2, { recursive: true, force: true });
+  }
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);

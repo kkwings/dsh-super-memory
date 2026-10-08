@@ -122,6 +122,7 @@ const { apply } = await import('../lib/host.js');
 const { decompressFrames } = await import('../lib/zstd.js');
 const { mergeKeywords, parseJsonArray, parseJsonObject } = await import('../lib/llm.js');
 const { diagnoseMiss } = await import('../lib/diagnose.js');
+const { timeLabelOf } = await import('../lib/diagnose.js');
 const { toolRecords } = await import('../lib/ingest.js');
 const { RECALL_HEAD_PREFIX, NEAR_DUPLICATE_SIMILARITY, questionTextOf } = await import('../lib/recall.js');
 // ㉕ 段要用**独立实现**量"召回行与 boost 资料是否重叠"（containment），
@@ -130,15 +131,15 @@ const { containment, tokenSet } = await import('../lib/text.js');
 // ③ 段要用它直接查库（钉住"夹具自污染"这个原因、并量出边界探针的分数）；
 // ⑥ 段原来在这里再 import 一次，已上移 —— 重复声明同一常量会直接 SyntaxError。
 const { MemoryIndex, retrieveTwoTier } = await import('../lib/retrieval.js');
-const { makeRecord, readRecords } = await import('../lib/store.js');
-const { DEFAULTS } = await import('../lib/config.js');
+const { appendRecords, makeRecord, readRecords, writeRecords } = await import('../lib/store.js');
+const { DEFAULTS, shortHash } = await import('../lib/config.js');
 
 /**
  * 假模型服务：由测试用例在 `apply()` **之前**设置，用来跑失败矩阵。
  * 始终存在（DSH 里 llm 一定在），靠 `behavior.mode` 切换返回内容；
  * "完全没有 llm 服务"那种机器由 `UNAVAILABLE` 闸门覆盖（见 unit.mjs）。
  */
-const behavior = { mode: 'off', calls: 0, rewriteCalls: 0 };
+const behavior = { mode: 'off', calls: 0, rewriteCalls: 0, pickCalls: 0, pickAnswer: null, pickLog: [] };
 
 /**
  * 「投影里有没有召回块」的判据串（来自 `lib/recall.js` 的 `RECALL_HEAD_PREFIX`）。
@@ -159,7 +160,12 @@ const fakeLlm = {
     // 查询改写走的是同一条 stream 通道，但**期望的输出形状不同**（JSON 数组 vs JSON 对象）：
     // 按系统提示词区分开，才能分别测"改写被调用/被跳过"（见 ㉓）。
     const isRewrite = typeof input.system === 'string' && input.system.includes('改写成');
+    // ✕ 通道的**分页挑选**（`lib/diagnose.js` 的 `pagePickSystem()`）走同一条 stream，
+    // 但期望的输出形状是"一个编号或 NONE"。按系统提示词区分开，才能分别量
+    // "翻了几页 / 每次挑了什么"（见 ㉖：两页才找到 + 调用次数上限）。
+    const isPick = typeof input.system === 'string' && input.system.includes('最可能直接回答');
     if (isRewrite) behavior.rewriteCalls += 1;
+    if (isPick) behavior.pickCalls += 1;
     if (behavior.mode === 'hang') { await new Promise((resolve) => setTimeout(resolve, 3000)); return; }
     if (behavior.mode === 'no-adapter') {
       yield { type: 'finish', kind: 'error', failure: { code: 'NO_ADAPTER', message: '提供方未注册' } };
@@ -173,6 +179,18 @@ const fakeLlm = {
     if (isRewrite) {
       // 改写要求严格 JSON 数组；给几个与库内容无关的词，便于观察"改写路径确实跑了"
       yield { type: 'text-delta', index: 0, text: '["跨压缩记忆", "注入成本", "改写"]' };
+      yield { type: 'finish', kind: 'done' };
+      return;
+    }
+    if (isPick) {
+      // 分页挑选：默认把**这一页的清单**记下来（断言要看"模型到底看到了什么"），
+      // 回答由用例设的 `behavior.pickAnswer` 决定（函数：按页决定；字符串：一律回它）。
+      const text = input.messages?.[0]?.content?.[0]?.text ?? '';
+      behavior.pickLog.push(text);
+      const answer = typeof behavior.pickAnswer === 'function'
+        ? behavior.pickAnswer(text, behavior.pickLog.length)
+        : (typeof behavior.pickAnswer === 'string' ? behavior.pickAnswer : 'NONE');
+      yield { type: 'text-delta', index: 0, text: String(answer) };
       yield { type: 'finish', kind: 'done' };
       return;
     }
@@ -1249,6 +1267,232 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
     + `扩写候选 ${lastExpand?.candidates} · 跳过工具 ${lastExpand?.skippedTool} · 调用 ${lastExpand?.calls}`);
   await put({ llmAssistEnabled: false, llmIngestExpand: false });
   console.log(`  ㉔ 段累计：通过 ${d24Passed} 条，失败 ${d24Failed} 条。`);
+}
+
+/* ── 26) ✕ 的提问归属 + 分页挑选（两页才找到）────────────────────────────────
+ * 这一节复现**用户实测的失效案例**并把它钉住：
+ *   用户问"我最早对设置面板要求的原话是什么？"——他要找的是本会话第一条消息
+ *   （"必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理…"），
+ *   插件却返回了后一条（"控制面板的 UI…做成三个板块…"）并报"找到相关内容"。
+ * 两个根因各一条端到端断言：
+ *   ① ✕ 必须绑定到**这条回答对应的提问**（messageId → turn → 该轮提问），
+ *      而不是"会话最后一条提问"；
+ *   ② 候选必须**分页喂**（每页 30 条）：正确的那条字面不含"最早"、词面分数排到第 31 名
+ *      —— 第 1 页（30 条）里没有它，所以这一节走的是"**第一页 NONE → 第二页命中**"，
+ *      并把**总调用次数**钉在页数上限内（超了就是成本失控）。
+ * 能失败：
+ *   · 去掉路由里 messageId 那段 → `via` 变 body、资料变成 B 的正文 → ① 红；
+ *   · 把分页换回"只喂 3 条"→ 第 2 页不存在、模型永远看不到正确那条 → ② 红；
+ *   · 去掉页数上限 → 调用次数断言红。 */
+{
+  let d26Passed = 0;
+  let d26Failed = 0;
+  const expect = (label, condition, detail = '') => {
+    if (condition) { d26Passed += 1; console.log(`  ✓ ${label}`); return; }
+    d26Failed += 1; process.exitCode = 1;
+    console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
+  };
+  console.log('\n=== ㉖ ✕：提问归属（messageId）+ 分页挑选（两页才找到）===');
+
+  const m26Id = `session-page-${process.pid}`;
+  const m26Question =
+    '我最早对设置面板要求的原话是什么？就是那个必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理的原始需求。';
+  const m26AnswerPanel = '控制面板的 UI 做成三个板块，开关都要能点';
+  const m26TrueText = '用户第一轮的原话：必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理。';
+  // 事件形状照抄真实日志：`assistant/message` 带 `turn` 与 `message.id`（✕ 的 messageId 就是它），
+  // `user/message` 必须带 `source.rpcId` 才算人类提问（P1-C 判据）。
+  const m26Events = [
+    { type: 'turn/start', seq: 5, time: Date.now(), data: { turn: 1 } },
+    {
+      type: 'user/message', seq: 7, time: Date.now(),
+      data: { content: [{ type: 'text', text: m26Question }], source: { kind: 'user', rpcId: 'harness-page-rpc-7' }, role: 'user', id: 'q-page-1' },
+    },
+    {
+      type: 'assistant/message', seq: 9, time: Date.now(),
+      data: { turn: 1, step: 1, message: { id: 'm26-turn-1-msg', role: 'assistant', content: [{ type: 'text', text: 'A 的回答' }] } },
+    },
+    { type: 'turn/end', seq: 11, time: Date.now(), data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/start', seq: 13, time: Date.now(), data: { turn: 2 } },
+    {
+      type: 'user/message', seq: 15, time: Date.now(),
+      data: { content: [{ type: 'text', text: m26AnswerPanel }], source: { kind: 'user', rpcId: 'harness-page-rpc-15' }, role: 'user', id: 'q-page-2' },
+    },
+    {
+      type: 'assistant/message', seq: 17, time: Date.now(),
+      data: { turn: 2, step: 1, message: { id: 'm26-turn-2-msg', role: 'assistant', content: [{ type: 'text', text: 'B 的回答' }] } },
+    },
+  ];
+  const m26Session = {
+    id: m26Id,
+    header: { cwd: workdir },
+    snapshotEvents: () => m26Events,
+    requestContext: () => ({ contextWindow: 1000000 }),
+  };
+  // 注册会话状态（`/diagnose` 靠 `findSessionById` 从进程内状态里拿会话对象）
+  emit(m26Session, { type: 'turn/start', seq: 3, time: Date.now(), data: { turn: 1 } });
+
+  /* 库：**41 条候选**，让正确的那条落在**页 2**（第 41 名）。
+   * 关键约束（2026-10-08 实测调出来的）：
+   *   ① 正确的那条必须**进候选池**（本地有戏、只是排序不靠前）——这正是用户的现场：
+   *      他问"我最早…要求的原话是什么"，那条字面上没有"最早"，词面**低于**后一条；
+   *   ② 池子要够大，让正确那条落在第 31 名之后 —— 旧实现只把前 3 条喂给模型，
+   *      于是它永远看不到正确那条（本节 `scanned=2` 就是这个判据）。
+   * 填充块刻意写成"**与提问高度重合的会议记录**"（把提问原句抄了一遍），这样它们的
+   * 词面分数高于正确那条（正确那条只是"提到了要求"，没有复述整句）——正是"字面撞词
+   * 最多的那条排前面"的真实现象。 */
+  const m26Now = Date.now();
+  const m26OldAt = new Date(m26Now - 86400_000 * 30).toISOString();
+  const m26FillText = (i) => `本会话第一条消息：必须带设置面板：注入开关 / 入库开关 / 可自调成本上限 / 本地记忆管理。`
+    + `${m26Question}（第 ${i + 1} 条会议记录）`;
+  const m26Records = [
+    ...Array.from({ length: 40 }, (_, i) => makeRecord({
+      layer: 'summary', session: m26Id, title: `面板要求讨论记录 ${i + 1}`, compactionId: `m26-fill-${i}`,
+      text: m26FillText(i),
+      at: new Date(m26Now - 60_000 * (i + 1)).toISOString(),
+    })),
+    // 第 41 条：**正确的那条**（页 2）。时间最旧（页里那行时间就是它的身份标记）。
+    makeRecord({
+      layer: 'summary', session: m26Id, title: '用户最初的设置面板要求', compactionId: 'm26-true',
+      text: m26TrueText,
+      at: m26OldAt,
+    }),
+  ];
+  /* 每个断言块开头都重新登记一次会话状态：会话状态表是 LRU（`MAX_STATES`=24），
+   * 前面几十段用例 + 本段自己的库操作足以把它挤掉 —— 一旦挤掉，`/diagnose` 会
+   * 解析不到会话（`via` 退回 body、定位不到 messageId），那会是"假红"。
+   * `emit()` 一个无害事件即可把 `stateFor(session)` 重新放进 LRU 队首。 */
+  const m26Touch = () => emit(m26Session, { type: 'turn/start', seq: 3, time: Date.now(), data: { turn: 1 } });
+  m26Touch();
+  // 幂等：重复跑同一份用例时不要把库撑成两倍（`workdir` 由调用方给，可能被复用）
+  writeRecords(root, m26Id, readRecords(root, m26Id).filter((record) => !/^m26-/.test(String(record.compactionId ?? ''))));
+  const m26Before = readRecords(root, m26Id).length;
+  appendRecords(root, m26Id, m26Records);
+  expect('用例库已入库（≥31 条，正确那条排在页 2）',
+    readRecords(root, m26Id).length - m26Before >= 31,
+    `实际新增 ${readRecords(root, m26Id).length - m26Before} 条`);
+  fs.rmSync(path.join(home, 'dsh-super-memory.llm-usage.json'), { force: true });
+  await put({
+    llmMode: 'custom', llmProvider: 'fake-provider', llmModel: 'fake-model',
+    llmIngestExpand: false, llmRecallRewrite: false, llmDailyCallCap: 0,
+    minScore: 0.02, diagnosePageSize: 30, diagnosePageLimit: 4, diagnoseCandidatePool: 120,
+  });
+  behavior.mode = 'ok';
+  behavior.pickCalls = 0;
+  behavior.pickLog = [];
+  /* 假模型：**第 1 页回 NONE，第 2 页回正确那条的页内编号**。
+   * 正确那条的身份标记 = 它在页里的**来源时间**（`timeLabelOf` 的口径，与页内清单逐字同源）
+   * —— 填充块都是"刚刚"，只有它写的是 30 天前。用时间当标记而不是正文串：填充块的正文里
+   * 刻意复述了提问原句，拿正文串当标记会把填充块也认成正确那条。 */
+  const m26OldLabel = timeLabelOf(m26OldAt);
+  behavior.pickAnswer = (text) => {
+    const lines = text.split('\n');
+    const at = lines.findIndex((line) => line.includes(m26OldLabel));
+    if (at < 0) return 'NONE';
+    const header = lines.slice(0, at + 1).reverse().find((line) => /^\[\d+\]/.test(line)) ?? '';
+    const n = Number((/^\[(\d+)\]/.exec(header) ?? [])[1] ?? 0);
+    return n > 0 ? String(n) : 'NONE';
+  };
+
+  const m26DiagFile = path.join(home, 'dsh-super-memory.diag.jsonl');
+  const m26DiagBefore = (fs.existsSync(m26DiagFile) ? fs.readFileSync(m26DiagFile, 'utf8').split('\n') : []).length;
+  m26Touch();
+  const m26 = await call('POST', '/api/dsh-super-memory/diagnose', {
+    workspace: workdir,
+    session: m26Id,
+    // 真实场景：用户点的是**第 1 轮那条回答**下面的 ✕，而请求里带的"最后一条提问"
+    // 是 B（这正是修复前会查错问题的那种情形）。
+    messageId: 'm26-turn-1-msg',
+    query: m26AnswerPanel,
+    // 池要够大（默认 10 会把候选截到 10 条，那还是"只喂很少"）
+    limit: 50,
+    rewrite: true,
+    boost: true,
+  });
+  const m26Value = m26.body?.value ?? {};
+  expect('✕ 请求成功（HTTP 200）', m26.status === 200, `实际 HTTP ${m26.status} ${JSON.stringify(m26.body?.error ?? null)}`);
+  expect('✕ 回执标明提问来源是 messageId 定位（via=message）',
+    m26Value.query?.via === 'message', `via=${JSON.stringify(m26Value.query?.via)}`);
+  expect('✕ 定位到的轮次 = 那条回答所属的轮次（turn 1）',
+    m26Value.query?.turn === 1, `turn=${JSON.stringify(m26Value.query?.turn)}`);
+  expect('✕ 提问文本与该轮提问原文一致（回执里只给哈希 + 长度，不落原文）',
+    m26Value.query?.hash === shortHash(m26Question) && m26Value.query?.chars === m26Question.length,
+    `${JSON.stringify(m26Value.query)} 期望 hash=${shortHash(m26Question)} chars=${m26Question.length}`);
+  expect('✕ 查的是**第 1 轮**的提问，不是请求里带的 B',
+    String(m26Value.material ?? '').includes('必须带设置面板')
+    && !String(m26Value.material ?? '').includes('三个板块'),
+    String(m26Value.material ?? '').slice(0, 120));
+
+  const m26Pages = m26Value.paging ?? {};
+  expect('第一页没有（模型回 NONE）→ 翻了第二页才命中（scanned=2）',
+    Number(m26Pages.scanned) === 2, `scanned=${JSON.stringify(m26Pages.scanned)} pages=${JSON.stringify(m26Pages.pages)} pool=${JSON.stringify(m26Pages.pool)}`);
+  expect('命中在第 2 页', Number(m26Pages.pickedPage) === 2, `pickedPage=${JSON.stringify(m26Pages.pickedPage)}`);
+  expect('每页 30 条、共 2 页',
+    Number(m26Pages.pageSize) === 30 && Number(m26Pages.pages) === 2,
+    `pageSize=${m26Pages.pageSize} pages=${m26Pages.pages} pool=${m26Pages.pool}`);
+  expect('分页回执如实带出池大小（≥31 条，正确那条在页 2）',
+    Number(m26Pages.pool) >= 31, `pool=${JSON.stringify(m26Pages.pool)}`);
+  // 成本红线：一次 ✕ 的模型调用次数必须 ≤ 页数上限（这里是 2 页 → 2 次）
+  expect('模型调用次数 ≤ 页数上限，且等于实际翻的页数（2 次）',
+    behavior.pickCalls === 2 && behavior.pickCalls <= Number(m26Pages.limit ?? 0),
+    `pickCalls=${behavior.pickCalls} limit=${m26Pages.limit}`);
+  expect('没有偷偷多翻页（第一次就回 NONE 也只是"这一页没有"）',
+    behavior.pickLog.length === 2, `实际问了 ${behavior.pickLog.length} 次`);
+  expect('模型看到的第 1 页**不含**正确那条（否则这条用例测不到"翻页"）',
+    !String(behavior.pickLog[0] ?? '').includes(m26OldLabel), String(behavior.pickLog[0] ?? '').slice(-160));
+  expect('模型看到的第 2 页**含**正确那条（页内清单那一行的时间就是身份标记）',
+    String(behavior.pickLog[1] ?? '').includes(m26OldLabel), String(behavior.pickLog[1] ?? '').slice(-160));
+  expect('找到了内容（found=true）', m26Value.found === true, `found=${JSON.stringify(m26Value.found)}`);
+  expect('资料已排进下一轮（boosting=true）', m26Value.boosting === true, `boosting=${JSON.stringify(m26Value.boosting)}`);
+
+  const m26Events2 = (fs.existsSync(m26DiagFile) ? fs.readFileSync(m26DiagFile, 'utf8').split('\n') : []).slice(m26DiagBefore)
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+  const m26AllLines = fs.existsSync(m26DiagFile) ? fs.readFileSync(m26DiagFile, 'utf8').split('\n') : [];
+  const parsedAll = m26AllLines.map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+  // ⚠️ 判据按**事件内容**找，不按"这一段的第几行"切：诊断日志有 `maxLines` 上限，
+  // 写满会 compact（丢开头一段），按行号切片会把刚写的行切到窗口外（实测踩过）。
+  const bindEvent = parsedAll.filter((entry) => entry.event === 'miss-query-bind' && entry.session === m26Id).slice(-1)[0] ?? null;
+  const strongEvent = parsedAll.filter((entry) => entry.event === 'strong-relevance' && entry.session === m26Id).slice(-1)[0] ?? null;
+  console.log(`   [㉖ 分页诊断] scanned=${strongEvent?.pagesScanned} page=${strongEvent?.page} bind=${JSON.stringify(bindEvent)}`);
+  expect('诊断留痕：miss-query-bind（记了 turn / seq，不落提问原文）',
+    bindEvent !== null && bindEvent.ok === true && bindEvent.turn === 1 && !('query' in bindEvent),
+    JSON.stringify(bindEvent));
+  expect('诊断留痕：strong-relevance 带 pagesScanned / page',
+    strongEvent !== null && strongEvent.pagesScanned === 2 && strongEvent.page === 2,
+    JSON.stringify(strongEvent));
+
+  // ② 回归：messageId 被**故意改坏**（换成一条不存在的 id）→ 必须退回旧口径并留痕（不静默）
+  const m26DiagBefore2 = (fs.existsSync(m26DiagFile) ? fs.readFileSync(m26DiagFile, 'utf8').split('\n') : []).length;
+  m26Touch();
+  const m26Fallback = await call('POST', '/api/dsh-super-memory/diagnose', {
+    workspace: workdir, session: m26Id, messageId: 'no-such-message', query: m26AnswerPanel, limit: 8,
+  });
+  const m26FallbackEvents = (fs.existsSync(m26DiagFile) ? fs.readFileSync(m26DiagFile, 'utf8').split('\n') : []).slice(m26DiagBefore2)
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+  const fallbackBind = (fs.existsSync(m26DiagFile) ? fs.readFileSync(m26DiagFile, 'utf8').split('\n') : [])
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean)
+    .filter((entry) => entry.event === 'miss-query-bind' && entry.session === m26Id).slice(-1)[0] ?? null;
+  expect('定位不到时退回旧口径（via=fallback）并如实标出原因',
+    m26Fallback.body?.value?.query?.via === 'fallback' && fallbackBind?.reason === 'message-not-found',
+    `${JSON.stringify(m26Fallback.body?.value?.query)} / bind=${JSON.stringify(fallbackBind)}`);
+
+  /* ③ 提问原文一致性（最后一道保险）：**同一个 messageId、两个不同的 body.query**，
+   * 宿主解析出来的查询哈希必须一模一样 —— 这就是"查询永远来自那条回答对应的提问、
+   * 不来自请求体"的可执行证明（谁把 body.query 放回优先位，这一条立刻红）。 */
+  m26Touch();
+  const m26Again = await call('POST', '/api/dsh-super-memory/diagnose', {
+    workspace: workdir, session: m26Id, messageId: 'm26-turn-1-msg',
+    query: '完全不相干的另一种问法：今天晚饭吃什么', limit: 8,
+  });
+  expect('换成别的 body.query，解析出的提问哈希不变（查询只认 messageId）',
+    m26Again.body?.value?.query?.hash === m26Value.query?.hash
+    && m26Again.body?.value?.query?.turn === 1,
+    `第一次=${JSON.stringify(m26Value.query)} 第二次=${JSON.stringify(m26Again.body?.value?.query)}`);
+  expect('（自检）两次的 body.query 确实不同（否则上面那条是空转）',
+    '完全不相干的另一种问法：今天晚饭吃什么' !== m26AnswerPanel);
+
+  behavior.pickAnswer = null;
+  await put({ llmAssistEnabled: false, llmIngestExpand: false });
+  console.log(`  ㉖ 段累计：通过 ${d26Passed} 条，失败 ${d26Failed} 条。`);
 }
 
 /* ── 清理：临时目录用完即清（异常路径由上面的 process 钩子兜底）─────────────

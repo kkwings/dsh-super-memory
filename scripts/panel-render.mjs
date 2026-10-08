@@ -1079,12 +1079,19 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
     const originalFetch = globalThis.fetch;
     const session = 'session-q-repeat';
     const reply = (value) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) });
-    globalThis.fetch = async (url) => {
+    /* 记下 ✕ 发给 `/diagnose` 的**请求体**：这一段要证明"按钮把这一轮的
+     * `messageId` 一起发出去了"（宿主靠它把 ✕ 绑定到该轮的提问，见 lib/routes.js）。 */
+    const diagnoseBodies = [];
+    const actionMessageId = 'msg-of-turn-1';
+    globalThis.fetch = async (url, init) => {
       const target = String(url);
       if (target.includes('/diagnostics')) {
         return reply({ runtime: [{ sessionId: session, workspace: 'E:\\w', knownCompactions: 2, hits: 1, misses: 1, lastQuery: '同一句话' }] });
       }
       if (target.includes('/diagnose')) {
+        if (typeof init?.body === 'string') {
+          try { diagnoseBodies.push(JSON.parse(init.body)); } catch { diagnoseBodies.push({ __raw: init.body }); }
+        }
         return reply({ boosting: true, found: true, material: '【对话】找到的资料', model: 'stub-model', file: 'E:\\w\\a.md' });
       }
       if (target.includes('/settings')) return settingsPayload;
@@ -1104,7 +1111,10 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
         for (let round = 0; round < 2; round += 1) {
           hookIndex = 0;
           currentComponent = key;
-          out = withComponent(key, () => renderMiss({ sessionId: session }));
+          // 与真机同形：DSH 的 `TurnTailNodeView` 只给这个槽位 `{ messageId }`
+          //（`renderSlot("conversation.chat.assistant-actions", { messageId })`），
+          // `sessionId` 由本插件的 `inject` 补上。
+          out = withComponent(key, () => renderMiss({ sessionId: session, messageId: actionMessageId }));
           for (let i = 0; i < 6; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
         }
         return out;
@@ -1122,6 +1132,18 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
       check('✕ 结果块挂在这一轮上（第 1 轮渲染得出来；跨轮才不显示）',
         (await renderTailFor(session, 1, 'missRepeatSame')).text.includes('找到相关内容'),
         '同一轮必须显示 —— 若这里也空，说明把功能整体关掉了，不是修好');
+      /* ✕ 请求必须带上**这一轮的 `messageId`**（宿主据此把 ✕ 精确定位到"这条回答对应的
+       * 提问"，而不是"会话最后一条提问"）。
+       * ⚠️ 能失败：把 `body: JSON.stringify({... messageId: ownMessageId ...})` 里的
+       * `messageId` 去掉 → 这一条立刻红（真机上表现为"点 ✕ 查的是别的问题"）。 */
+      const sentBody = diagnoseBodies.slice(-1)[0] ?? null;
+      check('✕ 发出的 /diagnose 请求带上了这一轮的 messageId',
+        sentBody?.messageId === actionMessageId, `实际请求体=${JSON.stringify(sentBody)}`);
+      check('✕ 请求里的 session 与"这一轮所在的会话"一致',
+        sentBody?.session === session, `实际 session=${JSON.stringify(sentBody?.session)}`);
+      check('✕ 请求里的提问是宿主探测到的**该轮**提问（面板不自己编词）',
+        sentBody?.query === '同一句话' && sentBody?.rewrite === true && sentBody?.boost === true,
+        `实际请求体=${JSON.stringify(sentBody)}`);
 
       const decide = globalThis.window?.__dsmTestHooks?.missActionDecide;
       check('✕ `MissAction` 的陈旧判据已导出（渲染过动作栏之后才登记）', typeof decide === 'function',
