@@ -353,7 +353,7 @@ plugin_manager  action: install_bundle  target: dsh-super-memory
 
 `npm test` **会真的报错**（退出码非 0），它跑四套：① 单元测试（纯函数 + 历次真实 bug 的回归）、② 面板静态自检（设置键 / CSS 类名 / API 路径 / 板块齐全 / 数字框精度）、③ 面板渲染冒烟（用桩 React 真正渲染面板整棵树，并核对"控件 ↔ 设置键"的绑定）、④ **宿主半边冒烟**（每个文件非空无 BOM 无 NUL、逐个 `node --check`、宿主入口真能加载、导出契约在位，**并真的调用一次 `apply(ctx)` 与合成 req/res 打一遍面板请求链**）。
 
-`scripts/harness.mjs` 的退出码分两档：**自检失败 = 1**，**缺参数 / 日志路径读不到 = 2**（并打印用法，不是 TypeError 栈）；它建的临时目录用完即清（异常路径也清）。
+`scripts/harness.mjs` 与 `scripts/selftest.mjs` 的退出码同一口径：**自检失败 = 1**，**缺参数 / 日志路径读不到 = 2**（并打印用法，不是 TypeError 栈）；不适用的段落打印 `SKIP + 原因`，**不算失败**。两个脚本建的临时目录都用完即清（异常路径也清）。
 
 其余脚本用真实会话日志做端到端验证：
 
@@ -365,6 +365,8 @@ node scripts/panel-render.mjs
 node scripts/host-smoke.mjs
 
 # 1) 纯离线：真实日志跑通「压缩入库 → 检索 → 总览 → 注入样例」+ minScore 标定表
+#    **有真断言**（入库块数/L1+L2 都在/总览在预算内/命中样例能注入且不超单轮上限/
+#    注入行带答案正文/无关提问 0 token），失败退出码 1；日志里没有压缩事件则整段 SKIP。
 node scripts/selftest.mjs <session.v4.jsonl.zstd>
 
 # 2) 宿主半边联调：假 cordis ctx + 真实日志，跑通入库/总览/命中/未命中/开关/面板 API/history_read

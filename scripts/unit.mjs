@@ -33,8 +33,10 @@ import { STRONG_HIT_RATIO, RateLimiter, makeRoutes, rewriteRateLimits, sessionLo
 import { shouldExpand, sessionLogSizeGuard, SESSION_LOG_MAX_MB } from '../lib/host.js';
 import {
   appendRecords, isExcerptOf, makeRecord, moveToTrash, patchKeywords, purgeTrash, readRecords,
-  removeSessionExcerpts, removeTrashEntry, storeRoot, withFileLock, writeRecordsSafely,
+  removeSessionExcerpts, removeTrashEntry, restoreFromTrash, sessionLockKey, storeRoot, withFileLock,
+  writeRecords, writeRecordsSafely,
 } from '../lib/store.js';
+import { writeExcerpt } from '../lib/transcript.js';
 import { sessionLogBytes } from '../lib/zstd.js';
 
 let passed = 0;
@@ -236,13 +238,44 @@ console.log('\n=== 5. 文本工具 ===');
   eq('完全相同 → 相似度 1', jaccard(tokens, tokenSet('跨压缩记忆插件')), 1);
 }
 
-console.log('\n=== 6. 提问事件解析（含 inbox 早到的那条路径）===');
+console.log('\n=== 6. 提问事件解析（含 inbox 早到的那条路径 + P1-C 非提问队列消息）===');
 {
-  const message = { content: [{ type: 'text', text: '这是提问' }], source: { kind: 'user' } };
+  const message = { content: [{ type: 'text', text: '这是提问' }], source: { kind: 'user', rpcId: 'rpc-1', clientTimeZone: 'Asia/Shanghai' } };
   eq('UserMessage 形状 → 取到提问', questionTextOf(message), '这是提问');
   eq('系统注入 → 空', questionTextOf({ content: [{ type: 'text', text: 'x' }], source: { kind: 'runtime-context' } }), '');
   eq('user/message 事件 → 取到提问', queryTextOf({ type: 'user/message', data: message }), '这是提问');
   eq('非用户事件 → 空', queryTextOf({ type: 'assistant/message', data: message }), '');
+
+  /* ── P1-C：把"非提问的队列消息"挡在查询之外 ──────────────────────────────
+   * 真实日志实测（本机 84 份日志 / 2092 条消息）：
+   *   · `kind:'user'` **且带 rpcId**：616/616 条 inbox 项、591/591 条 user/message，全是人类提问；
+   *   · `kind:'user'` **没有 rpcId**：50/50 条 inbox 项 —— 全是宿主代发的**子代理任务提示**
+   *     （“你在 Windows 上工作。目标仓库：…”这类派单），一条人类提问都没有；
+   *   · 通知类（tool-jobs / subagent-settled / agent-instructions / user-approval /
+   *     dsh-memoir 收尾）根本不叫 `kind:'user'`，且多半带 `form:'notice'`。
+   * 旧口径只看 `kind === 'user'`，于是 task prompt / 通知被当成本轮提问塞进 pendingQuery，
+   * 下一个真问题进来时查询身份被替换 → 分数从中位 0.5 掉到 0.25 上下 → **真问题漏检**。
+   * ⚠️ 能失败：删掉 `questionTextOf` 里的 `rpcId` 闸门 → 下面第 1、4 条立刻变红。 */
+  eq('宿主代发的任务提示（kind:user 但没有 rpcId）→ 不是提问',
+    questionTextOf({ content: [{ type: 'text', text: '你在 Windows 上工作。目标仓库：…' }], source: { kind: 'user' } }), '');
+  eq('kind:user 但 form:notice → 不是提问',
+    questionTextOf({ content: [{ type: 'text', text: 'background job pwsh-99 已完成' }], source: { kind: 'user', form: 'notice', rpcId: 'rpc-2' } }), '');
+  eq('tool-jobs notice → 不是提问',
+    questionTextOf({ content: [{ type: 'text', text: 'background job pwsh-28 (pwsh: …)' }], source: { kind: 'tool-jobs', form: 'notice', summary: '…' } }), '');
+  eq('dsh-memoir 收尾回合 → 不是提问',
+    questionTextOf({ content: [{ type: 'text', text: '来源工作回合：15。这是独立的记忆收尾回合，不是新的用户任务。' }], source: { kind: 'dsh-memoir', originTurn: 15 } }), '');
+
+  // 队列序列（真实顺序：真提问先到、通知随后插进队列）→ 记下的必须仍是真提问。
+  const queue = [
+    { content: [{ type: 'text', text: '真提问：注入成本上限是多少' }], source: { kind: 'user', rpcId: 'rpc-3' } },
+    { content: [{ type: 'text', text: 'background job pwsh-99 (node scripts/harness.mjs …) 已完成，退出码 0' }], source: { kind: 'user' } },
+  ];
+  let pending = '';
+  for (const item of queue) {
+    const text = questionTextOf(item);
+    if (text !== '') pending = text;
+  }
+  eq('通知 + 真提问的队列序列 → 查询身份是真提问（不是通知）', pending, '真提问：注入成本上限是多少');
 }
 
 console.log('\n=== 7. 全局数据目录 ===');
@@ -486,6 +519,25 @@ console.log('\n=== 12. 同一轮里不注入近重复的块（真实浪费：约
     && String(longRound.built.lines[0]).startsWith('- ') && String(longRound.built.text).includes(longRound.built.lines[0]),
     `lines=${JSON.stringify(longRound.built.lines)}`);
   eq('fps 与 lines 一一对应', longRound.built.fps.length, longRound.built.lines.length);
+
+  /* ⑤ P2-6 再补一刀：**单轮 token 预算**那道裁剪也会改注入文本（`formatRecall` 会把
+   * `lines[0]` 就地截短、或直接 `pop` 掉多出来的条）。宿主登记的必须是**裁剪之后**、
+   * 真正出现在 `built.text` 里的那一行 —— 否则跨轮去重会拿一段模型根本没见过的文本作比较。
+   * 这里把预算压到"只装得下一行的一小段"，强制走收缩分支。
+   * ⚠️ 能失败：把宿主登记改回 `fresh[i].tokens`（= `selectFreshHits` 里裁剪前的行）→
+   *   下面"登记的行就长在注入文本里"这一条在收缩场景下会红。 */
+  const shrink = formatRecall([
+    { record: makeRecord({ layer: 'summary', title: '长标题', compactionId: 'c1', text: `${base}${filler(0x4e00, 3000)}` }), fp: 'c1' },
+    { record: makeRecord({ layer: 'summary', title: '第二条', compactionId: 'c1', text: `${base}另外一段足够长的正文。`.repeat(40) }), fp: 'c2' },
+  ], { maxItems: 2, maxCharsPerItem: 600, maxTokensPerTurn: 180 });
+  check('⑤ 预算压缩后仍然有注入行（前提：这条夹具真的走了裁剪分支）',
+    shrink.items >= 1 && shrink.tokens <= 180, `items=${shrink.items} tokens=${shrink.tokens}`);
+  check('⑤ 登记口径 = 真正注入的那一行：每条 lines[i] 逐字出现在注入文本里（含被截短的第一行）',
+    shrink.lines.length > 0 && shrink.lines.every((line) => shrink.text.includes(line)),
+    `lines=${shrink.lines.map((line) => line.length).join(',')} chars=${shrink.text.length}`);
+  check('⑤ 被预算截短过（说明这一条不是"裁剪前的整行"）',
+    shrink.lines.some((line) => line.endsWith('…')) || shrink.lines.length < 2,
+    `lines=${JSON.stringify(shrink.lines.map((line) => line.slice(-12)))}`);
 }
 
 console.log('\n=== 13. ⑦ 模型字段：单一字段集（llmMode + llmProvider + llmModel）与旧键一次性迁移 ===');
@@ -835,7 +887,7 @@ console.log('\n=== 19. 写路径串行化：append 与读-改-写交错不许丢
   const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-lock-'));
   const root = storeRoot(workspace, '.dsh-compaction-memory');
   const sessionId = 'session-lock-0001';
-  const mk = (n) => makeRecord({ layer: 'summary', title: `块${n}`, text: `内容${n}`.repeat(20), compactionId: `c${n}` });
+  const mk = (n) => makeRecord({ session: sessionId, layer: 'summary', title: `块${n}`, text: `内容${n}`.repeat(20), compactionId: `c${n}` });
   appendRecords(root, sessionId, [mk(1), mk(2)]);
 
   // 受控交错（这就是真实事故的形状）：一次"读-改-写"在临界区中间 await（模型扩写那条
@@ -891,6 +943,47 @@ console.log('\n=== 19. 写路径串行化：append 与读-改-写交错不许丢
   const before = fs.statSync(path.join(root, `${sessionId}.jsonl`)).mtimeMs;
   eq('一条都没命中时不回写', await patchKeywords(root, sessionId, new Map([['nope', ['x']]])), 0);
   eq('文件 mtime 没变（确实没写）', fs.statSync(path.join(root, `${sessionId}.jsonl`)).mtimeMs, before);
+
+  /* ── P2-5：还原（`restoreFromTrash`）也必须落在这**同一把锁**上 ──────────
+   * 它整段是"读会话库判重 → 追加 → 改回收站条目"，早先是**无锁**的。
+   * 这里让"还原"与"期间的一次 append"受控交错：两边都必须落在最终库里。
+   * ⚠️ 能失败：把 `restoreFromTrash` 改回不带 `withFileLock` 的实现（并去掉 await）→
+   *   下面"期间 append 的块仍在"会红（旧快照/过期判重）。 */
+  const trashId = moveToTrash(root, sessionId, [mk(7)]);
+  const restoredPromise = restoreFromTrash(root, trashId);
+  check('P2-5 还原走的是**异步写锁**（返回 Promise —— 临界区不在调用栈里同步跑，与 patchKeywords 同一把锁）',
+    restoredPromise instanceof Promise, `返回类型=${Object.prototype.toString.call(restoredPromise)}`);
+  appendRecords(root, sessionId, [mk(8)]);                 // 与还原交错
+  const kwPromise = patchKeywords(root, sessionId, new Map([[String(readRecords(root, sessionId)[0].fp), ['并词P25']]]));
+  const restoredResult = await restoredPromise;
+  await kwPromise;
+  const afterRestore = readRecords(root, sessionId);
+  const afterTitles = afterRestore.map((record) => record.title);
+  eq('还原报告还原了 1 条（前提：这条夹具真的走了还原分支）', restoredResult.restored, 1);
+  check('还原与期间 append / 并词 交错后，两边的块都在',
+    afterTitles.includes('块7') && afterTitles.includes('块8'), `实际=${afterTitles.join(',')}`);
+  check('期间那次并词也落盘了（三条写路径共用一把锁，互不覆盖）',
+    afterRestore.some((record) => Array.isArray(record.keywords) && record.keywords.includes('并词P25')),
+    JSON.stringify(afterRestore.map((record) => record.keywords)));
+  const again = await restoreFromTrash(root, trashId);
+  eq('同一回收站条目还原两次 → 第二次 0 条（条目已被消费，不重复还原）', again.restored, 0);
+
+  /* 反例（说明这把锁不是装饰）：把"读在锁外 + 整份覆盖"的旧写法原样演一遍 ——
+   * 读快照、跨一个 await（真实链路里是模型调用/异步 IO）、期间别的写者 append，
+   * 然后用**旧快照**整份覆盖 → 期间那块被抹掉。
+   * `/delete` 与 `restoreFromTrash` 正是这条形状，所以它们必须和 patchKeywords 共用一把锁。 */
+  {
+    const snapshot = [...readRecords(root, sessionId)];
+    await Promise.resolve();                               // 交错点
+    appendRecords(root, sessionId, [mk(9)]);               // 别的写者
+    writeRecords(root, sessionId, snapshot);               // 旧快照整份覆盖
+    check('（反例）读在锁外的整份覆盖会抹掉期间 append 的块（对照：锁内重读才不会）',
+      !readRecords(root, sessionId).map((record) => record.title).includes('块9'),
+      `实际=${readRecords(root, sessionId).map((record) => record.title).join(',')}`);
+  }
+  check('锁键就是会话记忆文件的绝对路径（与 writeRecordsSafely 同一把锁）',
+    sessionLockKey(root, sessionId) === path.join(root, `${sessionId}.jsonl`),
+    sessionLockKey(root, sessionId));
   fs.rmSync(workspace, { recursive: true, force: true });
 }
 
@@ -899,7 +992,7 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
    * 直接驱动真实路由（不是重写一份逻辑）：假 req/res + 假 llm 网关。
    * `counted` 记录网关被调用几次 —— 这正是"会不会花钱"的唯一判据。
    */
-  const driveDiagnose = async ({ settings: overrides, count, session, body }) => {
+  const driveDiagnose = async ({ settings: overrides, count, session, body, rewriteLimiter, route = 'diagnose', diagEvents = null }) => {
     const list = [];
     const settingsValue = {
       ...DEFAULTS,
@@ -916,26 +1009,30 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
     };
     const routes = makeRoutes({
       settings: { get: () => ({ settings: settingsValue }) },
-      diag: { write: () => {} },
+      diag: { write: (entry) => { if (diagEvents !== null) diagEvents.push(entry); } },
       states: new Map(),
       knownWorkspaces: () => [workspace],
       build: 'test',
       llm: {
         rewriteQuery: async () => { count.calls += 1; return { ok: true, terms: ['单轮注入上限'], cached: false }; },
         rerank: async () => ({ ok: true, fp: null, index: 0 }),
+        testConnection: async () => { count.calls += 1; return { ok: true, ms: 3, route: { provider: 'fake-provider', model: 'fake-model' }, text: 'ok' }; },
         status: () => ({ enabled: true }),
       },
       dataHome: workspace,
       findSession: (id) => (id === session ? { id, header: { cwd: workspace }, snapshotEvents: () => [] } : null),
       boostFor: () => true,
+      // **P1-A 的注入缝**：这里注入一个"每个用例一份"的限流器，替代已删除的
+      // `body.__bypassRewriteLimit` 旁路 —— 请求体再也影响不到限流。
+      ...(rewriteLimiter === undefined ? {} : { rewriteLimiter }),
     });
     const req = {
-      url: '/api/dsh-super-memory/diagnose',
+      url: `/api/dsh-super-memory/${route}`,
       method: 'POST',
       headers: { 'x-dsh-super-memory': '1', 'content-type': 'application/json' },
       async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify(body), 'utf8'); },
     };
-    const res = { writeHead: () => {}, end: (text) => list.push(JSON.parse(text)) };
+    const res = { status: 0, writeHead: (status) => { res.status = status; }, end: (text) => list.push(JSON.parse(text)) };
     await routes.handler(req, res);
     return list[0];
   };
@@ -947,22 +1044,24 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
   ]);
   // ⚠️ 查询必须与库里内容**不相似**：本地一旦"强命中"，`skippedRewrite` 会先一步跳过
   // 改写（那条闸门在限流之前），于是永远走不到限流分支。用一句毫不相干的问法。
-  // 另外 `__bypassRewriteLimit` 是**只给测试**的旁路（生产路径从不带它）：
-  // 限流器是模块级共享的，前面几条断言会吃掉配额，需要它来隔离。
+  // 配额隔离改用**注入缝**（P1-A）：每个用例自己造一个 RateLimiter 实例传进 makeRoutes。
+  // 旧的 `body.__bypassRewriteLimit: true` 旁路已从 HTTP 路径彻底删除 —— 下面的
+  // "后门已关闭"用例就是钉这件事。
   const UNRELATED = '晚饭吃什么比较好';
   // 先确认"确实不强命中"：否则下面的限流断言会静默变成恒真
   {
     const probe = await driveDiagnose({
       count: { calls: 0 },
       session,
-      body: { workspace, session, query: UNRELATED, rewrite: true, boost: true, __bypassRewriteLimit: true },
+      rewriteLimiter: new RateLimiter({ windowMs: 60000, max: 6 }),
+      body: { workspace, session, query: UNRELATED, rewrite: true, boost: true },
     });
     console.log(`  探测回执：${JSON.stringify(probe?.value?.assist ?? null)}`);
     eq('（前提）不相干的问法不会被判成强命中（否则限流分支不可达）', probe?.value?.rewriteSkipped, false);
     check('（前提）它真的走了模型改写分支（assist.rewrite 有结果）',
       probe?.value?.assist?.rewrite != null, JSON.stringify(probe?.value?.assist));
     eq('（前提）改写成功了（不是失败码）', probe?.value?.assist?.rewrite?.ok, true);
-    eq('（前提）没有被限流（旁路生效）', probe?.value?.rewriteThrottled ?? null, null);
+    eq('（前提）没有被限流（配额还没用掉）', probe?.value?.rewriteThrottled ?? null, null);
   }
 
   // 闸门：模型档位关着时，连打 N+1 次**一次都不调用模型**（限流不替代闸门）
@@ -980,26 +1079,73 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
   {
     const limits = rewriteRateLimits();
     check('限流阈值本身不是"等于不限"（max ≥ 1 且有窗口）', limits.max >= 1 && limits.windowMs >= 1000, JSON.stringify(limits));
+
+    /* ── P1-A：`__bypassRewriteLimit` 后门必须已经关死 ───────────────────────
+     * 旧代码：`REWRITE_LIMITER.hit(key, at, { bypass: body.__bypassRewriteLimit === true })`，
+     * 而 writeGuard 只要求"自定义头 + JSON" —— 本机任意进程带一个 JSON 字段就能把限流关掉。
+     * 现在请求体里的这个字段**连读都不读**：连打 N+1 次、每次都带 `__bypassRewriteLimit: true`，
+     * 第 N+1 次照样被挡，且被挡那次模型调用 0 次。
+     * ⚠️ 能失败：把 `hit(...)` 改回读请求体里的 bypass（或让 `hit` 接受 bypass）→ 下面三条红。 */
+    const isolated = new RateLimiter({ windowMs: 60000, max: 3 });
     const count = { calls: 0 };
-    // 上面那几条"前提"探针已经用掉了同一个会话的配额，所以这里换一个会话键重新起算
     const session2 = `${session}-throttle`;
     let throttled = null;
     let allowed = 0;
-    for (let i = 0; i < limits.max + 1; i += 1) {
-      const envelope = await driveDiagnose({ count, session: session2, body: { workspace, session: session2, query: UNRELATED, rewrite: true, boost: true } });
+    for (let i = 0; i < isolated.thresholds().max + 1; i += 1) {
+      const envelope = await driveDiagnose({
+        count,
+        session: session2,
+        rewriteLimiter: isolated,
+        body: { workspace, session: session2, query: UNRELATED, rewrite: true, boost: true, __bypassRewriteLimit: true },
+      });
       if (envelope?.value?.rewriteThrottled != null) throttled = envelope.value.rewriteThrottled;
       else allowed += 1;
     }
-    eq(`前 ${limits.max} 次放行`, allowed, limits.max);
-    check('第 N+1 次被限流（回执里带 rewriteThrottled）', throttled !== null, JSON.stringify(throttled));
+    eq(`带 __bypassRewriteLimit:true 时仍然：前 ${isolated.thresholds().max} 次放行`, allowed, isolated.thresholds().max);
+    check('带 __bypassRewriteLimit:true 时第 N+1 次照样被限流（后门已删除）', throttled !== null, JSON.stringify(throttled));
     check('限流提示是可读人话', typeof throttled?.hint === 'string' && throttled.hint.includes('改写'), String(throttled?.hint).slice(0, 60));
-    eq('被限流的那次**没有调用模型**（限流的意义就在这）', count.calls, limits.max);
+    eq('被限流的那次**没有调用模型**（限流的意义就在这）', count.calls, isolated.thresholds().max);
+
     // 直连限流器：窗口滑过之后恢复
     const limiter = new RateLimiter({ windowMs: 1000, max: 2 });
     eq('窗口内第 1 次放行', limiter.hit('k', 1000).allowed, true);
     eq('窗口内第 2 次放行', limiter.hit('k', 1100).allowed, true);
     eq('窗口内第 3 次被挡', limiter.hit('k', 1200).allowed, false);
     eq('窗口滑过之后恢复', limiter.hit('k', 2100).allowed, true);
+  }
+
+  // P1-A：`/llm/test`（面板「测试连接」按钮）也必须限流 —— 它同样每次请求都真跑一次模型调用。
+  {
+    const isolated = new RateLimiter({ windowMs: 60000, max: 2 });
+    const session3 = `${session}-llmtest`;
+    const diagEvents = [];
+    const count = { calls: 0 };
+    let last = null;
+    for (let i = 0; i < isolated.thresholds().max + 1; i += 1) {
+      last = await driveDiagnose({
+        count,
+        session: session3,
+        rewriteLimiter: isolated,
+        route: 'llm/test',
+        diagEvents,
+        body: { session: session3, provider: 'fake-provider', model: 'fake-model' },
+      });
+    }
+    eq(`前 ${isolated.thresholds().max} 次真的调用了模型`, count.calls, isolated.thresholds().max);
+    eq('第 N+1 次返回 429 RATE_LIMITED', last?.error?.code, 'RATE_LIMITED');
+    check('限流提示是可读人话（告诉用户等多久）', typeof last?.error?.message === 'string' && last.error.message.includes('秒'), String(last?.error?.message).slice(0, 60));
+    check('诊断里留了痕（llm-test-throttled，用户能查出为什么没花钱）',
+      diagEvents.some((entry) => entry.event === 'llm-test-throttled' && entry.session === session3),
+      JSON.stringify(diagEvents.slice(-3)));
+    // 与 `/diagnose` 的改写**各算一份配额**：同一会话打 /llm/test 打满，不影响改写那条键。
+    const rewriteAfter = new RateLimiter({ windowMs: 60000, max: 1 });
+    const rewriteEnvelope = await driveDiagnose({
+      count: { calls: 0 },
+      session: session3,
+      rewriteLimiter: rewriteAfter,
+      body: { workspace, session: session3, query: UNRELATED, rewrite: true, boost: true },
+    });
+    eq('两条路由的限流键互不挤占（键含路径）', rewriteEnvelope?.value?.rewriteThrottled ?? null, null);
   }
   fs.rmSync(workspace, { recursive: true, force: true });
 }
@@ -1766,6 +1912,53 @@ console.log('\n=== 30. 入库体积收口：每条工具结果 ≤ toolResultMax
   check('摘要块有上限（口径是 maxChars + minChars = 980，不是硬 900）',
     summary.every((record) => record.text.length <= 980),
     `最大=${Math.max(...summary.map((record) => record.text.length))}`);
+}
+
+console.log('\n=== 26. 摘抄写盘必须走 assertInside（含 realpath 校验）===');
+{
+  /* 2026-10-08 只读审查 P2：`lib/transcript.js` 的 `writeExcerpt` 以前只有一句
+   * `target.startsWith(resolve(root) + sep)` 的**字符串前缀比较** —— 那挡不住
+   * "`_readable/excerpts` 是指向外部的符号链接/junction"，与其余写/删路径口径不一致。
+   * 现在它复用 `lib/store.js` 的 `assertInsidePath`（字符串 + 已存在路径的 realpath）。 */
+  const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-excerpt-'));
+  const root = storeRoot(ws, '.dsh-compaction-memory');
+  fs.mkdirSync(root, { recursive: true });
+  const items = [{ title: '摘抄标题', text: '逐字正文一段。', score: 0.9 }];
+
+  const wrote = writeExcerpt(root, 'session-ok', items, { query: '问一句' });
+  check('正常写盘落在 root/_readable/excerpts 之内',
+    typeof wrote === 'string' && path.resolve(wrote).startsWith(path.resolve(root) + path.sep) && fs.existsSync(wrote),
+    String(wrote));
+  check('摘抄内容写的是逐字正文', fs.existsSync(wrote) && fs.readFileSync(wrote, 'utf8').includes('逐字正文一段。'));
+
+  // 越界 sessionId：`..\..\..\pwn` 之类必须落回 root 内（safeSessionId + assertInside 双重设防）
+  const escaped = writeExcerpt(root, '..\\..\\..\\pwn', items, {});
+  check('越界 sessionId 不会被写出 root',
+    escaped !== null && path.resolve(escaped).startsWith(path.resolve(root) + path.sep),
+    String(escaped));
+  check('磁盘上确实没有 root 之外的 pwn 文件',
+    !fs.existsSync(path.join(path.resolve(root), '..', 'pwn')) && !fs.existsSync(path.join(path.resolve(root), '..', '..', 'pwn')));
+
+  /* 符号链接逃逸：把 `_readable/excerpts` 做成指向外部目录的 junction（Windows 上建 junction
+   * 不需要管理员权限）→ 必须**不写**并返回 null。
+   * ⚠️ 能失败：把 `writeExcerpt` 的 assertInside 换回 `startsWith` 前缀比较 → 这一条会红
+   *   （前缀比较只看字符串，junction 的路径字符串仍在 root 里）。 */
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-outside-'));
+  fs.rmSync(path.join(root, '_readable'), { recursive: true, force: true });
+  fs.mkdirSync(path.join(root, '_readable'), { recursive: true });
+  let linkMade = true;
+  try {
+    fs.symlinkSync(outside, path.join(root, '_readable', 'excerpts'), 'junction');
+  } catch { linkMade = false; }
+  if (!linkMade) {
+    console.log('  SKIP 符号链接逃逸用例 — 本机建不了 junction（权限受限），不影响其余断言');
+  } else {
+    const leaked = writeExcerpt(root, 'session-link', items, {});
+    check('符号链接逃逸 → 返回 null（不写）', leaked === null, String(leaked));
+    check('外部目录里一个文件都没有', fs.readdirSync(outside).length === 0, fs.readdirSync(outside).join(','));
+  }
+  fs.rmSync(ws, { recursive: true, force: true });
+  fs.rmSync(outside, { recursive: true, force: true });
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);

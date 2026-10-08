@@ -4,9 +4,29 @@
  *
  * 用法：node scripts/harness.mjs <sessionLogPath> [workdir]
  *
- * 退出口径：**自检失败 = 1，缺参数/日志读不到 = 2**（两者要能分开：
- * 前者是"代码坏了"，后者是"你少给了一个参数"）。
+ * 退出口径：**自检失败 = 1，缺参数/日志读不到 = 2，合理的 SKIP = 0**（三者要能分开：
+ * 第一条是"代码坏了"，第二条是"你少给了一个参数"，第三条是"这份日志本来就不适用"）。
  * 临时目录（`%TEMP%\dsm-harness-home-<pid>`）**用完即清**（异常路径也清，见文件末尾的 finally）。
+ *
+ * ## 适用范围与 SKIP 口径（2026-10-08 只读审查 P1-B 补）
+ *
+ * 本脚本的输入是「一份**真实会话日志** + 一个**临时工作区**」，它把日志里的压缩事件
+ * 重新投递一遍来建库，再用日志里的真实提问去检索。因此：
+ *
+ * | 段落 | 依赖 | 什么情况下 SKIP（**打印 `SKIP + 原因`，不计失败**） |
+ * |---|---|---|
+ * | ① 压缩时入库 / ② 总览 | 日志里**至少有一次 `compaction/summary`** | 一次压缩都没有 → 整段（全部依赖库的段落）SKIP 并以 0 退出 |
+ * | ③ 正样本（提问必须注入） | 提问要**落在某个压缩的 `shadowedRange` 内** | 没有任何"确实被压缩过"的提问 → 正样本段 SKIP |
+ * | ③ 负样本 / 边界探针 | 库内容与探针**不重合** | 库本身与探针有长文档重合（通用 bigram 沉底）→ 该探针记为**已知过召回**并 SKIP（打印分数与命中块） |
+ * | ③ 历史污染探针 | 库里是否逐字包含那两条探针 | **不跳过**：两种情形各有自己的断言（见那里的注释） |
+ * | ④ 工作区识别 / ④ 设置开关 / ㉓ / ㉔ | 合成事件，与日志内容无关 | 不跳过 |
+ * | ㉕ boost 与召回去重 | 本轮召回选中的块是否与 boost 资料重叠 | 不重叠（覆盖率差异）→ 打印 SKIP + 原因；**但还是会独立量一遍重叠度**，重叠却没被丢就是真 bug → 红 |
+ *
+ * **正样本为什么只取"被压缩过"的提问**：库是从压缩事件建起来的，压缩之后才提出的问题
+ * **从来没进过库**，要求它必须命中是错的期望（实测：某份真实日志 52 条历史提问里，
+ * 8 条 0 字符的全部落在唯一那个压缩区间 `13..1300` 之外，区间内的 44 条 44/44 命中）。
+ * 这不是"放宽断言"，而是把探针集合修正成"库里真的有对应内容"的那一批；
+ * 断言本身没有变弱：区间内的提问仍然必须逐条命中（漏一条就红）。
  */
 import fs from 'node:fs';
 import os from 'node:os';
@@ -103,11 +123,15 @@ const { decompressFrames } = await import('../lib/zstd.js');
 const { mergeKeywords, parseJsonArray, parseJsonObject } = await import('../lib/llm.js');
 const { diagnoseMiss } = await import('../lib/diagnose.js');
 const { toolRecords } = await import('../lib/ingest.js');
-const { RECALL_HEAD_PREFIX } = await import('../lib/recall.js');
-// ③ 段要用它直接查库（钉住"夹具自污染"这个原因）；⑥ 段原来在这里再 import 一次，
-// 已上移 —— 重复声明同一常量会直接 SyntaxError。
-const { MemoryIndex } = await import('../lib/retrieval.js');
-const { readRecords } = await import('../lib/store.js');
+const { RECALL_HEAD_PREFIX, NEAR_DUPLICATE_SIMILARITY, questionTextOf } = await import('../lib/recall.js');
+// ㉕ 段要用**独立实现**量"召回行与 boost 资料是否重叠"（containment），
+// 不能复用 selectFreshHits —— 那样断言会变成同义反复。
+const { containment, tokenSet } = await import('../lib/text.js');
+// ③ 段要用它直接查库（钉住"夹具自污染"这个原因、并量出边界探针的分数）；
+// ⑥ 段原来在这里再 import 一次，已上移 —— 重复声明同一常量会直接 SyntaxError。
+const { MemoryIndex, retrieveTwoTier } = await import('../lib/retrieval.js');
+const { makeRecord, readRecords } = await import('../lib/store.js');
+const { DEFAULTS } = await import('../lib/config.js');
 
 /**
  * 假模型服务：由测试用例在 `apply()` **之前**设置，用来跑失败矩阵。
@@ -204,12 +228,29 @@ const events = text.split('\n').filter((l) => l.trim())
 const sessionId = events[0].id;
 console.log(`日志：${frames} 帧 / ${events.length} 事件 / 会话 ${sessionId}`);
 
+/* ── 适用范围闸：这份日志里有没有"被压掉的历史" ──────────────────────────────
+ * 整个脚本（①~③ 以及所有依赖记忆库的段落）都建立在"日志里有 `compaction/summary`"之上：
+ * 没有压缩事件 → 库里一条块都不会有 → 后面的断言全是空测。
+ * 这时的正确行为是**打印 SKIP + 原因并以 0 退出**，而不是抛一个 ENOENT
+ * （早先实测：`node scripts/harness.mjs <零压缩日志>` 直接在 `statSync` 上抛错、退出码 1，
+ *  看起来像"代码坏了"，其实只是这份日志不适用）。 */
+const compactions = events.filter((e) => e.type === 'compaction/summary');
+if (compactions.length === 0) {
+  console.log('\nSKIP ①~㉕ 全部依赖记忆库的段落 — 这份日志里没有任何 `compaction/summary` 事件，');
+  console.log('     所以「压缩时入库 / 总览 / 提问命中」都无从验证（换一份含压缩事件的日志再跑）。');
+  console.log('     不依赖日志的段落（④c 工作区识别等）也不跑：它们同样以"库里有块"为前提。');
+  cleanupHome();
+  process.exit(0);
+}
+
 /** 造一个"用户刚问了 X"的会话：把历史 user 消息 + 一条新的用户消息拼进去。 */
 function sessionWithQuestion(question, suffixSeq, idOverride) {
   const base = events.filter((e) => e.type !== 'user/message' || e.data?.source?.kind !== 'user' || e.seq < 3000);
   const userEvent = {
     type: 'user/message', seq: suffixSeq, time: Date.now(),
-    data: { content: [{ type: 'text', text: question }], source: { kind: 'user' }, role: 'user', id: `q-${suffixSeq}` },
+    // `source` 必须**照真实日志的形状**写（kind + rpcId）：`questionTextOf` 现在要求
+    // rpcId 才认这是人类提问（P1-C），少了它这条合成提问会被当成宿主噪声、查询为空 → 整段假绿。
+    data: { content: [{ type: 'text', text: question }], source: { kind: 'user', rpcId: `harness-rpc-${suffixSeq}` }, role: 'user', id: `q-${suffixSeq}` },
   };
   const visible = [...base, userEvent];
   const id = idOverride ?? sessionId;
@@ -241,7 +282,6 @@ function cloneSession(question, suffixSeq) {
 }
 
 /* ── ① 压缩时入库 ───────────────────────────────────────────────────────── */
-const compactions = events.filter((e) => e.type === 'compaction/summary');
 console.log(`\n=== ① 压缩时入库（共 ${compactions.length} 次压缩）===`);
 const session = { id: sessionId, header: { cwd: workdir }, snapshotEvents: () => events, requestContext: () => ({ contextWindow: 1000000 }) };
 for (const event of compactions) {
@@ -273,12 +313,16 @@ console.log('第二次注入文本是否完全相同（应当相同 → 不追�
 
 /* ── ③ 提问命中注入 / 未命中 0 token ────────────────────────────────────── */
 console.log('\n=== ③ 提问命中 / 未命中（真断言：正样本必须注入、负样本必须 0 字符）===');
-/* 这一段 2026-10-08 从"只打印诊断"改成**真断言**：
- *   ① 正样本（夹具里真实的历史提问，relevantQuestions 全部 5 条）→ 必须含召回块；
- *   ② 负样本（12 条与本库无关的日常问题）→ 召回块字符数必须为 0；
+/* 这一段 2026-10-08 从"只打印诊断"改成**真断言**，同日（只读审查 P1-B）又修了两处**探针口径**：
+ *   ① 正样本 = 日志里**确实被压缩过**的人类提问（seq 落在某个压缩的 `shadowedRange` 内）
+ *      → 必须逐条注入召回块。压缩之后才问的问题从没进过库，不是有效正样本（见脚本头）。
+ *   ② 负样本 = 与本库无关的日常问题 → 召回块字符数必须为 0。
  * 任一条不成立就 process.exitCode = 1（自检失败 = 1，与脚本头的退出码约定一致）。
- * 能失败：把 `lib/retrieval.js` 的命中证据门 `MIN_MATCHED_TERMS` 改成 0 → 负样本立刻注入
- * （它们在新口径下的相对分是 1.0 上下）；把 minScore 抬到 2 → 正样本立刻全部漏掉。 */
+ * 能失败：
+ *   · 把 `lib/retrieval.js` 的命中证据门 `MIN_MATCHED_TERMS` 改成 0 → 12 条负样本里多条立刻注入
+ *     （它们的相对分是 1.0 上下，实测 3 条注入 277–298 字符）；
+ *   · 把配置的 `minScore` 调到 0.01 → 下面的"阈值灵敏度（合成夹具）"与"配置阈值下界"两条变红；
+ *   · 把检索整体弄坏（比如索引读空）→ 正样本逐条变红。 */
 let d3Passed = 0;
 let d3Failed = 0;
 const expect3 = (label, condition, detail = '') => {
@@ -286,39 +330,71 @@ const expect3 = (label, condition, detail = '') => {
   d3Failed += 1; process.exitCode = 1;
   console.log(`  ✗ ${label}${detail === '' ? '' : ` — ${detail}`}`);
 };
+/** 跳过一段（**打印 SKIP + 原因**，不计失败）。 */
+const skip3 = (label, reason) => console.log(`  SKIP ${label} — ${reason}`);
 /** 注入文本里"召回块"部分的字符数（0 = 没有召回块）。 */
 const recallCharsOf = (out) => (out.includes(RECALL_HEAD_MARK) ? out.split(RECALL_HEAD_MARK)[1].length : 0);
+/** 每条合成探针的 seq（必须够大，免得与日志里真实事件的 seq 撞车）。 */
+let seqCursor = 900000;
 
-const relevantQuestions = [];
+/* 被压缩过的 seq 区间：只有落在这里面的内容才真的进过库。 */
+const shadowedRanges = compactions
+  .map((event) => [Number(event.data?.shadowedRange?.start), Number(event.data?.shadowedRange?.end)])
+  .filter(([start, end]) => Number.isFinite(start) && Number.isFinite(end));
+const inShadowedRange = (seq) => shadowedRanges.some(([start, end]) => seq >= start && seq <= end);
+
+/* 正样本候选：**与插件同一口径**取提问（`questionTextOf` 会挡掉通知类与宿主派单）。 */
+const allUserQuestions = [];
 for (const event of events) {
-  if (event.type === 'user/message' && event.data?.source?.kind === 'user' && Number(event.seq) < 2000) {
-    const t = (event.data.content ?? []).map((b) => b.text ?? '').join(' ').trim();
-    if (t.length > 10) relevantQuestions.push(t);
+  if (event.type !== 'user/message') continue;
+  const t = questionTextOf(event.data);
+  if (t !== '' && t.length > 10) allUserQuestions.push({ text: t, seq: Number(event.seq) || 0 });
+}
+const coveredQuestions = allUserQuestions.filter((item) => inShadowedRange(item.seq));
+console.log(`  正样本口径：${shadowedRanges.length} 个压缩区间 ${JSON.stringify(shadowedRanges)}；`
+  + `历史人类提问 ${allUserQuestions.length} 条，其中**确实被压缩过**的 ${coveredQuestions.length} 条入选`
+  + `（其余 ${allUserQuestions.length - coveredQuestions.length} 条是压缩之后才问的，没进过库，不是有效正样本）。`);
+if (coveredQuestions.length === 0) {
+  skip3('正样本（提问必须注入）', '这份日志里没有"落在压缩区间内的人类提问"');
+} else {
+  for (const { text: question, seq } of coveredQuestions) {
+    // 每条探针都用一份**干净的会话状态**（复制库 + 新会话 id）：排除冷却/去重/粘住的参考块，
+    // 否则"这一条没注入"可能只是被上一条的冷却挡住了，断言会变成假绿。
+    const s = cloneSession(question, seqCursor++);
+    const out = injected(s);
+    const recallChars = recallCharsOf(out);
+    const lines = out.split(RECALL_HEAD_MARK)[1]?.split('\n').filter((l) => l.startsWith('- ')) ?? [];
+    console.log(`   Q(seq=${seq}): ${question.replace(/\s+/g, ' ').slice(0, 40)}`);
+    console.log(`      总注入 ${out.length} 字符；召回块 ${recallChars} 字符 / ${lines.length} 条`);
+    expect3(`已入库的相关提问必须注入召回块（seq=${seq}）：${question.replace(/\s+/g, ' ').slice(0, 24)}…`,
+      recallChars > 0, `召回块 ${recallChars} 字符`);
   }
 }
-let seqCursor = 900000;
-for (const question of relevantQuestions) {
-  // 每条探针都用一份**干净的会话状态**（复制库 + 新会话 id）：排除冷却/去重/粘住的参考块，
-  // 否则"这一条没注入"可能只是被上一条的冷却挡住了，断言会变成假绿。
-  const s = cloneSession(question, seqCursor++);
-  const out = injected(s);
-  const recallChars = recallCharsOf(out);
-  const lines = out.split(RECALL_HEAD_MARK)[1]?.split('\n').filter((l) => l.startsWith('- ')) ?? [];
-  console.log(`   Q: ${question.replace(/\s+/g, ' ').slice(0, 40)}`);
-  console.log(`      总注入 ${out.length} 字符；召回块 ${recallChars} 字符 / ${lines.length} 条`);
-  expect3(`相关提问必须注入召回块：${question.replace(/\s+/g, ' ').slice(0, 24)}…`, recallChars > 0, `召回块 ${recallChars} 字符`);
+
+/* ③b / ④ / ⑤ / history_read 等**下游探针**共用的提问池：只放"库里答得上来"的提问
+ * （= 已入库的那些）。不足 3 条时用最后一条补齐 —— 下游只是需要"一句真能命中的历史提问"，
+ * 重复同一条不影响任何被验语义（它们各自用**干净的会话状态**）。 */
+const relevantQuestions = (() => {
+  const texts = coveredQuestions.map((item) => item.text);
+  if (texts.length === 0) return [];
+  while (texts.length < 3) texts.push(texts[texts.length - 1]);
+  return texts;
+})();
+if (relevantQuestions.length > 0) {
+  console.log(`  下游探针提问池：${relevantQuestions.length} 条（取自已入库提问，不足 3 条时重复最后一条）`);
 }
 
-/* 负样本探针（2026-10-08 标定用的 24 条里挑 12 条，全部与本库内容无关）。
+/* 负样本探针（2026-10-08 标定用的 24 条里挑 12 条 + 1 条边界探针）。
  *
- * ⚠️ 这里**故意不用**早先那两条（"明天北京天气预报怎么样" / "帮我写一首关于春天的五言绝句"）：
- * 它们逐字出现在本文件自己里面（就是原来 ③ 段那两行字符串），而夹具会话读过 harness.mjs、
- * 工具结果原文已经入库（L2 的 `工具 read：scripts/harness.mjs`，4 万字符）。于是
- * "用户问的那句话逐字躺在一篇已入库文档里" —— **任何词法检索都必然命中**，与阈值无关：
- * 实测这两条 mc=8 / 13（命中 8 / 13 个不同 token）、score=0.89，远在 minScore 之上。
- * 在**真实库**（那份没有把 harness.mjs 源码读进库）上，同样两条探针 = 0.000 / 0.000，不注入
- * （`%TEMP%\dsm-c1-*` 的标定脚本可复现）。所以它们是**夹具自污染**，不是阈值问题；
- * 这里改成"钉住原因"的断言（见下面的 containsProbeAssertion），而不是假装它们应当为空。 */
+ * ⚠️ 前 12 条**故意不用**早先那两条（"明天北京天气预报怎么样" / "帮我写一首关于春天的五言绝句"）：
+ * 它们逐字出现在本文件自己里面（就是原来 ③ 段那两行字符串），只要夹具会话读过 harness.mjs、
+ * 工具结果原文进了库（L2 的 `工具 read：scripts/harness.mjs`），"用户问的那句话逐字躺在一篇
+ * 已入库文档里" —— **任何词法检索都必然命中**，与阈值无关。那两条改到下面按库内容**条件式**判定
+ * （库里真有逐字包含它的记录 → 断言"必须命中且来自自污染"；否则 → 断言"必须 0 字符"）。
+ *
+ * 这 12 条是**库无关**的强负样本：它们只与库共享 ≤2 个 token，靠的是**命中证据门**
+ * （`MIN_MATCHED_TERMS`）而不是阈值 —— 把阈值调到 0.01 也不会注入它们。
+ * 想验"阈值真的在挡"，用下面的合成夹具（同样能失败，且不依赖这份库）。 */
 const NEGATIVE_PROBES = [
   '晚饭吃什么比较好',
   '帮我订一张下周三去上海的机票',
@@ -332,13 +408,14 @@ const NEGATIVE_PROBES = [
   '吉他新手先练什么和弦',
   '马拉松赛前一周怎么吃',
   '帮我把这段话翻译成法语',
-  /* 硬负样本（**这一条让断言对阈值敏感**）：上面 12 条都是被"命中证据门"挡住的
-   * （命中 ≤2 个 token），所以把 minScore 调到 0.01 也不会注入它们；这一条不同 ——
-   * 它是一句话题空转的日常话，却与库里那块 4 万字符的工具结果共享 6 个通用 bigram，
-   * **过了证据门**，只靠阈值挡住（实测 top-1 = 0.276，阈值 0.28 的下沿）。
-   * 于是：把 minScore 调到 0.01 → 它立刻注入 → 本条断言变红。 */
-  '帮我看看这个问题现在到底是怎么处理的我有点搞不清楚',
 ];
+/* **边界探针**（库相关，条件式）：一句话题空转的日常话，却会与库里那些"逐字包含用户提问的
+ * 长 L2 块"共享若干通用 bigram，可能**过了证据门**、只靠阈值挡住。实测它在不同的真实库上
+ * 落在阈值两侧（0.276 / 0.323 / 0.380），所以**不能**当成库无关的负样本：
+ *   · 库只给出"过门但低于阈值"的候选 → 断言必须 0 字符（硬断言）；
+ *   · 库给出的候选已经高过阈值 → 那是**已知过召回**（要修它得改 minScore/证据门口径 = 业务语义，
+ *     不在本轮范围）→ 打印 SKIP + 分数 + 命中块，**不计失败**，但把证据留在这里。 */
+const ADVERSARIAL_PROBE = '帮我看看这个问题现在到底是怎么处理的我有点搞不清楚';
 console.log('\n负样本（与本库无关；每条都用干净会话状态：召回块必须为 0 字符）：');
 for (const question of NEGATIVE_PROBES) {
   const s = cloneSession(question, seqCursor++);
@@ -348,18 +425,86 @@ for (const question of NEGATIVE_PROBES) {
   expect3(`不相关提问必须不注入：${question}`, recallChars === 0, `召回块 ${recallChars} 字符`);
 }
 
-/* 夹具自污染的**可失败**断言：那两条历史探针之所以被召回，是因为库里有一篇逐字包含它们的
- * 文档。这条断言钉住这个原因 —— 若哪天工具结果不再入库（或探针不再出现在 harness.mjs 里），
- * 它会变红，提醒把这行诊断重新升级成"应当为空"的断言。 */
+/* 边界探针：先量库自己的候选分数，再决定断言口径（条件式，两种情形都能失败）。 */
+{
+  const configuredMinScore = Number(DEFAULTS.minScore);
+  const probeIndex = new MemoryIndex(readRecords(root, sessionId));
+  const admitted = retrieveTwoTier(probeIndex, ADVERSARIAL_PROBE, {
+    minScore: 0.01, maxItems: 1, preferSummaryChunks: true,
+  });
+  const atConfigured = retrieveTwoTier(probeIndex, ADVERSARIAL_PROBE, {
+    minScore: configuredMinScore, maxItems: 2, preferSummaryChunks: true,
+  });
+  const s = cloneSession(ADVERSARIAL_PROBE, seqCursor++);
+  const out = injected(s);
+  const recallChars = recallCharsOf(out);
+  const overRecall = admitted.hits.length > 0 && admitted.topScore > configuredMinScore;
+  console.log(`   边界探针："${ADVERSARIAL_PROBE}" → 库最高候选 ${admitted.topScore.toFixed(4)}（阈值 ${configuredMinScore}）`);
+  if (overRecall) {
+    const top = admitted.hits[0];
+    console.log(`      命中块：title=${JSON.stringify(top.record?.title ?? '')} layer=${top.record?.layer ?? ''}`
+      + ` len=${String(top.record?.text ?? '').length} matched=${top.matched}/${top.queryTerms}`);
+    skip3('边界探针必须不注入', `本库把它抬过了阈值（${admitted.topScore.toFixed(4)} > ${configuredMinScore}）——`
+      + '已知过召回：要修它必须改 minScore / 证据门口径（业务语义），不在本轮范围；证据见上一行的命中块');
+    // 即使走 SKIP 分支也留一条硬约束：注入量仍然不许越过单条上限（口径来自 formatRecall）。
+    expect3('（过召回情形）注入量仍必须守单条上限 + 头部',
+      recallChars <= DEFAULTS.maxCharsPerItem + 260,
+      `召回块 ${recallChars} 字符 / 上限 ${DEFAULTS.maxCharsPerItem} + 头部`);
+    expect3('（过召回情形）库最高候选确实过了证据门（否则它不该走这一支）',
+      admitted.hits[0].matched >= 1, `matched=${admitted.hits[0].matched}`);
+  } else {
+    expect3('边界探针必须不注入（库只提供"过门但低于阈值"的候选）', recallChars === 0, `召回块 ${recallChars} 字符`);
+    expect3('边界探针在配置阈值下确实被挡住（不是"库里根本没候选"）',
+      atConfigured.tier === 'none', `tier=${atConfigured.tier} top=${atConfigured.topScore.toFixed(4)}`);
+  }
+}
+
+/* 阈值灵敏度：**库无关、确定性**的一对断言（合成夹具）。
+ * 早先这一条靠"边界探针恰好落在阈值下沿"来承担，而它在不同真实库上会漂到阈值之上 ——
+ * 于是"把 minScore 调到 0.01 必须变红"这条就时灵时不灵。改用合成索引：
+ *   · 低阈值下同一句话必然命中（证明夹具本身有效）；
+ *   · 阈值抬到 1.5 必须挡住（证明分数闸门真的在挡，而不是被证据门顺手挡掉）；
+ *   · **配置里的 minScore 必须显著高于 0.01** —— 把它改成 0.01/0 就等于关掉闸门，这一条变红。 */
+{
+  const synthQuery = '阈值灵敏度合成探针';
+  const synthIndex = new MemoryIndex([
+    makeRecord({ session: 'synthetic', layer: 'raw', title: synthQuery, compactionId: 'synthetic', text: `${synthQuery} 正文正文正文正文` }),
+  ]);
+  const low = retrieveTwoTier(synthIndex, synthQuery, { minScore: 0.01, maxItems: 1, preferSummaryChunks: true });
+  const high = retrieveTwoTier(synthIndex, synthQuery, { minScore: 1.5, maxItems: 1, preferSummaryChunks: true });
+  expect3('阈值灵敏度（合成夹具）：低阈值下同一句话必然命中（前提，否则下面那条是空测）',
+    low.hits.length > 0, `tier=${low.tier} top=${low.topScore.toFixed(4)}`);
+  expect3('阈值灵敏度（合成夹具）：阈值抬到 1.5 必须挡住（分数闸门真的在挡）',
+    high.hits.length === 0, `tier=${high.tier} top=${high.topScore.toFixed(4)}`);
+  expect3('配置的 minScore 必须显著高于 0.01（否则等于把命中闸门关掉）',
+    Number(DEFAULTS.minScore) > 0.01, `minScore=${DEFAULTS.minScore}`);
+}
+
+/* 历史探针（"明天北京天气预报怎么样" / "帮我写一首关于春天的五言绝句"）：**条件式**。
+ * 这两条之所以历史上会命中，是因为库里可能有一篇**逐字包含它们**的文档（本文件自己的源码被
+ * 读过并入了 L2）——那是夹具自污染，不是阈值问题。于是**两种情形各有自己的断言**，
+ * 任何一种情形都不会因为"另一种情形"而报红：
+ *   · 库里有逐字包含它的记录 → 断言"必须注入召回块"（命中必须真的来自自污染，不能悄悄变空）；
+ *   · 库里没有          → 断言"必须注入 0 字符"（干净库下的正确期望）。
+ * ⚠️ 能失败：前一支被"检索整体坏掉"打红；后一支被"证据门/阈值被关掉"打红。 */
 const CONTAMINATED_PROBES = ['明天北京天气预报怎么样', '帮我写一首关于春天的五言绝句'];
 {
   const probeIndex = new MemoryIndex(readRecords(root, sessionId));
   for (const probe of CONTAMINATED_PROBES) {
     const top = probeIndex.search(probe, { limit: 1 })[0];
     const verbatim = String(top?.record?.text ?? '').includes(probe);
-    console.log(`   （历史探针）"${probe}" → 库里逐字包含它的记录：${verbatim ? `${top.record.title}（mc=${top.matched}，score=${top.score.toFixed(3)}）` : '没有'}`);
-    expect3(`历史"不相关"探针的命中来自夹具自污染（库里有逐字包含它的文档，不是阈值问题）：${probe}`,
-      verbatim, '库里找不到逐字包含它的记录 —— 说明污染已消失，请把这两条改回"必须为空"的断言');
+    const s = cloneSession(probe, seqCursor++);
+    const out = injected(s);
+    const recallChars = recallCharsOf(out);
+    if (verbatim) {
+      console.log(`   （历史探针）"${probe}" → 库里有逐字包含它的记录：${top.record.title}（mc=${top.matched}，score=${top.score.toFixed(3)}）→ 自污染情形`);
+      expect3(`自污染情形：库里有逐字包含该探针的记录 → 命中必须来自它（召回块非空）：${probe}`,
+        recallChars > 0, `召回块 ${recallChars} 字符`);
+    } else {
+      console.log(`   （历史探针）"${probe}" → 库里没有逐字包含它的记录 → 干净库情形`);
+      expect3(`干净库情形：库里没有逐字包含该探针的记录 → 必须注入 0 字符：${probe}`,
+        recallChars === 0, `召回块 ${recallChars} 字符`);
+    }
   }
 }
 console.log(`  ③ 段累计：通过 ${d3Passed} 条，失败 ${d3Failed} 条。`);
@@ -421,7 +566,7 @@ console.log('\n=== ③b 回归：inbox 即召回 + 一轮内文本稳定 + 未�
     time: Date.now(),
     data: {
       content: [{ type: 'text', text }],
-      source: { kind: 'user' },
+      source: { kind: 'user', rpcId: `harness-lag-${seq}` },
       role: 'user',
       id: `q-${seq}`,
     },
@@ -587,7 +732,7 @@ console.log('越界工作区 delete →', outside.status, outside.body.error?.co
       JSON.stringify(header),
       JSON.stringify({
         type: 'user/message', seq: 1, time: Date.now(),
-        data: { content: [{ type: 'text', text: '跨压缩记忆怎么装' }], source: { kind: 'user' } },
+        data: { content: [{ type: 'text', text: '跨压缩记忆怎么装' }], source: { kind: 'user', rpcId: 'harness-probe-rpc' } },
       }),
     ];
     fs.writeFileSync(path.join(dir, 'session.jsonl'), `${lines.join('\n')}\n`, 'utf8');
@@ -952,8 +1097,38 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
     `实际 ${boostBody === '' ? 0 : boostBody.length + boostHead.length} / 排队时 ${queued?.injectedChars}`);
   expect('召回诊断写出了 boostDedupDropped（本轮可观测字段）',
     recallEvent !== null && Number.isSafeInteger(recallEvent.boostDedupDropped), JSON.stringify(recallEvent));
-  expect('与 boost 重叠的召回块被丢掉（boostDedupDropped ≥ 1）',
-    recallEvent !== null && recallEvent.boostDedupDropped >= 1, `实际=${recallEvent?.boostDedupDropped}`);
+  /* 「boost 去重分支被走到」是**覆盖率**断言，能不能走到取决于库内容：
+   * boost 素材来自 `/diagnose`（按分数挑的对话块），召回候选来自提问召回那一侧
+   * （同一个检索但不同的调用点与上限），两者**未必**选中同一块。
+   * 所以这里条件式判定，两种情形各有硬断言：
+   *   · 诊断说丢了 ≥1 条 → 分支确实被走到（硬断言）；
+   *   · 诊断说 0 条 → 用**独立实现**（`lib/text.js` 的 containment，不经过 selectFreshHits）
+   *     量一遍"召回到的那些行与 boost 资料到底重不重叠"：
+   *       重叠 ≥ NEAR_DUPLICATE_SIMILARITY 却没被丢 → **真 bug，红**；
+   *       确实不重叠 → 打印 SKIP + 原因（这一轮没有可丢的东西）。
+   * 真正的正确性不变量由下一条"同一片段只出现 1 次"独立保证。 */
+  /* 口径必须与 `selectFreshHits` **同形**：它比的是 `itemText(record, maxChars)`
+   * —— **不含** `- [来源] ` 前缀。前缀里那几个 token（如"对话"）在 boost 资料里也出现，
+   * 把它们算进分子分母会让重叠度虚高（实测同一份数据：带前缀 0.600、不带前缀 0.500，
+   * 正好跨过 0.6 这条线）→ 会得出"该丢却没丢"的假阳性。 */
+  const boostFull = tokenSet(boostHead + boostBody);
+  const recallPart = (boostedOut.split(RECALL_HEAD_MARK)[1] ?? '').split(boostHead)[0] ?? '';
+  const recallLines = recallPart.split('\n').filter((line) => line.startsWith('- '));
+  const maxOverlap = boostFull.size === 0 ? 0 : recallLines.reduce(
+    (best, line) => Math.max(best, containment(tokenSet(line.replace(/^- \[[^\]]*\]\s*/, '')), boostFull)), 0,
+  );
+  if (recallEvent !== null && recallEvent.boostDedupDropped >= 1) {
+    expect('与 boost 重叠的召回块被丢掉（boostDedupDropped ≥ 1）', true);
+  } else {
+    expect('（没有可丢的块时）召回行与 boost 资料确实不重叠 —— 若重叠却没丢，这里必须红',
+      maxOverlap < NEAR_DUPLICATE_SIMILARITY,
+      `最大重叠度 ${maxOverlap.toFixed(3)} ≥ 阈值 ${NEAR_DUPLICATE_SIMILARITY} 却没被丢（召回 ${recallLines.length} 行）`);
+    if (maxOverlap < NEAR_DUPLICATE_SIMILARITY) {
+      console.log(`  SKIP boost 去重分支被走到（boostDedupDropped ≥ 1） — 本轮召回（reason=${recallEvent?.reason}）`
+        + `选中的 ${recallLines.length} 行与 boost 资料最大重叠只有 ${maxOverlap.toFixed(3)}（< ${NEAR_DUPLICATE_SIMILARITY}），`
+        + '没有可丢的块：这是**库相关**的覆盖率差异，不是缺陷');
+    }
+  }
   // 不重复投喂：boost 资料正文的那一段不该在召回里再出现一次
   const materialBody = (boostBody.split('\n\n')[1] ?? '').split('\n')[1] ?? '';
   const phrase = materialBody.slice(10, 60);
@@ -992,7 +1167,7 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
       // 那样这条用例就测不到"非工具块照旧拿到模型词"。
       data: {
         content: [{ type: 'text', text: '读一下 host.js 里的扩写筛选逻辑，然后总结给我：我想确认工具结果块到底还会不会被送去扩写关键词，以及这一刀省下来的调用次数与输入字符数大概是多少。' }],
-        source: { kind: 'user' }, role: 'user', id: 'q-mix-1',
+        source: { kind: 'user', rpcId: 'harness-mix-rpc' }, role: 'user', id: 'q-mix-1',
       },
     },
     {

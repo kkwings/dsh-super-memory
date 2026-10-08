@@ -167,6 +167,10 @@ Requires **Node ≥ 22.15** (native session logs are multi-frame zstd, which nee
 
 ```bash
 npm test
+# selftest now carries real assertions (ingest counts, L1+L2 present, recap within
+# budget, a hit sample that injects and stays under the per-turn cap, the injected line
+# carrying answer text, unrelated questions injecting 0). Failure exits 1; a log with no
+# compaction events SKIPs that whole part with a printed reason instead of failing.
 node scripts/selftest.mjs <session.v4.jsonl.zstd>
 node scripts/harness.mjs  <session.v4.jsonl.zstd> [tmp workspace]
 ```

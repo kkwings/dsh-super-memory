@@ -40,6 +40,8 @@ const libDir = resolve(process.argv[2] ?? join(here, '..', 'lib'));
 
 /** 提问哈希的口径来源：直接用**被测代码自己的那个函数**（`config.js` 的 shortHash）。 */
 const { shortHash } = await import(pathToFileURL(join(libDir, 'config.js')).href);
+/** 召回块首行判据：也直接用被测代码自己的常量（`recall.js`），不在脚本里复刻一份。 */
+const { RECALL_HEAD_PREFIX } = await import(pathToFileURL(join(libDir, 'recall.js')).href);
 
 /**
  * 本进程建的临时目录/big 环境（④⑤⑥ 段用）：无论正常结束还是抛错都要清掉。
@@ -384,6 +386,25 @@ try {
     searchRead.status === 200 && searchRead.body?.ok === true,
     `HTTP ${searchRead.status} ${JSON.stringify(searchRead.body?.error ?? '')?.slice(0, 160)}`);
 
+  /* ── P2-3：`/search` 的 minScore 必须有下界与上界 ────────────────────────
+   * 这条路由的 `minScore` 直接来自 URL：`?minScore=-5` 比任何分数都小 → 全部候选都算"命中"，
+   * 等于**用一个 URL 参数把命中阈值关掉**（面板标定会被带偏）；`?minScore=99` 则相反。
+   * 现在夹紧到 [0,1]，非有限值回落到当前设置，并在回执里带 `minScoreClamped`。
+   * ⚠️ 能失败：把 clamp 改回 `Number(url.searchParams.get('minScore') ?? current.minScore)`
+   *   （只判 isFinite）→ 下面第一条立刻红（minScore 会是 -5）。 */
+  const searchBase = `/api/dsh-super-memory/search?workspace=${encodeURIComponent(workspace)}&session=${SESSION_ID}&query=${encodeURIComponent('host-smoke 参数化路径探针')}`;
+  const negScore = await call('GET', `${searchBase}&minScore=-5`);
+  check('P2-3 负数 minScore 被夹到 0（不能用一个 URL 参数把阈值关掉）',
+    negScore.body?.value?.minScore === 0 && negScore.body?.value?.minScoreClamped === true,
+    `minScore=${negScore.body?.value?.minScore} clamped=${negScore.body?.value?.minScoreClamped}`);
+  const hugeScore = await call('GET', `${searchBase}&minScore=99`);
+  check('P2-3 minScore > 1 被夹到 1', hugeScore.body?.value?.minScore === 1, `minScore=${hugeScore.body?.value?.minScore}`);
+  const nanScore = await call('GET', `${searchBase}&minScore=abc`);
+  check('P2-3 非数字 minScore 回落到当前设置（不是 NaN、也不是 0）',
+    Number.isFinite(nanScore.body?.value?.minScore) && nanScore.body.value.minScore > 0
+    && nanScore.body?.value?.minScoreClamped === false,
+    `minScore=${nanScore.body?.value?.minScore} clamped=${nanScore.body?.value?.minScoreClamped}`);
+
   // ⚠️ **能失败的验证（第 4 项要求的"能失败的验证"）**：去掉 GET 分支里的
   // `{persist:false}`（也就是让读请求重新走会写盘的那条登记）→ 这里的
   // "设置文件没被改写"会变红。这条是"GET 不产生持久写副作用"的正向证据。
@@ -422,7 +443,7 @@ try {
     header: { cwd: workspace },
     snapshotEvents: () => [{
       type: 'user/message', seq: 100, time: Date.now(),
-      data: { content: [{ type: 'text', text: question }], source: { kind: 'user' }, role: 'user', id: 'q-hostsmoke' },
+      data: { content: [{ type: 'text', text: question }], source: { kind: 'user', rpcId: 'hostsmoke-rpc' }, role: 'user', id: 'q-hostsmoke' },
     }],
     requestContext: () => ({ contextWindow: 1000000 }),
   };
@@ -450,6 +471,126 @@ try {
   check('整个诊断文件里没有任何 queryHead 字段（历史明文不许残留）',
     diagEntries.every((entry) => !('queryHead' in entry)),
     diagEntries.filter((entry) => 'queryHead' in entry).map((entry) => entry.event).join(','));
+
+  /* ── ⑥b P1-C：非提问的队列消息不得顶替真提问 ─────────────────────────────
+   * 场景按**真实日志的顺序**复现（先真提问、后通知插进同一个队列）：
+   *   ① `agent/inbox/spliced` 送来人类提问（source 带 rpcId）→ 应为本轮查询；
+   *   ② 同一个队列随后插进一条**宿主代发的后台任务通知**
+   *      （`kind:'user'`、无 rpcId —— 本机 50/50 条这种形状全是派单，没有一条是提问）
+   *      → 旧口径会把它也当提问、覆盖 pendingQuery，于是本轮检索用的是通知那段噪声。
+   * 观测点用宿主自己的诊断（`recall.queryHash` / `queryChars`，不落明文）：
+   * 断言实际检索的查询就是真提问。
+   * ⚠️ 能失败：删掉 `questionTextOf` 的 rpcId 闸门（或把拼接处的 rpcId 复核去掉）→
+   *   查询哈希变成通知那段 → 两条全红。
+   */
+  const realQuery = 'P1C 真提问：跨压缩记忆的注入成本上限到底是多少';
+  const noticeQuery = 'background job pwsh-99 (node scripts/harness.mjs …) 已完成，退出码 0';
+  // seq 按真实顺序：inbox 里的提问**早于**它落库（8000 < 9000），后台任务通知更晚（9002）。
+  const p1cSeq = { inboxQuestion: 8000, committed: 9000, notice: 9002 };
+  const p1cSession = {
+    id: SESSION_ID,
+    header: { cwd: workspace },
+    snapshotEvents: () => [{
+      type: 'user/message', seq: p1cSeq.committed, time: Date.now(),
+      data: { content: [{ type: 'text', text: realQuery }], source: { kind: 'user', rpcId: 'p1c-real-rpc' }, role: 'user', id: 'q-p1c' },
+    }],
+    requestContext: () => ({ contextWindow: 1000000 }),
+  };
+  const inboxItem = (text, source, seq) => ({
+    type: 'agent/inbox/spliced',
+    seq,
+    time: Date.now(),
+    data: {
+      target: 'next-turn',
+      inserted: [{ content: [{ type: 'text', text }], source, role: 'user', id: `inbox-${seq}` }],
+    },
+  });
+  emit(p1cSession, inboxItem(realQuery, { kind: 'user', rpcId: 'p1c-real-rpc' }, p1cSeq.inboxQuestion));
+  emit(p1cSession, inboxItem(noticeQuery, { kind: 'user' }, p1cSeq.notice));
+  provider.text({ agent: { session: p1cSession } });
+  const p1cEntries = readFileSync(diagFile, 'utf8').split('\n').filter((line) => line.trim() !== '')
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter((entry) => entry?.event === 'recall' && entry.session === SESSION_ID);
+  const p1cLast = p1cEntries[p1cEntries.length - 1] ?? null;
+  check('⑥b （前提）通知插进队列后确实又跑了一次检索并落了诊断',
+    p1cLast !== null && p1cLast.queryHash === shortHash(realQuery),
+    `实际 hash=${p1cLast?.queryHash} chars=${p1cLast?.queryChars}；真提问 hash=${shortHash(realQuery)}/${realQuery.length}，通知 hash=${shortHash(noticeQuery)}/${noticeQuery.length}`);
+  check('⑥b 通知不得顶替真提问：查询身份仍是真提问（不是那段通知）',
+    p1cLast?.queryHash !== shortHash(noticeQuery),
+    `实际=${p1cLast?.queryHash}`);
+  check('⑥b 查询长度也是真提问的长度（没把通知拼进去）',
+    p1cLast?.queryChars === realQuery.length,
+    `实际=${p1cLast?.queryChars} 期望=${realQuery.length}`);
+
+  /* ── ⑥c P2-1：`/diagnostics` 的来源校验 + 会话过滤（会话内 ✕ 按钮的数据来源）────
+   * 这条路由会回传"这个会话上一个问题"的**原文**。要求（只读审查 P2-1）：
+   *   ① 不带那个自定义头 → 拒（本机任意进程不能直接 GET 读用户提问原文）；
+   *   ② 点名了 session → 只回**这一个**会话的文本，且长度受限；
+   *   ③ 没点名 → 只回计数器，任何提问文本都不下发；
+   *   ④ 同时**✕ 功能必须仍然可用**：点名 session 时必须能真的拿到那句问题。
+   * 观测点：真打路由（合成 req/res），不是桩。
+   * ⚠️ 能失败：去掉 `panelReadGuard` → 第一条红；去掉会话过滤 → 第三条红。
+   */
+  // 先造一次**真命中**：投一份含探针原文的压缩摘要，再问那一句 ——
+  // `lastRecallQuery` 只在命中时才写，所以这是 ✕ 按钮真正的数据来源。
+  const p21Probe = 'P2-1 探针：跨压缩记忆的注入成本上限是多少';
+  const p21Session = {
+    id: SESSION_ID,
+    header: { cwd: workspace },
+    snapshotEvents: () => [{
+      type: 'user/message', seq: 5000, time: Date.now(),
+      data: { content: [{ type: 'text', text: p21Probe }], source: { kind: 'user', rpcId: 'p21-rpc' }, role: 'user', id: 'q-p21' },
+    }],
+    requestContext: () => ({ contextWindow: 1000000 }),
+  };
+  emit(emitSession, {
+    type: 'compaction/summary',
+    seq: 77,
+    time: Date.now(),
+    data: {
+      compactionId: 'hostsmoke-p21',
+      turn: 2,
+      shadowedRange: { start: 70, end: 76 },
+      shadowedTokenCount: 900,
+      summary: [{ type: 'text', text: `# 注入成本\n${p21Probe}。结论：单轮注入上限是 700 token。`.repeat(4) }],
+    },
+  });
+  await new Promise((r) => setTimeout(r, 30));
+  // 走**真实提问路径**：先让 inbox 送来这一问（这是 DSH 里提问最早出现的形态），
+  // 否则上一条 ⑥b 留在 pending 里的问题会盖住它（那正是 P1-C 描述的机制）。
+  emit(p21Session, {
+    type: 'agent/inbox/spliced',
+    seq: 5001,
+    time: Date.now(),
+    data: {
+      target: 'next-turn',
+      inserted: [{ content: [{ type: 'text', text: p21Probe }], source: { kind: 'user', rpcId: 'p21-rpc' }, role: 'user', id: 'inbox-p21' }],
+    },
+  });
+  const p21Injected = provider.text({ agent: { session: p21Session } });
+  check('⑥c （前提）探针问题真的命中了（否则 lastQuery 恒为空，下面的断言会假绿）',
+    p21Injected.includes(RECALL_HEAD_PREFIX), `注入 ${p21Injected.length} 字符`);
+
+  const diagNoHeader = await call('GET', `/api/dsh-super-memory/diagnostics?session=${SESSION_ID}`, undefined, { 'x-dsh-super-memory': '' });
+  check('⑥c 不带来源标记的 GET /diagnostics → 403 forbidden',
+    diagNoHeader.status === 403 && diagNoHeader.body?.error?.code === 'forbidden',
+    `HTTP ${diagNoHeader.status} code=${diagNoHeader.body?.error?.code}`);
+  const diagScoped = await call('GET', `/api/dsh-super-memory/diagnostics?session=${SESSION_ID}&limit=1`);
+  const scopedRows = diagScoped.body?.value?.runtime ?? [];
+  check('⑥c 带标记 + 点名 session → 只回该会话（不是所有进程内会话）',
+    diagScoped.status === 200 && scopedRows.length === 1 && scopedRows[0]?.sessionId === SESSION_ID,
+    `HTTP ${diagScoped.status} rows=${scopedRows.map((row) => row.sessionId).join(',') || '(空)'}`);
+  check('⑥c ✕ 路径仍能拿到"上一个问题"文本（点名 session 时）',
+    scopedRows[0]?.lastQuery === p21Probe,
+    `实际=${JSON.stringify(scopedRows[0]?.lastQuery)}`);
+  const diagGlobal = await call('GET', '/api/dsh-super-memory/diagnostics?limit=1');
+  const globalRows = diagGlobal.body?.value?.runtime ?? [];
+  check('⑥c 没点名 session 时任何提问文本都不下发（只回计数器）',
+    diagGlobal.status === 200 && Array.isArray(globalRows) && globalRows.every((row) => row.lastQuery === ''),
+    `rows=${globalRows.length} 非空文本=${globalRows.filter((row) => row.lastQuery !== '').length}`);
+  check('⑥c 回执里带过滤条件（服务端确实按会话过滤，不是客户端挑的）',
+    diagScoped.body?.value?.filtered?.session === SESSION_ID,
+    JSON.stringify(diagScoped.body?.value?.filtered));
 } catch (error) {
   check('④⑤⑥ 段整体执行不抛错', false, String(error?.stack ?? error).split('\n').slice(0, 4).join(' / '));
 } finally {
