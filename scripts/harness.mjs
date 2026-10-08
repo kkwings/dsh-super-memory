@@ -20,6 +20,7 @@ const { decompressFrames } = await import('../lib/zstd.js');
 const { mergeKeywords, parseJsonArray, parseJsonObject } = await import('../lib/llm.js');
 const { diagnoseMiss } = await import('../lib/diagnose.js');
 const { toolRecords } = await import('../lib/ingest.js');
+const { RECALL_HEAD_PREFIX } = await import('../lib/recall.js');
 
 /**
  * 假模型服务：由测试用例在 `apply()` **之前**设置，用来跑失败矩阵。
@@ -27,6 +28,18 @@ const { toolRecords } = await import('../lib/ingest.js');
  * "完全没有 llm 服务"那种机器由 `UNAVAILABLE` 闸门覆盖（见 unit.mjs）。
  */
 const behavior = { mode: 'off', calls: 0, rewriteCalls: 0 };
+
+/**
+ * 「投影里有没有召回块」的判据串（来自 `lib/recall.js` 的 `RECALL_HEAD_PREFIX`）。
+ *
+ * 2026-10-08：召回头部**删掉了** `【本次会话更早（已被压缩）的参考】` 这半句
+ * （作用已被"以下内容来自本会话早前（已被压缩）的部分"覆盖，省 ≈22 字符/轮），
+ * 所以探针改用召回块首行的前 12 个字符。
+ * ⚠️ 别换成头部里那句安全声明：boost 头也带同一句，探针会把 boost 误判成召回
+ * （实测踩过：两条"不相关问题"探针因此报"✗ 竟然注入了"）。
+ */
+const RECALL_HEAD_MARK = RECALL_HEAD_PREFIX;
+
 const fakeLlm = {
   async listProviders() { return [{ provider: 'fake-provider', model: 'fake-model' }]; },
   async *stream(input) {
@@ -185,8 +198,8 @@ for (const question of [relevantQuestions[2], relevantQuestions[9]]) {
   if (question === undefined) continue;
   const s = sessionWithQuestion(question, seqCursor++);
   const out = injected(s);
-  const hasRecall = out.includes('【本次会话更早（已被压缩）的参考】');
-  const recallPart = hasRecall ? out.split('【本次会话更早（已被压缩）的参考】')[1] : '';
+  const hasRecall = out.includes(RECALL_HEAD_MARK);
+  const recallPart = hasRecall ? out.split(RECALL_HEAD_MARK)[1] : '';
   console.log(`\nQ: ${question.replace(/\s+/g, ' ').slice(0, 40)}`);
   console.log(`   总注入 ${out.length} 字符；含召回块: ${hasRecall}`);
   const lines = (recallPart ?? '').split('\n').filter((l) => l.startsWith('- '));
@@ -197,7 +210,7 @@ console.log('\n不相关问题（用干净会话状态：召回块应当为空 �
 for (const question of ['明天北京天气预报怎么样', '帮我写一首关于春天的五言绝句']) {
   const s = cloneSession(question, seqCursor++);
   const out = injected(s);
-  const hasRecall = out.includes('【本次会话更早（已被压缩）的参考】');
+  const hasRecall = out.includes(RECALL_HEAD_MARK);
   console.log(`   Q: ${question} → 总注入 ${out.length} 字符，召回块 ${hasRecall ? '✗ 竟然注入了' : '✓ 空'}`);
 }
 
@@ -266,13 +279,13 @@ console.log('\n=== ③b 回归：inbox 即召回 + 一轮内文本稳定 + 未�
   const lagQuestion = relevantQuestions[2];
 
   const before = injected(lagSession);
-  console.log('投影里没有任何用户消息 → 含召回块（应为 false）:', before.includes('已被压缩）的参考'));
+  console.log('投影里没有任何用户消息 → 含召回块（应为 false）:', before.includes(RECALL_HEAD_MARK));
   console.log('此时仍有压缩后总览（应为 true）:', before.includes('本会话此前脉络'));
 
   const inboxSeq = seqCursor++;
   emit(lagSession, inboxEvent(inboxSeq, lagQuestion));
   const afterInbox = injected(lagSession);
-  console.log('inbox 事件刚到、提问尚未落库 → 含召回块（应为 true）:', afterInbox.includes('已被压缩）的参考'));
+  console.log('inbox 事件刚到、提问尚未落库 → 含召回块（应为 true）:', afterInbox.includes(RECALL_HEAD_MARK));
   console.log(`注入文本增量 ${afterInbox.length - before.length} 字符（召回块本身）`);
 
   emit(lagSession, userEvent(inboxSeq + 2, lagQuestion));
@@ -283,7 +296,7 @@ console.log('\n=== ③b 回归：inbox 即召回 + 一轮内文本稳定 + 未�
     emit(lagSession, userEvent(seqCursor++, q));
   }
   const afterMiss = injected(lagSession);
-  console.log('随后连问两个不相关问题 → 参考块仍挂着（stickyRecall 默认开，应为 true）:', afterMiss.includes('已被压缩）的参考'));
+  console.log('随后连问两个不相关问题 → 参考块仍挂着（stickyRecall 默认开，应为 true）:', afterMiss.includes(RECALL_HEAD_MARK));
   console.log('且文本仍逐字不变（未命中没有追加任何快照，应为 true）:', afterMiss === afterInbox);
 }
 
@@ -321,7 +334,7 @@ console.log('\n=== ④ 设置开关即时生效（经面板 API，每次用一�
 const askSession = () => cloneSession(relevantQuestions[2], seqCursor++);
 const probe = async (label) => {
   const value = injected(askSession());
-  console.log(`   ${label}: ${value.length} 字符  ${value.includes('【本次会话更早（已被压缩）的参考】') ? '(含召回)' : '(无召回)'}`);
+  console.log(`   ${label}: ${value.length} 字符  ${value.includes(RECALL_HEAD_MARK) ? '(含召回)' : '(无召回)'}`);
 };
 await probe('默认（两个注入开关都开）');
 await put({ injectRecall: false });
@@ -577,7 +590,7 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
     requestContext: () => ({ contextWindow: 1000000 }),
   };
   const out = injected(clean);
-  console.log('B 工作区里一个全新会话 → 无召回也无总览（应为 true）:', out === '' || (!out.includes('已被压缩）的参考') && !out.includes('本会话此前脉络')));
+  console.log('B 工作区里一个全新会话 → 无召回也无总览（应为 true）:', out === '' || (!out.includes(RECALL_HEAD_MARK) && !out.includes('本会话此前脉络')));
 }
 
 // 21) 回收站按天数自动清理：把条目的 deletedAt 改老，再把保留天数设成 1（改设置会触发一次清理）
@@ -775,7 +788,9 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
     boostedOut.includes('用户点了「✕」后由辅助模型找到'), `注入 ${boostedOut.length} 字符`);
   // boost 完整性：注入文本里 boost 那一段的字符数必须**逐字**等于排队时记下的长度
   // （含 `⟦mem-hist⟧` 标记 —— 它是 boost 文本的第一个字符序列）
-  const boostHead = '⟦mem-hist⟧【本次会话更早（已被压缩）的参考 · 用户点了「✕」后由辅助模型找到】';
+  // 2026-10-08：boost 头与召回同步删掉了 `【本次会话更早（已被压缩）的参考 · …】` 那半句，
+  // 只留来源说明（`lib/host.js` 的 `boostFor` 是唯一构造处，这里必须与它同形）。
+  const boostHead = '⟦mem-hist⟧用户点了「✕」后由辅助模型找到';
   const boostBody = boostedOut.split(boostHead)[1] ?? '';
   expect('boost 逐字完整（字符数和 boost-queued 记下的完全一致）',
     queued !== null && boostBody !== '' && boostBody.length + boostHead.length === queued.injectedChars,
