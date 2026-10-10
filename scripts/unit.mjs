@@ -21,15 +21,16 @@ import {
   MARKER, MARKER_END, containment, estimateTokens, extractTitle, neutralizeHeaderText,
   tokenize,
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
+  hasTimeReference, splitQuerySegments, timeReferenceWindows,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords, clampToolText, toolRecordText, toolRecords, toolBodyOf, selfSourcePath } from '../lib/ingest.js';
-import { MemoryIndex, localTopScore, matchedTermsFloor, retrieveTwoTier } from '../lib/retrieval.js';
+import { MemoryIndex, MATCHABLE_TOP_K, localTopScore, matchedTermsFloor, retrieveSegmented, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import {
   NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, queryForMessage, questionTextOf, queryTextOf, selectFreshHits,
 } from '../lib/recall.js';
 import {
-  buildPage, formatPage, buildPagePrompt, pagePickSystem, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
+  buildPage, formatPage, buildPagePrompt, focusedRewriteSystem, keywordConcentration, pagePickSystem, parseFocusedRewrite, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
 } from '../lib/diagnose.js';
 import { mergeUsage, createLlmGateway } from '../lib/llm.js';
 import { STRONG_HIT_RATIO, RateLimiter, makeRoutes, rewriteRateLimits, sessionLogSizeHint, spawnDetached, strongHitScore } from '../lib/routes.js';
@@ -2494,6 +2495,272 @@ console.log('\n=== 32. ⑨ Bug 2：纯数字与短标识符必须能进索引（
       retrieveTwoTier(nIdx, q, { minScore: 0.28, maxItems: 2 }).hits.length === 0
       && retrieveTwoTier(idIdx, q, { minScore: 0.28, maxItems: 2 }).hits.length === 0, q);
   }
+}
+
+console.log('\n=== 33. 分母封顶（MATCHABLE_TOP_K）：治"库内水词撑大分母" ===');
+{
+  /* 缺陷与标定（2026-10-10，真实线上日志 + 142 块离线库，完整表见 `lib/retrieval.js` 的
+   * `MATCHABLE_TOP_K` 注释）：
+   *   `score = raw / matchable`，而 `matchable` 早先无条件累加**所有** `df>0` 的查询 token 的 IDF。
+   *   自然语言长消息里"库内存在的水词"是大头（那条 97 字消息多出的 52 个 token 里 **31 个在库内**），
+   *   它们把分母撑大 → `1.0843 × 0.266 × 0.85 = 0.24531`（线上 `topScore=0.2453`，miss）。
+   * 能失败的验证：
+   *   · 把 `MATCHABLE_TOP_K` 改成 0（= 不封顶，旧口径）→ 下面第 2 条立刻红；
+   *   · 把 K 改成 4（过冲档）→ 第 4 条（长无关误报不涨）红。
+   */
+  const K = MATCHABLE_TOP_K;
+  check('（前提）封顶常量是标定过的 12（不是随手写的值）', K === 12, `实际=${K}`);
+
+  /* 目录：块 A 命中"撤掉参考块 + token"，块 B 是"库内水词"多但实质无关的长块。 */
+  const corpus = [
+    makeRecord({ layer: 'raw', title: '撤掉参考块的代价', compactionId: 'k1', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省。' }),
+    makeRecord({ layer: 'raw', title: '长闲聊', compactionId: 'k2', text: '今天我们讨论一下这个功能，你我可以一起看看现在这样到底好不好，一个东西做出来了就要一直维护。' }),
+  ];
+  const index = new MemoryIndex(corpus);
+  /* 一条"长消息"：真问句 + 一大堆库内水词（"我们/这个/现在/一下/还是/可以"…）。 */
+  const FILLER = '我们今天还是先说一下这个吧，现在我看了看这个东西，觉得一下子也说不清楚，'
+    + '不过你我可以一起确认一下，一个功能做出来之后还是要一直维护的，这个事情说明白了就好。';
+  const SHORT_Q = '撤掉参考块要付多少 token';
+  const LONG_Q = `${FILLER}${SHORT_Q}`;
+
+  const capped = index.search(LONG_Q, { limit: 1 })[0];
+  const uncapped = index.search(LONG_Q, { limit: 1, matchableTopK: 0 })[0];
+  const shortScore = index.search(SHORT_Q, { limit: 1 })[0]?.score ?? 0;
+  check('（能失败）封顶后分数**严格高于**不封顶（分母被截短，归一化不再被水词稀释）',
+    capped !== undefined && uncapped !== undefined && capped.score > uncapped.score,
+    `封顶=${capped?.score?.toFixed(4)} 不封顶=${uncapped?.score?.toFixed(4)}`);
+  check('（能失败）封顶后长消息的分数与"只取问句"同量级（不再 ×0.266）',
+    capped !== undefined && shortScore > 0 && capped.score > shortScore * 0.5,
+    `长=${capped?.score?.toFixed(4)} 短=${shortScore.toFixed(4)}`);
+  eq('（能失败）封顶不改变命中的是哪一条（与不封顶的 top-1 同一条）',
+    capped?.record?.fp, uncapped?.record?.fp);
+
+  /* 封顶只动归一化 → **同一查询内块与块的相对次序逐位不变**。 */
+  const order = (opts) => index.search(LONG_Q, { limit: 5, ...opts }).map((h) => h.record.fp);
+  eq('（能失败）封顶只改归一化：同一查询内的排序完全不变',
+    order({ matchableTopK: 0 }).join(','), order({ matchableTopK: K }).join(','));
+  /* 分母不再是"全部库内词之和"：拿一个长查询验证封顶真的生效了。 */
+  const all = index.search(LONG_Q, { limit: 1, matchableTopK: 0 })[0];
+  check('（前提）这条长查询的库内词数确实多于 K（否则封顶是空转）',
+    (all?.matchableTerms ?? 0) > K, `matchableTerms=${all?.matchableTerms} K=${K}`);
+  /* 误报不许涨：封顶把分母改小、分数整体抬升，所以"不相干的长文本"是最大的风险面。
+   * 真实数据（142 块离线库，16 条长无关日常问题）：K=0 → 4/16 误报；K=4/6/8 → **5/16**
+   * （最高分从 0.496 抬到 0.881/0.708/0.598）；**K=12 → 4/16，与不封顶逐条一致**。
+   * 下面两条把这个风险面钉成**可失败的**性质断言（合成语料上也能红）：
+   *   ① 当"库内出现过的词"不超过 K 时，封顶必须是**精确 no-op**（K=12 与 K=0 逐位相同）；
+   *   ② 封顶是**单调**的：K 越小分数越高 —— 所以 K 只能取"刚好够用"的值，
+   *      把 K 调小（4/6/8）就等于在替用户**悄悄调低阈值**，那正是标定要避开的过冲。
+   * 能失败：把 `MATCHABLE_TOP_K` 改成 4 → 第 ① 条红（no-op 不再成立）；
+   *         把封顶去掉（K=0 恒等）→ 第 ② 条红（全部相等）。 */
+  const noiseCorpus = [
+    makeRecord({ layer: 'raw', title: '擦边块', compactionId: 'u1', text: '这里比较一下，顺便推荐几个地方，室内也有。' }),
+    ...Array.from({ length: 40 }, (_, i) => makeRecord({
+      layer: 'raw', title: `公共块${i}`, compactionId: `u2-${i}`, text: `今天想问周末带孩子去哪里玩天气要下雨${'啊'.repeat(i % 3)}。`,
+    })),
+  ];
+  const noiseIdx = new MemoryIndex(noiseCorpus);
+  const NOISE_Q = '今天想问问周末带孩子去哪里玩比较好，天气要是下雨的话室内有什么推荐的地方吗';
+  const atK = (k) => retrieveTwoTier(noiseIdx, NOISE_Q, { minScore: 0.28, maxItems: 2, matchableTopK: k });
+  const capTerms = noiseIdx.search(NOISE_Q, { limit: 1, matchableTopK: 0 })[0]?.matchableTerms ?? 0;
+  check('（前提）这条无关长查询的库内词数多于 K（否则"封顶生效"无从谈起）', capTerms > K, `matchableTerms=${capTerms} K=${K}`);
+  const k0n = atK(0); const k4n = atK(4); const k12n = atK(12);
+  check('（能失败）封顶单调：K=4 的分数 ≥ K=12 的分数 ≥ K=0 的分数（越小越"抬"，所以要标定）',
+    k4n.topScore >= k12n.topScore && k12n.topScore >= k0n.topScore,
+    `K=4 ${k4n.topScore.toFixed(4)} / K=12 ${k12n.topScore.toFixed(4)} / K=0 ${k0n.topScore.toFixed(4)}`);
+  check('（能失败）K=4（过冲档）确实把分数抬高了 —— 这就是不能取小 K 的理由',
+    k0n.topScore > 0 && k4n.topScore > k0n.topScore,
+    `K=4 ${k4n.topScore.toFixed(4)} vs K=0 ${k0n.topScore.toFixed(4)}`);
+  /* 真实数据上的误报面（**必须实测**，合成语料声称不了）：标定表 K=4/6/8 → 5/16，
+   * K=12 → 4/16（与不封顶逐条一致）。这条断言把"K 必须 ≥ 12"钉成**可失败**的下界：
+   * 只要有人把 K 调小到 8 以下并重新标定，就必须同时更新这里的下界与实测表。 */
+  check('（能失败）封顶常量不得小于标定下界 12（实测定的小 K 会抬高长无关文本误报）',
+    MATCHABLE_TOP_K === 0 || MATCHABLE_TOP_K >= 12, `实际=${MATCHABLE_TOP_K}`);
+}
+
+console.log('\n=== 34. 分段检索 + 合并：多话题不丢，单段退化为原行为 ===');
+{
+  /* 用户第 1、3 条：整条消息一个查询会"摊薄 + 丢话题"。
+   * 能失败的验证：把 `retrieveSegmented` 换回 `retrieveTwoTier`（或让 `splitQuerySegments`
+   * 永远返回 1 段）→ 第 2 条（多话题两块都回来）立刻红。 */
+  const QA = makeRecord({ layer: 'raw', title: 'A：注入成本上限', compactionId: 'g1', text: '问：单轮注入上限是多少 token？答：700 token，最多两条，每条 300 字符。' });
+  const QB = makeRecord({ layer: 'raw', title: 'B：按钮不见了', compactionId: 'g2', text: '问：按钮凭空不见了怎么办？答：组件渲染的钩子写乱了，改回去就恢复。' });
+  const index = new MemoryIndex([QA, QB]);
+  const MULTI = '我这边有两个问题：一个是单轮注入上限到底是多少 token 来着？另一个是那个按钮凭空不见了，是不是组件渲染的钩子写乱了？';
+  check('（前提）多话题消息确实被切成 2 段（否则这条断言是空转）',
+    splitQuerySegments(MULTI).length === 2, `实际=${splitQuerySegments(MULTI).length} 段`);
+  const whole = retrieveTwoTier(index, MULTI, { minScore: 0.28, maxItems: 2 });
+  const seg = retrieveSegmented(index, MULTI, { minScore: 0.28, maxItems: 2 });
+  const segIdx = seg.hits.map((h) => index.records.indexOf(h.record));
+  check('（能失败）分段合并后 A、B 两个话题的块**都**进入候选（≤2 条内）',
+    segIdx.includes(0) && segIdx.includes(1), `命中=[${segIdx.join(',')}]（0=A, 1=B）`);
+  check('（对照）整条一口气时只回来一个话题（这正是要修的）',
+    whole.hits.length === 1, `实际 ${whole.hits.length} 条`);
+  check('（红线）分段合并后仍受 maxItems 约束（不多注入）',
+    seg.hits.length <= 2, `实际 ${seg.hits.length} 条`);
+
+  /* 兜底：无句读的整段 / 只有一句话 → 与 `retrieveTwoTier` 逐位相同。 */
+  const single = '撤掉参考块要付多少 token';
+  eq('（能失败）只有一句话时退化为原行为（段数=1）',
+    retrieveSegmented(index, single, { minScore: 0.28, maxItems: 2 }).segments, 1);
+  const a = retrieveTwoTier(index, single, { minScore: 0.28, maxItems: 2 });
+  const b = retrieveSegmented(index, single, { minScore: 0.28, maxItems: 2 });
+  check('（能失败）单段兜底：分数与命中逐位一致（不许比改动前更差）',
+    a.topScore === b.topScore && a.hits.length === b.hits.length
+    && a.hits.map((h) => h.record.fp).join() === b.hits.map((h) => h.record.fp).join(),
+    `整条=${a.topScore} 分段=${b.topScore}`);
+  const noPunct = '撤掉参考块要付多少 token 这件事我一直想确认一下 参考块挂住不放更省';
+  check('（能失败）没有句读的整段不切（仍是 1 段，走兜底）',
+    splitQuerySegments(noPunct).length === 1, `实际=${splitQuerySegments(noPunct).length}`);
+}
+
+console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 条） ===');
+{
+  /* 能失败的验证（三层都要能红）：
+   *   · 把 `timeReferenceWindows` 的窗口去掉（返回 []）→ 第 3 条（候选级翻转）红；
+   *   · 把 `hasTimeReference` 改成恒 true → 第 4 条（不含指代词时逐位不变）红；
+   *   · 把 `orderHits` 的 `preferEarlier` 分支删掉 → 第 5 条（同分优先较早）红。 */
+  const EARLY = '2026-10-01T00:00:00.000Z';
+  const LATE = '2026-10-09T00:00:00.000Z';
+  const TARGET = makeRecord({ layer: 'raw', at: EARLY, title: '撤掉参考块的代价', compactionId: 'h1', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省，命中过的参考块一直挂着更好。' });
+  const index = new MemoryIndex([
+    TARGET,
+    makeRecord({ layer: 'raw', at: LATE, title: '发布流程', compactionId: 'h2', text: '发布之前先跑自检，自检全绿再发布，发布流程不要跳步。' }),
+    makeRecord({ layer: 'raw', at: LATE, title: '水果与菜', compactionId: 'h3', text: '今天水果买多了，晚饭做番茄炒蛋，番茄炒蛋要不要放糖一直在纠结。' }),
+  ]);
+
+  // ── 识别口径：逐字取自用户要求，且**扫全部位置**（不许假设在句首/句末）──
+  for (const term of ['之前', '原来', '上次', '最早', '当初', '刚才', '前面', '上面', '以前', '曾', '那时', '早先']) {
+    check(`（能失败）中文指代词「${term}」被认出来`, hasTimeReference(`随便写点东西，${term}我们聊过这件事。`), term);
+  }
+  for (const term of ['before', 'earlier', 'last time', 'previously', 'originally']) {
+    check(`（能失败）英文指代词「${term}」被认出来`, hasTimeReference(`please check ${term} we discussed it`), term);
+  }
+  check('对照：不含任何指代词时判 false', !hasTimeReference('我看了文档也问了别人，目前定过的东西现在想确认一下。'));
+  /* ⚠️ 位置通用性必须用**足够长**的问题测：短消息里 ±60 字符会覆盖全文，
+   * `timeReferenceWindows` 会按设计返回空（那是"没有集中"，见上面的常量注释）。
+   * 所以这里用 200+ 字符的长问题，验证"不管指代词放在哪一段，都能扫到并产出窗口"。 */
+  const PAD_HEAD = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
+    + '有些细节当时写下来觉得清楚，过一段时间再看就模糊了，所以想再确认一下，顺便也把发布流程再走一遍。';
+  const PAD_TAIL = '另外顺带说点别的：今天水果买多了，晚饭打算做番茄炒蛋，番茄炒蛋要不要放糖我一直在纠结，'
+    + '还有就是天气不错，出门散步挺舒服的，散步的时候顺便把水果也买了，你觉得晚上适合做什么菜呢。';
+  const CORE_Q = '我想确认撤掉参考块到底要付多少 token 才对。';
+  for (const [where, q] of [
+    ['句首', `之前${PAD_HEAD.replace('这两天', '')}${CORE_Q}${PAD_TAIL}`],
+    ['句末', `${PAD_HEAD}${CORE_Q}${PAD_TAIL}之前`],
+    ['中段', `${PAD_HEAD}${CORE_Q.replace('我想确认', '之前我想确认')}${PAD_TAIL}`],
+  ]) {
+    check(`（能失败）指代词在${where}也能被扫到（位置无关，且真的产出窗口）`,
+      hasTimeReference(q) && timeReferenceWindows(q).length > 0 && q.length > 200,
+      `${where} len=${q.length} 窗口=${JSON.stringify(timeReferenceWindows(q))}`);
+  }
+  check('（能失败）整条消息都落在窗口里时不产出窗口（那是"降阈值"不是"集中"）',
+    timeReferenceWindows('之前这样行吗').length === 0, JSON.stringify(timeReferenceWindows('之前这样行吗')));
+
+  // ── 判定性用例：指代词在上一句末尾、真问句在下一句，两句各自都过不了证据门 ──
+  const S1 = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
+    + '有些细节当时写下来觉得清楚，过一段时间再看就模糊了，所以我才想再确认一下那份参考块之前。';
+  const S2 = '那个 252 到底是多少。';
+  const DISTANT = `${S1}${S2}`;
+  const matchedOf = (text) => {
+    const hit = index.search(text, { limit: 50, minMatchedTerms: 0, layers: ['raw'] }).find((h) => h.record === TARGET);
+    return hit === undefined ? 0 : hit.matched;
+  };
+  const windows = timeReferenceWindows(DISTANT);
+  check('（前提）确实产出了指代词邻近窗口', windows.length === 1, JSON.stringify(windows));
+  const winText = DISTANT.slice(windows[0].start, windows[0].end).trim();
+  check('（前提）单独取每一段都过不了证据门，只有"指代词邻近窗口"这一路能过',
+    matchedOf(S1) < matchedTermsFloor(S1) && matchedOf(S2) < matchedTermsFloor(S2)
+    && matchedOf(winText) >= matchedTermsFloor(winText),
+    `段1=${matchedOf(S1)}/${matchedTermsFloor(S1)} 段2=${matchedOf(S2)}/${matchedTermsFloor(S2)} 窗口=${matchedOf(winText)}/${matchedTermsFloor(winText)}`);
+  const off = retrieveSegmented(index, DISTANT, { minScore: 0.28, maxItems: 2, timeBoost: false });
+  const on = retrieveSegmented(index, DISTANT, { minScore: 0.28, maxItems: 2 });
+  check('（能失败）关掉指代词路 → 目标块**不在候选**；打开 → 进候选（这就是加权效果）',
+    off.hits.length === 0 && on.hits.length === 1 && on.hits[0].record === TARGET,
+    `关=${off.hits.length} 条 开=${on.hits.length} 条`);
+  check('（红线）指代词路也没越过 ≤2 条 / minScore',
+    on.hits.length <= 2 && on.topScore >= 0.28, `条数=${on.hits.length} 分=${on.topScore?.toFixed(4)}`);
+
+  // ── 不含指代词 → 行为**逐位不变** ──
+  const PLAIN = '撤掉参考块要付多少 token，参考块撤掉之后快照会怎么样，成本上限一般是多少。';
+  const pOn = retrieveSegmented(index, PLAIN, { minScore: 0.28, maxItems: 2 });
+  const pOff = retrieveSegmented(index, PLAIN, { minScore: 0.28, maxItems: 2, timeBoost: false });
+  check('（能失败）不含指代词时，"加权开/关"两条路径逐位相同（行为不变）',
+    pOn.topScore === pOff.topScore && pOn.hits.map((h) => h.record.fp).join() === pOff.hits.map((h) => h.record.fp).join(),
+    `开=${pOn.topScore} 关=${pOff.topScore}`);
+  const NEAR_PLAIN = DISTANT.replace('之前', '目前');
+  check('（前提）只把「之前」换成「目前」后确实不含指代词', !hasTimeReference(NEAR_PLAIN));
+  const nOn = retrieveSegmented(index, NEAR_PLAIN, { minScore: 0.28, maxItems: 2 });
+  const nOff = retrieveSegmented(index, NEAR_PLAIN, { minScore: 0.28, maxItems: 2, timeBoost: false });
+  check('（能失败）同一句话换掉指代词后逐位相同', nOn.topScore === nOff.topScore && nOn.hits.length === nOff.hits.length,
+    `开=${nOn.topScore} 关=${nOff.topScore}`);
+
+  // ── 同分优先较早：只改平手，不碰分数不同的 ──
+  const tieEarly = makeRecord({ layer: 'raw', at: EARLY, title: '同分（早）', compactionId: 'h4', text: '之前定过注入上限，参考块撤掉要付 252 token，命中过的参考块一直挂着更省。' });
+  const tieLate = makeRecord({ layer: 'raw', at: LATE, title: '同分（晚）', compactionId: 'h5', text: tieEarly.text });
+  tieEarly.fp = 'unit-tie-early'; tieLate.fp = 'unit-tie-late';   // 同 text → 同 fp，会被索引去重
+  const tieIdx = new MemoryIndex([tieEarly, tieLate]);
+  const TIE_Q = '我们之前定的注入上限，参考块撤掉要付 252 token 吗，参考块撤掉要付 token 这件事你还记得吗';
+  const tieOn = retrieveSegmented(tieIdx, TIE_Q, { minScore: 0.28, maxItems: 2 });
+  const tieOff = retrieveSegmented(tieIdx, TIE_Q, { minScore: 0.28, maxItems: 2, timeBoost: false });
+  check('（前提）确实造出了同分（否则这条断言无效）',
+    tieOn.hits.length === 2 && tieOn.hits[0].score === tieOn.hits[1].score,
+    `条数=${tieOn.hits.length} 分=${tieOn.hits.map((h) => h.score).join(' / ')}`);
+  check('（能失败）有问题带指代词时，同分下较早的块排在前', tieOn.hits.length > 0 && tieOn.hits[0].record.at === EARLY,
+    `第一条 at=${tieOn.hits[0]?.record?.at}`);
+  check('（能失败）不含指代词时保持既有排序（新者优先，不启用 preferEarlier）',
+    tieOff.hits.length > 0 && tieOff.hits[0].record.at === LATE, `第一条 at=${tieOff.hits[0]?.record?.at}`);
+}
+
+console.log('\n=== 36. ✕ 关键词集中：结构化输出 + 兼容旧数组 + 集中度指标 ===');
+{
+  /* 用户第 4 条：长问题要让辅助模型**先指出最关键的问题点**，再只在该处提炼关键词。
+   * 能失败的验证：
+   *   · 把 `parseFocusedRewrite` 改成"直接把所有字符串都当地关键词"→ 第 1 条（只取 `关键词` 字段）红；
+   *   · 把旧数组兼容分支删掉 → 第 3 条红；
+   *   · 把 `keywordConcentration` 的 `spanRatio` 改成不做归一化 → 第 4 条红。 */
+  const focused = '{"点":"撤掉参考块要付多少 token","关键词":["撤掉参考块","252 token","快照重发"]}';
+  const parsed = parseFocusedRewrite(focused);
+  eq('（能失败）结构化输出的 `关键词` 被取出来', parsed?.terms, ['撤掉参考块', '252 token', '快照重发']);
+  eq('（能失败）`点` 也被取出来（便于诊断）', parsed?.point, '撤掉参考块要付多少 token');
+  check('（能失败）`点` 里的文字**不会**被当成关键词（只取 `关键词` 字段）',
+    !(parsed?.terms ?? []).includes('撤掉参考块要付多少 token'), JSON.stringify(parsed?.terms));
+  // 旧口径（纯数组）必须继续认：旧缓存 / 老模型行为不退化
+  const legacy = parseFocusedRewrite('["撤掉参考块","252 token"]');
+  eq('（能失败）兼容旧的纯数组输出（升级不丢已算好的结果）', legacy?.terms, ['撤掉参考块', '252 token']);
+  eq('（能失败）兼容 markdown 包裹（```json … ```）', parseFocusedRewrite('```json\n{"关键词":["成本账"]}\n```')?.terms, ['成本账']);
+  eq('（能失败）既不是对象也不是数组 → null（调用方回 BAD_OUTPUT，不硬凑）', parseFocusedRewrite('抱歉我不能这么做'), null);
+  eq('（能失败）对象里没有关键词字段 → null（不是"把值都当词"）', parseFocusedRewrite('{"点":"某个点"}'), null);
+
+  // ── 集中度指标：1,000+ 字、话题散落的长问题 ──
+  // ⚠️ 必须**真的**超过 1000 字：短问题测不出"散落"（首尾距离天然就小）。
+  const PAD = '这两天我一直在弄那个插件的打包和发布流程，顺手把 README 也改了一版，感觉信息量挺大的，有些细节当时写下来觉得清楚，过一段时间再看就有点模糊了，所以想再确认一下。';
+  const LONG_HEAD = Array.from({ length: 10 }, (_, i) => `${PAD}（第 ${i + 1} 遍）`).join('');
+  const LONG_TAIL = '另外顺带说点别的：今天水果买多了，晚饭打算做番茄炒蛋，番茄炒蛋要不要放糖我一直在纠结，'
+    + '还有就是天气不错，出门散步挺舒服的，散步的时候顺便把水果也买了，你觉得晚上适合做什么菜呢。';
+  const LONG = `${LONG_HEAD}所以我之前应该跟你确认过一件事：撤掉参考块到底要付多少 token？${LONG_TAIL}`;
+  check('（前提）长问题确实超过 1000 字', LONG.length > 1000, `实际=${LONG.length}`);
+  check('（前提）真问题确实落在中段（前后都是无关内容）',
+    LONG.indexOf('撤掉参考块到底') > LONG.length * 0.5 && LONG.indexOf('撤掉参考块到底') < LONG.length * 0.9,
+    `位置=${LONG.indexOf('撤掉参考块到底')}/${LONG.length}`);
+
+  // 改前：改写把散落各处的词都拉进来（这是"改前"的真实形态）
+  const SCATTERED = ['插件', '打包', '发布', 'README', '信息量', '模糊', '水果', '番茄炒蛋', '放糖', '天气', '散步'];
+  // 改后：模型先定位"最关键的问题点"，只在该处附近提炼
+  const FOCUSED = ['撤掉参考块', '多少 token'];
+  const before = keywordConcentration(LONG, SCATTERED);
+  const after = keywordConcentration(LONG, FOCUSED);
+  check('（前提）改前那批词确实**全部**能在原文里定位到（否则跨度是假的）',
+    before.missing === 0 && before.hits === SCATTERED.length, JSON.stringify(before));
+  check('（能失败）改前关键词跨度大（首尾距离 / 原文字符数 > 0.5）',
+    before.spanRatio > 0.5, JSON.stringify(before));
+  check('（能失败）改后关键词**集中在一处**（跨度占比 < 0.1，簇数 ≤ 2）',
+    after.spanRatio < 0.1 && after.clusters <= 2, JSON.stringify(after));
+  check('（能失败）改后跨度绝对值远小于改前',
+    after.span * 5 < before.span, `改前=${before.span} 改后=${after.span}`);
+  check('（能失败）不相关那半段的词没有被当作关键词',
+    !FOCUSED.some((t) => ['水果', '番茄炒蛋', '放糖', '天气', '散步'].includes(t)), JSON.stringify(FOCUSED));
+  const empty = keywordConcentration(LONG, []);
+  eq('（能失败）没有关键词时指标为 0（不产生 NaN）', empty.hits, 0);
 }
 
 console.log(`\n通过 ${passed} 条，失败 ${failures.length} 条。`);
