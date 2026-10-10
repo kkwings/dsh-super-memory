@@ -23,7 +23,7 @@ import {
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords, clampToolText, toolRecordText, toolRecords, toolBodyOf, selfSourcePath } from '../lib/ingest.js';
-import { MemoryIndex, localTopScore, retrieveTwoTier } from '../lib/retrieval.js';
+import { MemoryIndex, localTopScore, matchedTermsFloor, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import {
   NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, queryForMessage, questionTextOf, queryTextOf, selectFreshHits,
@@ -1408,7 +1408,8 @@ console.log('\n=== 24. 注入行抽取口径：答优先 / 结论句优先 / 首
 
   // ⑥ CRLF：真实库的 L2 块是 `\r\n`。**实测：这条现在杀不死任何变异** ——
   //    • 去掉 `itemText` 里的 `\r\n` 归一：照样绿（行首判据里都有 `.trim()`）；
-  //    • 去掉 `cleanItemLine` 的 `.trim()`：也照样绿（`answerTextsOf` 自己再 trim 一次）。
+  //    • 去掉 `cleanItemLine` 的 `.trim()`：也照样绿（`qnaSegmentsOf` 自己再 trim 一次，
+  //      见 §31 —— 它已取代旧的 `answerTextsOf`）。
   //    也就是说这一刀在当前实现里是**冗余的防御**，不是唯一防线。
   //    留着它的理由：它让"行首判据"在任何调用顺序下都干净（少一层隐式依赖），
   //    而这条断言钉的是**行为契约**：CRLF 块与 LF 块的注入行必须逐字相同 ——
@@ -2398,6 +2399,100 @@ console.log('\n=== 27. ✕：提问归属（messageId → 该轮提问）+ 候�
       eq('→ 没有排进下一轮', out3[0]?.value?.boosting, false);
     }
     fs.rmSync(workspace2, { recursive: true, force: true });
+  }
+}
+
+/* ── 2026-10-09 新增：⑨ 两处"该给的信息没给全"的真 bug（第三方只读实验在真实库上证实） ── */
+
+console.log('\n=== 31. ⑨ Bug 1：`答：` 的续行必须进注入行（不是落进 body 就没了） ===');
+{
+  /* 形状（`lib/ingest.js:375-376` 生成）：`问：<user>\n答：<assistant>`，assistant 的换行原样保留
+   * → **只有第一行带前缀，答案的全部续行没有行首 `答：`**。
+   * 旧 `answerTextsOf` 只认"行首 `答：`"，续行落进 `body`；而有答时
+   * `poolText ≡ answers`（`itemText` 第 578 行）、`emitted ⊇ splitSentences(answers)`，
+   * 于是取样池恒空、结论句也被挡 → **只要块里有 `答：` 行，块正文对注入行贡献恒为 0**。
+   * 能失败的验证：
+   *   · 把续行收集去掉（等价旧逻辑）→ 第 1/2 条立刻红（实测：注入行只剩 30 字符左右）；
+   *   · 把 `问` 的续行也算进答 → 第 2 条红（问句正文被塞回注入行）。
+   */
+  const qa = makeRecord({
+    layer: 'raw', title: '续行探针', compactionId: 'c1',
+    text: '问：第一行提问\n这一整段是提问的续行，属于问句正文，不该出现在注入行里，所以要写得够长。\n'
+      + '答：答的第一行\n答的续行必须出现。\n答的第二段续行也要出现。',
+  });
+  const line = itemText(qa, 300);
+  check('（能失败）答的续行进了注入行（旧实现里整段丢失）',
+    line.includes('答的续行必须出现') && line.includes('答的第二段续行也要出现'), line);
+  check('（能失败）问的续行**不进**注入行（题面由标题承担）',
+    !line.includes('属于问句正文'), line);
+  // 答行短、块体长 —— 正是旧实现"注入 30 字符"的形状。
+  // ⚠️ 填充句必须**句句不同**：`dedupeAdjacentSentences`/`collapseRepeats` 会把逐字重复的
+  // 相邻句折成一句（那是既有且正确的行为），用重复填充会让这个用例退化成"确实没东西可放"。
+  const varied = Array.from({ length: 12 }, (_, n) => `第${n + 1}句答案正文，旧实现里它一个字都进不了注入行。`).join('');
+  const shortAnswer = makeRecord({
+    layer: 'raw', title: '短答长体', compactionId: 'c2',
+    text: `问：这一问很长。\n答：三个都清楚了。\n${varied}`,
+  });
+  const shortLine = itemText(shortAnswer, 300);
+  check('（能失败）"答行很短、块体很长"的块必须把 300 字符预算用满（旧实现只注入 30 字符）',
+    shortLine.length >= 290, `实际=${shortLine.length} 字符`);
+  // 同一行里的 `问：…答：…`
+  const inline = makeRecord({ layer: 'raw', title: '同行', compactionId: 'c3', text: '问：同行的问 答：同行的答' });
+  check('`问：…答：…` 同行写法照旧收答段', itemText(inline, 300).includes('同行的答'), itemText(inline, 300));
+  // 无前缀的正文（首行就是普通正文）不属于任何段，不能被当成"答的续行"
+  const plain = makeRecord({ layer: 'summary', title: '无结构', compactionId: 'c4', text: '开头一句普通正文。后面还有正文。' });
+  check('无问答结构时行为不变（照样取开头正文）', itemText(plain, 300).includes('开头一句普通正文'), itemText(plain, 300));
+}
+
+console.log('\n=== 32. ⑨ Bug 2：纯数字与短标识符必须能进索引（可检索） ===');
+{
+  /* 旧正则 `[A-Za-z][A-Za-z0-9_+\-.#/]{1,}` **要求首字符是字母** → 纯数字串被整段跳过，
+   * 而 CJK bigram 也不覆盖数字；`-`/`_`/驼峰边界也没有拆开。
+   * 后果（第三方在 3 个库 × 12 种门配置下实测）：`252是什么`、`stickyRecall省多少` **0 候选**。
+   * 能失败的验证：把 `LATIN_WORD_RE` 改回旧正则、并把标识符拆分去掉 → 下面每条都红。
+   */
+  check('（能失败）tokenize(\'252是什么\') 含 252', tokenize('252是什么').includes('252'), JSON.stringify(tokenize('252是什么')));
+  check('（能失败）tokenize(\'stickyRecall 省多少\') 含 stickyrecall',
+    tokenize('stickyRecall 省多少').includes('stickyrecall'), JSON.stringify(tokenize('stickyRecall 省多少')));
+  check('（能失败）小数保留：tokenize(\'0.28\') 含 0.28', tokenize('0.28').includes('0.28'), JSON.stringify(tokenize('0.28')));
+  check('带单位的只取数字部分：tokenize(\'34.3%\') 含 34.3', tokenize('34.3%').includes('34.3'), JSON.stringify(tokenize('34.3%')));
+  check('标识符整串保留（整词精确命中不被削弱）',
+    tokenize('dsh-compaction-memory').includes('dsh-compaction-memory')
+    && tokenize('maxCharsPerItem').includes('maxcharsperitem'),
+    JSON.stringify(tokenize('dsh-compaction-memory')));
+  check('标识符额外产出结构片段（kebab / snake / camel）',
+    tokenize('kebab-case').includes('kebab') && tokenize('snake_case').includes('snake')
+    && tokenize('camelCase').includes('camel') && tokenize('camelCase').includes('case'),
+    JSON.stringify(tokenize('kebab-case snake_case camelCase')));
+  // 证据门的口径必须还是"用户表面词"——否则门会在标识符查询上悄悄升高（既有标定失效）
+  check('门的分子分母仍是表面词：matchedTermsFloor(\'252是什么\') = 1', matchedTermsFloor('252是什么') === 1, `实际=${matchedTermsFloor('252是什么')}`);
+  check('门的分子分母仍是表面词：matchedTermsFloor(\'stickyRecall 省多少\') = 3（不是展开后的 5）',
+    matchedTermsFloor('stickyRecall 省多少') === 3, `实际=${matchedTermsFloor('stickyRecall 省多少')}`);
+  check('门的分子分母仍是表面词：`撤掉参考块要付多少token？` 仍是 4（与此前标定一致）',
+    matchedTermsFloor('撤掉参考块要付多少token？') === 4, `实际=${matchedTermsFloor('撤掉参考块要付多少token？')}`);
+  // 端到端：库里放一条含 252 的块，修前是"查询 0 token → 0 候选"
+  const numeric = [
+    makeRecord({ layer: 'raw', title: '成本账', compactionId: 'n1', text: '答：撤掉参考块要付 252 token；整份 1054 字符 ≈ 252 token。' }),
+    makeRecord({ layer: 'raw', title: '无关块', compactionId: 'n2', text: '今天天气不错，适合出门散步。' }),
+  ];
+  const nIdx = new MemoryIndex(numeric);
+  const nHits = nIdx.search('252是什么', { limit: 5 });
+  check('（能失败）端到端：库里有 252 的块时「252是什么」必须召回（修前 0 候选）',
+    nHits.length > 0 && String(nHits[0].record.title) === '成本账',
+    `候选=${nHits.length} top=${nHits[0]?.record?.title}`);
+  const idIdx = new MemoryIndex([
+    makeRecord({ layer: 'raw', title: '开关', compactionId: 'n3', text: '答：`stickyRecall`（默认开）直接省掉那 252 token。' }),
+    makeRecord({ layer: 'raw', title: '别的', compactionId: 'n4', text: '晚饭做番茄炒蛋。' }),
+  ]);
+  const iHits = idIdx.search('stickyRecall 省多少', { limit: 5 });
+  check('（能失败）端到端：标识符查询「stickyRecall 省多少」必须召回（修前 0 候选）',
+    iHits.length > 0 && String(iHits[0].record.title) === '开关',
+    `候选=${iHits.length} top=${iHits[0]?.record?.title}`);
+  // 无关查询仍不注入（这两条是任务点名要求的）
+  for (const q of ['帮我写一封请假邮件', '今天是2024年几月几号']) {
+    check(`（能失败）无关查询不注入：${q}`,
+      retrieveTwoTier(nIdx, q, { minScore: 0.28, maxItems: 2 }).hits.length === 0
+      && retrieveTwoTier(idIdx, q, { minScore: 0.28, maxItems: 2 }).hits.length === 0, q);
   }
 }
 
