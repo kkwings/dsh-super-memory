@@ -18,13 +18,13 @@ import { fileURLToPath } from 'node:url';
 
 import { DEFAULTS, EDITABLE_FIELDS, INTEGER_BOUNDS, INTEGER_FIELDS, KNOWN_WORKSPACES_MAX, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo, shortHash } from '../lib/config.js';
 import {
-  MARKER, MARKER_END, containment, estimateTokens, extractTitle, neutralizeHeaderText,
+  MARKER, MARKER_END, TIME_REFERENCE_TERMS, containment, estimateTokens, extractTitle, neutralizeHeaderText,
   tokenize,
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
   hasTimeReference, splitQuerySegments, timeReferenceWindows,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords, clampToolText, toolRecordText, toolRecords, toolBodyOf, selfSourcePath } from '../lib/ingest.js';
-import { MemoryIndex, MATCHABLE_TOP_K, localTopScore, matchedTermsFloor, retrieveSegmented, retrieveTwoTier } from '../lib/retrieval.js';
+import { MemoryIndex, MATCHABLE_TOP_K, TIME_REFERENCE_BOOST, localTopScore, matchedTermsFloor, retrieveSegmented, retrieveTwoTier } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import {
   NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, queryForMessage, questionTextOf, queryTextOf, selectFreshHits,
@@ -2586,8 +2586,17 @@ console.log('\n=== 34. 分段检索 + 合并：多话题不丢，单段退化为
   const QB = makeRecord({ layer: 'raw', title: 'B：按钮不见了', compactionId: 'g2', text: '问：按钮凭空不见了怎么办？答：组件渲染的钩子写乱了，改回去就恢复。' });
   const index = new MemoryIndex([QA, QB]);
   const MULTI = '我这边有两个问题：一个是单轮注入上限到底是多少 token 来着？另一个是那个按钮凭空不见了，是不是组件渲染的钩子写乱了？';
-  check('（前提）多话题消息确实被切成 2 段（否则这条断言是空转）',
-    splitQuerySegments(MULTI).length === 2, `实际=${splitQuerySegments(MULTI).length} 段`);
+  /* 2026-10-10 缺陷 A 修完，这条多话题消息切成 **3** 段：`引导语：` 自己一段，两个问句各一段。
+   * 断言跟着行为更新，但**意图不变**（仍是"多话题不丢"）：段数 ≥2、且**每个问句各自成段**。
+   * 只钉"段数恰好等于某个数"会让这条断言变成"实现细节的快照"，
+   * 所以下面同时钉住"两句话分别在各自的段里"。 */
+  const multiSegs = splitQuerySegments(MULTI);
+  check('（前提）多话题消息被切成 ≥2 段，且两个问句各自成段（否则下面的断言是空转）',
+    multiSegs.length >= 2
+    && multiSegs.some((s) => s.includes('单轮注入上限到底是多少'))
+    && multiSegs.some((s) => s.includes('按钮凭空不见了'))
+    && multiSegs.every((s) => (s.match(/[？?]/g) ?? []).length <= 1),
+    `实际=${multiSegs.length} 段 ${JSON.stringify(multiSegs.map((s) => s.slice(0, 16)))}`);
   const whole = retrieveTwoTier(index, MULTI, { minScore: 0.28, maxItems: 2 });
   const seg = retrieveSegmented(index, MULTI, { minScore: 0.28, maxItems: 2 });
   const segIdx = seg.hits.map((h) => index.records.indexOf(h.record));
@@ -2611,6 +2620,54 @@ console.log('\n=== 34. 分段检索 + 合并：多话题不丢，单段退化为
   const noPunct = '撤掉参考块要付多少 token 这件事我一直想确认一下 参考块挂住不放更省';
   check('（能失败）没有句读的整段不切（仍是 1 段，走兜底）',
     splitQuerySegments(noPunct).length === 1, `实际=${splitQuerySegments(noPunct).length}`);
+
+  /* ── 2026-10-10 缺陷 A：切句规则必须"留住真问句" ─────────────────────────────
+   * 真实用例（逐字取自用户）：引导语 + 真问句 + 尾句。旧切法把真问句**粘在 22 字引导语后面**，
+   * 于是问句的分数被那句废话摊薄（真库实测 0.5310 vs 独立成段 0.6654），
+   * 而"过短片段并入邻居"又会把它整个吞掉 —— 最后检索去命中不相干的块。
+   * 下面四条逐条对应要求 ①②③④，每一条都能被"退回旧切法"打红。 */
+  const LEAD = '做吧，顺便我给你提供一个可以拿来验证的问题：';
+  const REAL_Q = '我们最早聊控制面板的时候是怎么定的？';
+  const TAIL = '你可以尝试调整之后用这个问题去检索命中率。';
+  const REAL = `${LEAD}${REAL_Q}${TAIL}`;
+  const segsA = splitQuerySegments(REAL);
+  check('（能失败·缺陷A①）含疑问语气的片段必须独立成段（不被并进邻居）',
+    segsA.includes(REAL_Q), `实际分段=${JSON.stringify(segsA)}`);
+  check('（能失败·缺陷A②）冒号/顿号后的短引导语是边界（引导语自己一段，后面的问句独立成段）',
+    JSON.stringify(splitQuerySegments('我看了下：那事到底怎么办？'))
+      === JSON.stringify(['我看了下：', '那事到底怎么办？']),
+    `实际=${JSON.stringify(splitQuerySegments('我看了下：那事到底怎么办？'))}`);
+  check('（能失败·缺陷A③）短片段合并**不吞问句**：问句段长度可以短于 minChars 仍然独立',
+    splitQuerySegments('行。那事怎么办？', { minChars: 12 }).includes('那事怎么办？'),
+    `实际=${JSON.stringify(splitQuerySegments('行。那事怎么办？', { minChars: 12 }))}`);
+  check('（能失败·缺陷A④）不丢字符：分段拼回去（去掉空白）与原文一致',
+    segsA.join('').replace(/\s+/g, '') === REAL.replace(/\s+/g, ''),
+    `拼回=${JSON.stringify(segsA.join(''))}`);
+  check('（前提）这条用例的分段数 ≥2（否则"独立问句"无从谈起）',
+    segsA.length >= 2, `实际=${segsA.length} 段`);
+  /* ── 两条"对照"断言（2026-10-10 改期望值；**意图没放宽，只把意图写准**）────────────
+   * 旧的期望值是按 `minChars=12` 写的，而 12 已被实测否定（见 `splitQuerySegments` 的标定表）：
+   *   · 旧期望① `…（两句 → 2 段）`：两条 9 字句被并成 1 段而**变红** —— 这正是"12 太粗"的证据
+   *     （9–12 字的正常短句被并进邻居；真实库实测 4 条提问中招）。新期望按 `minChars=6` 给出：
+   *     两句**各自成段** —— 守的仍是它本来要守的东西："没有引导语边界时，仍按既有切句规则走"
+   *     （`。` 就是既有边界）。
+   *   · 旧期望② `['行。那事怎么办？']`：要求"短片段并进下一句"—— 但下一句是**问句**，
+   *     而新实现的意图恰恰是"**短片段不并进问句**"（依据：问句粘 22 字引导语 0.5310，
+   *     独立成段 0.6654）。所以新期望改成断言**新意图**：`行。` 与问句各自成段、问句里不含 `行。`。
+   *     它守的"不许新增『仅因短就断开』的行为"也没丢：`行。` 只有 2 字，它独立成段不是因为短，
+   *     而是因为它**排在问句前面**（`landPending` 找不到可并的非问句邻居才自成段）——
+   *     紧接着第三条对照钉的就是这一点：同样短的 `行。` 后面若接**非问句**，仍必须并回去。 */
+  check('（对照）没有冒号边界时仍按既有切句走（两句 → 2 段，9 字短句不被 minChars 吞掉）',
+    JSON.stringify(splitQuerySegments('第一句先说点别的。第二句继续说点别的。')) === JSON.stringify(['第一句先说点别的。', '第二句继续说点别的。']),
+    `实际=${JSON.stringify(splitQuerySegments('第一句先说点别的。第二句继续说点别的。'))}`);
+  const shortLead = splitQuerySegments('行。那事怎么办？');
+  check('（对照·新意图）短片段不并进问句：`行。` 独立成段，问句独立成段且不含 `行。`',
+    JSON.stringify(shortLead) === JSON.stringify(['行。', '那事怎么办？'])
+    && !shortLead.find((s) => /[？?]/.test(s)).includes('行。'),
+    `实际=${JSON.stringify(shortLead)}`);
+  check('（对照）短片段后面不是问句时，仍按既有规则并回去（没有新增"仅因短就断开"的行为）',
+    JSON.stringify(splitQuerySegments('行。那事先放着。')) === JSON.stringify(['行。 那事先放着。']),
+    `实际=${JSON.stringify(splitQuerySegments('行。那事先放着。'))}`);
 }
 
 console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 条） ===');
@@ -2628,13 +2685,25 @@ console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 
     makeRecord({ layer: 'raw', at: LATE, title: '水果与菜', compactionId: 'h3', text: '今天水果买多了，晚饭做番茄炒蛋，番茄炒蛋要不要放糖一直在纠结。' }),
   ]);
 
-  // ── 识别口径：逐字取自用户要求，且**扫全部位置**（不许假设在句首/句末）──
-  for (const term of ['之前', '原来', '上次', '最早', '当初', '刚才', '前面', '上面', '以前', '曾', '那时', '早先']) {
+  // ── 识别口径：**最终词表逐字列在这里**（表变了就必须同步改这一行，改不动就是遗漏）──
+  /* 2026-10-10 缺陷 B：旧表**没有"第一次"**，于是 `hasTimeReference('我们第一次聊到…')` 返回 false
+   * —— 而"第一次"正是最口语的时间指代词。现在按**包含式（子串）**匹配，
+   * "第一次提到 / 第一次聊到" 也都算。 */
+  const ZH_TERMS = ['第一次', '最早', '原先', '原来', '上次', '上回', '之前', '先前', '早先', '当初', '刚才', '刚刚', '前面', '上面', '以前', '曾', '那时', '当时', '最初', '初次', '首度'];
+  const EN_TERMS = ['before', 'earlier', 'last time', 'previously', 'originally', 'used to'];
+  eq('（能失败）时间指代词词表与 README/注释一致（表一变这条就红）',
+    [...TIME_REFERENCE_TERMS], [...ZH_TERMS, ...EN_TERMS]);
+  for (const term of ZH_TERMS) {
     check(`（能失败）中文指代词「${term}」被认出来`, hasTimeReference(`随便写点东西，${term}我们聊过这件事。`), term);
   }
-  for (const term of ['before', 'earlier', 'last time', 'previously', 'originally']) {
+  for (const term of EN_TERMS) {
     check(`（能失败）英文指代词「${term}」被认出来`, hasTimeReference(`please check ${term} we discussed it`), term);
   }
+  check('（能失败·缺陷B1）「第一次」在**真实用例**里被认出来（旧表漏掉的就是它）',
+    hasTimeReference('我们第一次聊到控制面板的时候是怎么说的？'));
+  check('（能失败·缺陷B1）中文是**包含式**匹配：「第一次提到」也算',
+    hasTimeReference('我们第一次提到这件事是在哪一轮？'));
+  check('（能失败·缺陷B1）英文大小写不敏感', hasTimeReference('We used to discuss this.') && hasTimeReference('AS DISCUSSED BEFORE'));
   check('对照：不含任何指代词时判 false', !hasTimeReference('我看了文档也问了别人，目前定过的东西现在想确认一下。'));
   /* ⚠️ 位置通用性必须用**足够长**的问题测：短消息里 ±60 字符会覆盖全文，
    * `timeReferenceWindows` 会按设计返回空（那是"没有集中"，见上面的常量注释）。
@@ -2656,9 +2725,15 @@ console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 
   check('（能失败）整条消息都落在窗口里时不产出窗口（那是"降阈值"不是"集中"）',
     timeReferenceWindows('之前这样行吗').length === 0, JSON.stringify(timeReferenceWindows('之前这样行吗')));
 
-  // ── 判定性用例：指代词在上一句末尾、真问句在下一句，两句各自都过不了证据门 ──
+  // ── 判定性用例：窗口**只做附加证据**（缺陷 B 收敛后的核心性质）────────────────
+  /* 旧行为（已修）：窗口单独成一路，**能把任何一段都没命中的块拉进候选**；
+   * 实测后果是"恰好含『最早』二字但不相关"的块被抬上来（真实库上 20/59 条含指代词提问发生过）。
+   * 新规则：候选集合完全由各段决定；窗口命中只把**已有候选**的分数乘 `TIME_REFERENCE_BOOST`。
+   * 下面两组断言分别钉住新规则的两个方向（**都能失败**）：
+   *   ① 只被窗口命中的块 → **不许进候选**（把 `boostExisting` 改回 `merge` 立刻红）；
+   *   ② 已经是候选的块 → 窗口命中后**分数必须更高**（把窗口那一步删掉立刻红）。 */
   const S1 = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
-    + '有些细节当时写下来觉得清楚，过一段时间再看就模糊了，所以我才想再确认一下那份参考块之前。';
+    + '有些细节写下来觉得清楚，过一段时间再看就模糊了，所以我才想再确认一下那份参考块之前。';
   const S2 = '那个 252 到底是多少。';
   const DISTANT = `${S1}${S2}`;
   const matchedOf = (text) => {
@@ -2674,11 +2749,51 @@ console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 
     `段1=${matchedOf(S1)}/${matchedTermsFloor(S1)} 段2=${matchedOf(S2)}/${matchedTermsFloor(S2)} 窗口=${matchedOf(winText)}/${matchedTermsFloor(winText)}`);
   const off = retrieveSegmented(index, DISTANT, { minScore: 0.28, maxItems: 2, timeBoost: false });
   const on = retrieveSegmented(index, DISTANT, { minScore: 0.28, maxItems: 2 });
-  check('（能失败）关掉指代词路 → 目标块**不在候选**；打开 → 进候选（这就是加权效果）',
-    off.hits.length === 0 && on.hits.length === 1 && on.hits[0].record === TARGET,
-    `关=${off.hits.length} 条 开=${on.hits.length} 条`);
-  check('（红线）指代词路也没越过 ≤2 条 / minScore',
-    on.hits.length <= 2 && on.topScore >= 0.28, `条数=${on.hits.length} 分=${on.topScore?.toFixed(4)}`);
+  check('（能失败·缺陷B2①）窗口**不能单独把新块拉进候选**：段都过不了门 → 目标块一条都不进（开关都一样）',
+    off.hits.length === 0 && on.hits.length === 0 && on.segments >= 2,
+    `关=${off.hits.length} 条 开=${on.hits.length} 条 segments=${on.segments}`);
+  /* 断言"这条用例确实有窗口、而且窗口确实能命中目标块" —— 否则上面那条是空测
+   * （万一哪天窗口不再产出，上面就变成"什么都不测也绿"）。 */
+  check('（前提）窗口这一路确实能命中目标块（否则上一条是空测）',
+    matchedOf(winText) >= matchedTermsFloor(winText), `窗口 matched=${matchedOf(winText)}/${matchedTermsFloor(winText)}`);
+
+  // ② 已经有候选的块：窗口命中 → 加分。合成夹具（单块索引，窗口分 > 段分）。
+  {
+    const BOOST_TARGET = makeRecord({ layer: 'raw', at: EARLY, title: 'T', compactionId: 'b1', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省。' });
+    const boostIdx = new MemoryIndex([BOOST_TARGET]);
+    const BOOST_Q = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
+      + '有些细节写下来觉得清楚，过一段时间再看就模糊了。'
+      + '所以我之前确认过那份参考块要付多少。'
+      + '那个到底是多少。';
+    const bOff = retrieveSegmented(boostIdx, BOOST_Q, { minScore: 0.28, maxItems: 2, timeBoost: false });
+    const bOn = retrieveSegmented(boostIdx, BOOST_Q, { minScore: 0.28, maxItems: 2 });
+    check('（前提）这条夹具里目标块本来就是候选（否则"加成"无从谈起）',
+      bOff.hits.length === 1 && bOff.hits[0].record === BOOST_TARGET, `关=${bOff.hits.length} 条`);
+    check('（能失败·缺陷B2②）窗口命中已有候选 → 分数必须被抬高（×TIME_REFERENCE_BOOST 的量级）',
+      bOn.hits.length === 1 && bOn.topScore > bOff.topScore
+      && Math.abs(bOn.topScore - bOff.topScore * TIME_REFERENCE_BOOST) < 1e-9,
+      `关=${bOff.topScore?.toFixed(4)} 开=${bOn.topScore?.toFixed(4)} 系数=${TIME_REFERENCE_BOOST}`);
+  }
+
+  /* ③ 反例："恰好含『最早』二字但不相关"的块 —— 不许仅因窗口进入候选。
+   * 夹具：不相关块里写一句含「最早」的话，窗口落在它上面；段完全不命中它。 */
+  {
+    const NOISE = makeRecord({ layer: 'raw', at: LATE, title: '相机的事', compactionId: 'n1', text: '镜头和相机一直放在柜子里没有用过，二手店大概会给个什么价钱，周末打算去问问。' });
+    const T2 = makeRecord({ layer: 'raw', at: EARLY, title: '撤掉参考块的代价', compactionId: 'n2', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省。' });
+    const noiseIdx = new MemoryIndex([NOISE, T2]);
+    const NOISE_Q = '最近整理文档的时候我翻到最早那台相机，想问问现在还能卖多少钱，顺便把柜子清一清，'
+      + '相机是很多年前买的，镜头也一直在柜子里放着，二手店大概会给个什么价钱呢，'
+      + '撤掉参考块要付多少 token 这件事我确认一下。';
+    const nOff = retrieveSegmented(noiseIdx, NOISE_Q, { minScore: 0.28, maxItems: 2, timeBoost: false });
+    const nOn = retrieveSegmented(noiseIdx, NOISE_Q, { minScore: 0.28, maxItems: 2 });
+    check('（前提）这条反例里"相机"那段自己就能命中（所以"它进候选"不是窗口造成的）',
+      nOff.hits.some((h) => h.record === NOISE), `关=${JSON.stringify(nOff.hits.map((h) => h.record.title))}`);
+    check('（前提）这条反例里确实产出了窗口（否则上一条是空测）',
+      timeReferenceWindows(NOISE_Q).length > 0, JSON.stringify(timeReferenceWindows(NOISE_Q)));
+    check('（前提）打开/关闭窗口加成，候选集合必须完全一致（窗口只加分、不加块）',
+      nOn.hits.map((h) => h.record.fp).join() === nOff.hits.map((h) => h.record.fp).join(),
+      `开=${nOn.hits.length} 关=${nOff.hits.length}`);
+  }
 
   // ── 不含指代词 → 行为**逐位不变** ──
   const PLAIN = '撤掉参考块要付多少 token，参考块撤掉之后快照会怎么样，成本上限一般是多少。';

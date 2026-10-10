@@ -1495,6 +1495,148 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
   console.log(`  ㉖ 段累计：通过 ${d26Passed} 条，失败 ${d26Failed} 条。`);
 }
 
+/* ── 永久回归 ⓐ：真实记忆库上的三条"缺陷 B"回归（2026-10-10）────────────────────────
+ *
+ * 为什么放在这里（而不是 `unit.mjs`）：这三条**必须盯着真实库的块编号**（#15 / #21 / #51），
+ * 而 `unit.mjs` 是**零 I/O 的合成夹具**（它连磁盘都不碰，这是它的价值）。`harness.mjs` 本来
+ * 就是"准宿主 + 真库"的联调脚本，读一份**只读**的真实库正好在它的职责里。
+ *
+ * 库路径：`DSH_SUPER_MEMORY_REAL_STORE`（环境变量）> `<仓库上一级>/.dsh-compaction-memory/
+ * session-d7e61f90-e491-45ad-9378-0b6fc158ca15.jsonl`。文件不存在就 **SKIP 并 exit 0**
+ * （与脚本头的 SKIP 口径一致：不是"代码坏了"，而是"这台机器上没有这份数据"）。
+ * 全程**只读**（只有 `readFileSync`），不写、不建索引文件、不做任何修复。
+ *
+ * 三条期望（用户 2026-10-10 实测给出的精确目标）：
+ *   ① `我们第一次聊到控制面板的时候是怎么说的？` → 命中 10-02 的块（#21 或 #51；库里含
+ *      "控制面板"的块**只有这两个**），且 `hasTimeReference` 对"第一次"必须是 true；
+ *   ② `我最早对设置面板要求的原话是什么？` → 命中 **#15**（含"必须带设置面板"的原话块）；
+ *   ③ 反例 `你今天晚饭吃了什么？` → **0 注入**。
+ * 能失败：把 `TIME_REFERENCE_TERMS` 里的"第一次"删掉 → ①红；把 `splitQuerySegments` 退回
+ * 旧切法 → ①②都要红（问句被粘在引导语后面 / 被并走）；把窗口改回"可单独产生候选" → ①红
+ * （窗口会单独把含"最早"的无关块拉进来，top-2 被挤掉）。实测见本轮报告。 */
+{
+  const realStorePath = process.env.DSH_SUPER_MEMORY_REAL_STORE
+    ?? path.resolve(import.meta.dirname, '..', '..', '..', '.dsh-compaction-memory',
+      'session-d7e61f90-e491-45ad-9378-0b6fc158ca15.jsonl');
+  if (!fs.existsSync(realStorePath)) {
+    console.log('  SKIP 永久回归 ⓐ（缺陷 B 真实库回归） — 找不到真实库：' + realStorePath);
+  } else {
+    const { splitQuerySegments, hasTimeReference, timeReferenceWindows } = await import('../lib/text.js');
+    const { MemoryIndex, retrieveSegmented, TIME_REFERENCE_BOOST } = await import('../lib/retrieval.js');
+    const records = fs.readFileSync(realStorePath, 'utf8').split('\n').filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line));
+    const index = new MemoryIndex(records);
+    /** 块编号：就是它在库里（文件行序）的序号 —— 用户实测给的就是这个口径。 */
+    const indexOf = new Map(records.map((record, i) => [record, i]));
+    let dRealFailed = 0;
+    const expectReal = (label, condition, detail = '') => {
+      if (condition) { console.log(`  ✓ ${label}${detail === '' ? '' : `  — ${detail}`}`); return; }
+      dRealFailed += 1;
+      process.exitCode = 1;
+      console.log(`  ✗ ${label}${detail === '' ? '' : `  — ${detail}`}`);
+    };
+    const ask = (question) => retrieveSegmented(index, question, {
+      minScore: DEFAULTS.minScore, maxItems: DEFAULTS.maxItems, preferSummaryChunks: DEFAULTS.preferSummaryChunks,
+    });
+    const idsOf = (result) => result.hits.map((hit) => `#${indexOf.get(hit.record)}`).join(',') || '（无）';
+    console.log(`  永久回归 ⓐ：真实库 ${records.length} 块（${path.basename(realStorePath)}，只读）`);
+
+    /* ① 控制面板：库里含"控制面板"的块只有 #21 / #51，两条都在 10-02。 */
+    const onlyTwo = records.map((record, i) => [i, record])
+      .filter(([, record]) => String(record.text ?? '').includes('控制面板')).map(([i]) => i);
+    expectReal('（前提）真实库里含「控制面板」的块恰好是 #21 / #51（否则下面的期望没有依据）',
+      JSON.stringify(onlyTwo) === JSON.stringify([21, 51]), `实际=${JSON.stringify(onlyTwo)}`);
+    expectReal('（能失败）「第一次」必须被认成时间指代词（词表漏了它就全盘失效）',
+      hasTimeReference('我们第一次聊到控制面板的时候是怎么说的？'));
+    const q1 = '我们第一次聊到控制面板的时候是怎么说的？';
+    const r1 = ask(q1);
+    const top1 = r1.hits.length > 0 ? indexOf.get(r1.hits[0].record) : -1;
+    expectReal('（能失败·缺陷B）「我们第一次聊到控制面板…」→ top-1 落在 10-02 的块（#21 或 #51）',
+      top1 === 21 || top1 === 51,
+      `segments=${r1.segments} tier=${r1.tier} top=${idsOf(r1)}（期望 #21 或 #51）`);
+
+    /* ② 设置面板：含"必须带设置面板"的原话块是 #15（10-02）。 */
+    const q2 = '我最早对设置面板要求的原话是什么？';
+    const r2 = ask(q2);
+    const top2 = r2.hits.length > 0 ? indexOf.get(r2.hits[0].record) : -1;
+    expectReal('（能失败·缺陷B）「我最早对设置面板要求的原话是什么？」→ top-1 落在 #15（原话块）',
+      top2 === 15, `segments=${r2.segments} tier=${r2.tier} top=${idsOf(r2)}（期望 #15）`);
+
+    /* ③ 反例：与库内容无关的日常问题 → 一条都不许注入。 */
+    const q3 = '你今天晚饭吃了什么？';
+    const r3 = ask(q3);
+    expectReal('（能失败·缺陷B 反例）「你今天晚饭吃了什么？」→ 0 注入（tier=none、hits 为空）',
+      r3.hits.length === 0 && r3.tier === 'none', `tier=${r3.tier} hits=${idsOf(r3)}`);
+
+    /* ③′ **缺陷 A 的那条原句**（用户 2026-10-10 实测的现场）：引导语 + 真问句 + 尾句。
+     * 它是唯一能让"切句退回旧法"变红的回归用例 —— 上面三条都是**单句**，
+     * 整条检索与分段检索等价，退回旧切法照样绿（实测确认）。这条不一样：
+     * 旧切法下真问句被粘在 22 字引导语后面（0.5310）且会被"过短片段并入邻居"吞掉，
+     * 而尾句单独一路会命中 10-08 的无关块（#167 0.6042 / #181 0.5681），
+     * 于是 top-1 落到 10-08（#211/#167/#181 那一片），而不是 10-02 的 #21/#51。 */
+    const q5 = '做吧，顺便我给你提供一个可以拿来验证的问题：我们最早聊控制面板的时候是怎么定的？你可以尝试调整之后用这个问题去检索命中率。';
+    const r5 = ask(q5);
+    const top5 = r5.hits.length > 0 ? indexOf.get(r5.hits[0].record) : -1;
+    expectReal('（能失败·缺陷A）真实原句：top-1 必须落在 10-02 的块（#21 或 #51）',
+      top5 === 21 || top5 === 51, `segments=${r5.segments} tier=${r5.tier} top=${idsOf(r5)}（期望 #21 或 #51）`);
+    expectReal('（能失败·缺陷A）真问句必须独立成段（不被引导语粘住、也不被并入尾句）',
+      splitQuerySegments(q5).includes('我们最早聊控制面板的时候是怎么定的？'),
+      `segments=${JSON.stringify(splitQuerySegments(q5).map((s) => s.slice(0, 16)))}`);
+
+    /* ④ 窗口收敛规则在真实库上的可执行守卫（窗口**不许**单独产生新候选）。
+     * 理想形态是"所有段都过不了门、只有窗口能过门 → 目标块仍然 0 注入"，但真实提问里
+     * 这种形态很难稳定复现（本轮实测 64 条真实提问里满足"分段 + 出窗口"的只有 4 条）。
+     * 这里改用**结构性**判据，它直接对应收敛规则的实现（候选集合完全由各段决定）：
+     *   合并检索里注入的每一条，都必须来自**某一段自己**的候选 —— 窗口命中只算加分。
+     * 旧行为（窗口当独立一路）会把"仅窗口命中"的块并进候选集合，这条就在结构上禁掉了。
+     * ⚠️ 两条实测得到的"别这么写"（写了只会得到假红或空测）：
+     *   · **不能**断言"尾段搜不到 #15"：尾段（"第一次提到设置面板…原话"）像真问题，
+     *     它**自己**就能命中 #15（实测 [15,51,159,…]）。
+     *   · **不能**指望"窗口把 #15 顶进注入"来区分新旧：本轮 64 条真实提问上，
+     *     旧（窗口成路）与新（只加成）的**注入结果逐条相同**（0 条差异）——
+     *     窗口命中的块几乎总能被某个段也命中，所以差异只体现在**候选集合**上，
+     *     而这里正好钉住候选集合。 */
+    const q4 = '顺便说点别的：控制面板那几个开关分别是什么意思。'
+      + '我这两天一直在整理这个插件的文档，把面板说明、注入行取样、成本上限这些内容都重新读了一遍，有些细节当时以为很清楚，过一段时间再看就模糊了，'
+      + '我这两天一直在整理这个插件的文档，把面板说明、注入行取样、成本上限这些内容都重新读了一遍，有些细节当时以为很清楚，过一段时间再看就模糊了，'
+      + '还有第一次提到设置面板的时候，我最早的原话到底是什么？';
+    const segs4 = splitQuerySegments(q4);
+    const r4 = ask(q4);
+    const search = (text, boost) => index.search(text, { layers: ['raw'], limit: 6, ...(boost === undefined ? {} : { boost }) })
+      .map((hit) => indexOf.get(hit.record));
+    const union4 = new Set(segs4.flatMap((segment) => search(segment)));
+    const windows4 = timeReferenceWindows(q4);
+    expectReal('（前提）这条用例确实被切成了 ≥2 段（否则"窗口单独产生候选"无从谈起）',
+      segs4.length >= 2, `segments=${segs4.length} ${JSON.stringify(segs4.map((s) => s.slice(0, 14)))}`);
+    expectReal('（前提）这条用例确实产出了指代词窗口（否则"窗口"那两条是空测）',
+      windows4.length > 0, `windows=${windows4.length}`);
+    /* 前提：窗口**确实**能单独产出候选（这条用例才有区分力）。实测：窗口那 176 字里
+     * #163（2026-10-08，"你说：关于你给我整一大堆英文…"）过了证据门、却没有任何一段命中它 ——
+     * 旧实现（窗口成路）会把它并进候选集合，新实现（只加成）不会。 */
+    const windowOnly = [...new Set(windows4.flatMap((window) => search(q4.slice(window.start, window.end), TIME_REFERENCE_BOOST)))]
+      .filter((id) => !union4.has(id));
+    expectReal('（前提）窗口确实能单独产出候选（旧实现会把它并进来；否则下面那条没有区分力）',
+      windowOnly.length > 0, `窗口单独候选=${JSON.stringify(windowOnly)}`);
+    expectReal('（能失败·缺陷B 收敛）注入的每一条都来自**某一段自己**的候选（窗口只加分、不产生候选）',
+      r4.hits.every((hit) => union4.has(indexOf.get(hit.record))),
+      `注入=${idsOf(r4)} 各段候选并集=${JSON.stringify([...union4].sort((a, b) => a - b))}`);
+    /* 同一条用例的**加权是否真的生效**：关掉指代词那一路后，命中块的分数必须变（更低）。
+     * 它同时钉住"`hasTimeReference` 认得出这条提问"——把"第一次"从词表里删掉，
+     * 这条提问就不再被当作"问了时间指代词"，`timeBoost` 那一路整段不生效，分数逐位相同 → 红。
+     * 这比前面那条 #21/#51 的 top-1 断言更严：只断言"命中哪一块"时，#51 靠"控制面板"三个字
+     * 也能命中，删掉词表照样绿（实测过：那条断言在词表被破坏时仍通过）。 */
+    const nOff = retrieveSegmented(index, q4, {
+      minScore: DEFAULTS.minScore, maxItems: DEFAULTS.maxItems,
+      preferSummaryChunks: DEFAULTS.preferSummaryChunks, timeBoost: false,
+    });
+    const scoreKey = (result) => result.hits.map((hit) => `${indexOf.get(hit.record)}:${Number(hit.score).toFixed(4)}`).join(',');
+    expectReal('（能失败·缺陷B）这条提问含「第一次」→ 指代词加权必须真的生效（关掉后分数/结果逐位不同）',
+      nOff.hits.length > 0 && scoreKey(nOff) !== scoreKey(r4),
+      `关=${scoreKey(nOff)} 开=${scoreKey(r4)}`);
+    console.log(`  永久回归 ⓐ 段累计：通过若干，失败 ${dRealFailed} 条。`);
+  }
+}
+
 /* ── 清理：临时目录用完即清（异常路径由上面的 process 钩子兜底）─────────────
  * 只清插件自己造的目录（临时 DSH_HOME + 沙箱工作区），**不动**用户传进来的 workdir。
  * 本机曾在 `%TEMP%` 里残留 76 个 `dsm-harness-home-*`，就是因为这条只在正常结束路径执行。 */

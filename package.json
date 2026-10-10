@@ -1,6 +1,6 @@
 {
   "name": "dsh-super-memory",
-  "version": "0.2.3",
+  "version": "0.2.5",
   "type": "module",
   "description": "跨压缩记忆：同一个超长会话被压缩多次后，早前问过/定过的事仍能被检索到并作为参考注入。压缩时入库（0 模型调用），提问时本地检索、命中才注入。",
   "main": "./lib/host.js",
