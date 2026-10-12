@@ -1911,15 +1911,28 @@ console.log('\n=== 29. C2.3：「恢复默认设置」逐键重置，但保留�
 
 console.log('\n=== 30. 入库体积收口：每条工具结果 ≤ toolResultMaxChars ===');
 {
+  /* 平台中立的夹具根：本插件自己的目录（两个平台都是绝对路径），以及它**同级**的一个
+   * 用户项目目录 —— `path.join(pluginRoot, '..', …)` 只是拼字符串，`selfSourcePath` 内部
+   * 会 `resolve` 掉 `..`，所以结果稳定落在插件目录之外。 */
+  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const userProject = path.join(pluginRoot, '..', '用户项目');
   /* 真实缺陷（2026-10-08 修）：`toolRecords` 早先是**先切后拼** ——
    *   text = `${text.slice(0, maxChars)}…（原 N 字符，已截断）``，落盘时再拼上 `【工具 …】` 首行,
    * 于是记录 text 的长度 = maxChars + 60~70。真实夹具库里实测 22/210 条越界，最大 4068（上限 4000）。
    * 现在收口在一个纯函数（`clampToolText` + `toolRecordText`），并在 `rawRecords` 的合并出口
    * **再收口一次**（那是唯一绕不过去的点）。
    * 能失败：把 `toolRecords` 里的 `toolRecordText(...)` 换回 `text.slice(0, maxChars) + 首行`
-   * （或把出口那行 `clampToolRecord` 删掉），下面第 1/2/6/7 条立刻红。 */
-  const longTarget = `E:\\项目\\docs\\${'很长的目录名'.repeat(12)}\\spec.md`;
-  const tinyTarget = `E:\\项目\\${'很长的目录名'.repeat(30)}\\spec.md`; // 目标长到标题被 slice(0, 60) 截断
+   * （或把出口那行 `clampToolRecord` 删掉），下面第 1/2/6/7 条立刻红。
+   *
+   * ⚠️ 夹具路径必须**平台中立**（2026-10-12，Linux CI 实测）：
+   * 这里原先写死成 Windows 形态的 `E:\项目\…`（含 `cwd`）。`selfSourcePath` 用的是
+   * **平台原生**路径语义：`path.isAbsolute('E:\\项目\\x')` 在 Windows 上是 true，在 POSIX
+   * 上是 false（`E:` 只是普通文件名），于是它被 `resolve(cwd, …)` 解释成**相对路径**、
+   * 正好落进插件目录里 —— 判成"读的是插件自己"→ `selfSourceSkipped++` → 整条被丢掉，
+   * `records.length` 变 0，下一行 `records[0].text` 直接抛 TypeError。
+   * 所以下面所有路径都从 `pluginRoot` 推出来，两个平台都落在插件目录**之外**。 */
+  const longTarget = path.join(userProject, 'docs', '很长的目录名'.repeat(12), 'spec.md');
+  const tinyTarget = path.join(userProject, '很长的目录名'.repeat(30), 'spec.md'); // 目标长到标题被 slice(0, 60) 截断
   const huge = '工具结果正文。'.repeat(40000); // 28 万字符（任务要求量级的 40 万字符同口径）
   const huge400k = '工具结果正文。'.repeat(60000); // 42 万字符
   const settings = {
@@ -1934,37 +1947,40 @@ console.log('\n=== 30. 入库体积收口：每条工具结果 ≤ toolResultMax
   });
   const ingest = (events, overrides = {}) => rawRecords({
     session: { snapshotEvents: () => events }, sessionId: 's', compactionId: 'c1', at: '2026-10-08T00:00:00.000Z',
-    range: { start: 1, end: 99 }, settings: { ...settings, ...overrides }, cwd: 'E:\\项目',
+    range: { start: 1, end: 99 }, settings: { ...settings, ...overrides }, cwd: userProject,
   });
 
   // ① 40 万字符 → 入库记录 ≤ 上限（且真的还是"截断过"的那条）
   const big = ingest([call('c1', 'read', longTarget), result('c1', huge400k)]);
   eq('40 万字符的工具结果仍然入库（不是被整条丢掉）', big.records.length, 1);
-  check('入库记录 ≤ toolResultMaxChars（4000）', big.records[0].text.length <= 4000,
-    `实际=${big.records[0].text.length}`);
-  eq('长度恰好用满上限（不是"提前砍一大截"）', big.records[0].text.length, 4000);
+  // 先断条数、再取 [0]：条数为 0 时这里必须给出可读的失败信息，
+  // 而不是让 `records[0].text` 抛 TypeError 把整段输出截断（CI 上就是这么炸的）。
+  eq('入库记录本身带 text 字段（条数为 0 时先在这里红，不抛异常）',
+    typeof big.records[0]?.text, 'string');
+  check('入库记录 ≤ toolResultMaxChars（4000）', big.records[0]?.text.length <= 4000,
+    `实际=${big.records[0]?.text.length}`);
+  eq('长度恰好用满上限（不是"提前砍一大截"）', big.records[0]?.text.length, 4000);
   eq('截断计数照旧 +1', big.toolTruncatedItems, 1);
   // ② 上限设成 200（面板下限）也要 ≤ 200；目标长到标题被截断时同样成立
   const small = ingest([call('c2', 'read', tinyTarget), result('c2', huge, 3)], { toolResultMaxChars: 200 });
-  check('上限 200 时记录 ≤ 200（含首行与截断说明）', small.records[0].text.length <= 200,
-    `实际=${small.records[0].text.length}`);
+  check('上限 200 时记录 ≤ 200（含首行与截断说明）', small.records[0]?.text.length <= 200,
+    `实际=${small.records[0]?.text.length}`);
   // ③ 量级守恒：上限越大留下的正文越多（不是"一律砍到同一长度"）
   const mid = ingest([call('c3', 'read', longTarget), result('c3', huge, 5)], { toolResultMaxChars: 800 });
   check('上限 800 与 4000 留下不同长度的正文（说明上限真的在起作用）',
-    mid.records[0].text.length > 200 && mid.records[0].text.length <= 800,
-    `800→${mid.records[0].text.length}`);
+    mid.records[0]?.text.length > 200 && mid.records[0]?.text.length <= 800,
+    `800→${mid.records[0]?.text.length}`);
   // ④ **另一条出口**（被压掉那段只有工具结果、没有对话轮）也必须 ≤ 上限
   const toolsOnly = ingest([call('c4', 'web_fetch', 'https://example.com/a'), result('c4', huge, 7)]);
-  check('"只有工具结果"那条出口同样 ≤ 上限', toolsOnly.records[0].text.length <= 4000,
-    `实际=${toolsOnly.records[0].text.length}`);
+  check('"只有工具结果"那条出口同样 ≤ 上限', toolsOnly.records[0]?.text.length <= 4000,
+    `实际=${toolsOnly.records[0]?.text.length}`);
   // ⑤ 自指噪声：读本插件自己的文件不入 L2，但**诊断计数照记**
-  const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   const self = ingest([
     call('c5', 'read', path.join(pluginRoot, 'scripts', 'harness.mjs')), result('c5', huge, 9),
-    call('c6', 'read', 'E:\\项目\\src\\app.ts'), result('c6', '用户项目的源码正文'.repeat(200), 11),
+    call('c6', 'read', path.join(userProject, 'src', 'app.ts')), result('c6', '用户项目的源码正文'.repeat(200), 11),
   ]);
   eq('读插件自己的源码 → 不入 L2', self.records.length, 1);
-  eq('留下来的那条是用户项目的文件', self.records[0].title.includes('app.ts'), true);
+  eq('留下来的那条是用户项目的文件', self.records[0]?.title.includes('app.ts'), true);
   eq('诊断计数 selfSourceSkipped=1（跳过不是静默的）', self.toolSelfSourceSkipped, 1);
   eq('用户项目那条照常入库（没有扩大成"排除所有代码文件"）', self.toolKept, 1);
   // 相对路径（工作区 cwd = 插件根）同样算自指
@@ -1993,7 +2009,7 @@ console.log('\n=== 30. 入库体积收口：每条工具结果 ≤ toolResultMax
   const builtDirect = toolRecords({ events: [call('c10', 'read', longTarget), result('c10', huge, 23)], settings });
   eq('（前提）构造处产出了 1 条工具记录', builtDirect.records.length, 1);
   check('构造处（toolRecords）本身就 ≤ 上限（不依赖出口兜底）',
-    builtDirect.records[0].text.length <= 4000, `实际=${builtDirect.records[0].text.length}`);
+    builtDirect.records[0]?.text.length <= 4000, `实际=${builtDirect.records[0]?.text.length}`);
   check('（对照）旧写法在同一份输入上会越界（说明这条断言不是恒真）',
     4000 + `【工具 read 的结果 · ${longTarget.replace(/\\/g, '/').split('/').slice(-2).join('/')}】\n`.length
       + '…（原 420000 字符，已截断）'.length > 4000,
@@ -2006,29 +2022,29 @@ console.log('\n=== 30. 入库体积收口：每条工具结果 ≤ toolResultMax
    * 若出口把截断说明重新当成正文装配，占用率会掉到 ~3982/4000 = 99.5%，正文被静默削掉 18 字符。
    * 能失败：把 `clampToolRecord` 里"已在上限内就原样返回"的早返回删掉 → 占用率 < 99.8% → 红。 */
   const large = ingest([call('c8', 'read', longTarget), result('c8', huge, 17)]);
-  const occupancy = large.records[0].text.length / 4000;
+  const occupancy = (large.records[0]?.text.length ?? 0) / 4000;
   check('出口收口对"已经夹好"的记录是幂等的（占用率不下降，正文不被静默削掉）',
-    occupancy >= 0.998, `占用率=${(occupancy * 100).toFixed(2)}%（长度 ${large.records[0].text.length}）`);
+    occupancy >= 0.998, `占用率=${(occupancy * 100).toFixed(2)}%（长度 ${large.records[0]?.text.length}）`);
   /* 出口收口必须真的在起作用：把"未经收口"的超长文本当正文喂进管线（模拟将来新增的生成路径），
    * 断言落盘记录 ≤ 上限。删掉 `rawRecords` 合并出口那行 `clampToolRecord` → 这一条红。 */
   const overlong = '越界正文。'.repeat(3000); // 1.5 万字符，远超 4000
   const bypass = rawRecords({
     session: {
       snapshotEvents: () => [
-        { type: 'tool/call', seq: 21, data: { callId: 'c9', name: 'read', arguments: JSON.stringify({ file_path: 'E:\\项目\\a\\b.md' }) } },
+        { type: 'tool/call', seq: 21, data: { callId: 'c9', name: 'read', arguments: JSON.stringify({ file_path: path.join(userProject, 'a', 'b.md') }) } },
         result('c9', overlong, 22),
       ],
     },
-    sessionId: 's', compactionId: 'c1', at: 'x', range: { start: 21, end: 22 }, settings, cwd: 'E:\\项目',
+    sessionId: 's', compactionId: 'c1', at: 'x', range: { start: 21, end: 22 }, settings, cwd: userProject,
   });
   check('1.5 万字符的工具结果落盘 ≤ 4000（出口收口在起作用）',
     bypass.records.length === 1 && bypass.records[0].text.length <= 4000,
     `条数=${bypass.records.length} 长度=${bypass.records[0]?.text.length}`);
   // `selfSourcePath` 的窄口径：只认插件目录，别的一律放行
-  eq('selfSourcePath：插件内绝对路径命中', selfSourcePath({ file_path: path.join(pluginRoot, 'lib', 'host.js') }, 'E:\\项目', pluginRoot) !== '', true);
-  eq('selfSourcePath：用户项目相对路径不命中', selfSourcePath({ file_path: 'src/app.ts' }, 'E:\\项目', pluginRoot), '');
-  eq('selfSourcePath：没有路径参数（如 web_fetch）不命中', selfSourcePath({ url: 'https://x/y' }, 'E:\\项目', pluginRoot), '');
-  eq('selfSourcePath：参数是坏 JSON 字符串时不抛错', selfSourcePath('{不是 JSON', 'E:\\项目', pluginRoot), '');
+  eq('selfSourcePath：插件内绝对路径命中', selfSourcePath({ file_path: path.join(pluginRoot, 'lib', 'host.js') }, userProject, pluginRoot) !== '', true);
+  eq('selfSourcePath：用户项目相对路径不命中', selfSourcePath({ file_path: 'src/app.ts' }, userProject, pluginRoot), '');
+  eq('selfSourcePath：没有路径参数（如 web_fetch）不命中', selfSourcePath({ url: 'https://x/y' }, userProject, pluginRoot), '');
+  eq('selfSourcePath：参数是坏 JSON 字符串时不抛错', selfSourcePath('{不是 JSON', userProject, pluginRoot), '');
   // ⑥ 摘要块是"软上限"的另一件事：maxChars 900 + 并入碎片（`mergeTinyBlocks` 的 minChars 80）
   const summary = summaryRecords({
     sessionId: 's', compactionId: 'c', at: 'x',
