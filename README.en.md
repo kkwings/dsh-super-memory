@@ -11,6 +11,7 @@ After a very long session has been compacted a few times, things you asked or de
 >
 > - It is developed and maintained **with AI assistance** and **may contain defects**. Please **verify it yourself** before relying on it for anything important; issues and pull requests are welcome (see "Licence" below).
 > - It is intended mainly for **learning and testing**, and the author **does not promise ongoing updates**. It is MIT-licensed: **forking, modifying and republishing are all fine**.
+> - **The runtime needs a Node with zstd support**: reading a session log uses `zstdDecompressSync` from `node:zlib`, which is why `engines` declares **`node >= 22.15`**. CI measured **Node 20.20.2 failing at load time with a syntax error** (`does not provide an export named 'zstdDecompressSync'`); **Node 24.x works** and 22.x is checked by the CI matrix. DSH itself reads session logs through the same API, so the floor is the same.
 
 ## What it does and does not do
 

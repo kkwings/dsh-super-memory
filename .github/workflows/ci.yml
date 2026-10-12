@@ -13,16 +13,24 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        node: ['22.x', '24.x']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node }}
 
       # No install step on purpose: the plugin declares no dependencies (only peers that the
       # DSH host provides) and every suite imports Node built-ins only. That is also why a
       # fresh clone can run all of this without a network fetch.
+      #
+      # Node floor: lib/zstd.js imports `zstdDecompressSync` from `node:zlib`. Node 20 does not
+      # export it (first CI run, Node 20.20.2: "does not provide an export named
+      # 'zstdDecompressSync'" — an instant syntax error on import, both platforms). DSH itself
+      # has the same floor: the host reads session logs the same way and carries
+      # node-addon-require-builtin for exactly this class of difference. The matrix runs the two
+      # lines we can verify (22.x latest and 24.x) so the floor is measured, not assumed.
       - name: unit — pure functions (text/tokenizer/BM25/config/retrieval)
         run: node scripts/unit.mjs
 

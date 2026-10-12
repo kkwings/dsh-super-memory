@@ -9,6 +9,7 @@
 >
 > - 本插件**由 AI 协助开发与维护**，**可能存在缺陷**。请在重要场景**自行验证**后再依赖它；发现问题欢迎开 issue 或直接改（见下方「许可」）。
 > - 它主要面向**学习与测试**用途，作者**不保证持续更新**。代码是 MIT 许可，**fork、修改、再发布都可以**。
+> - **运行环境需要带 zstd 支持的 Node**：插件读会话日志要用 `node:zlib` 的 `zstdDecompressSync`，所以 `package.json` 的 `engines` 声明了 **`node >= 22.15`**。CI 实测 **Node 20.20.2 会在加载时直接报语法错**（`does not provide an export named 'zstdDecompressSync'`），**Node 24.x 正常**，22.x 由 CI 矩阵验证。DSH 本体读会话日志用的是同一个 API，所以下限一致。
 
 ## 1. 这是什么 / 解决什么问题
 
