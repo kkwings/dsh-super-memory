@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Self-check suites
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No install step on purpose: the plugin declares no dependencies (only peers that the
+      # DSH host provides) and every suite imports Node built-ins only. That is also why a
+      # fresh clone can run all of this without a network fetch.
+      - name: unit — pure functions (text/tokenizer/BM25/config/retrieval)
+        run: node scripts/unit.mjs
+
+      - name: panel-check — settings keys and panel wiring stay consistent
+        run: node scripts/panel-check.mjs
+
+      - name: panel-render — client slots render against a stubbed host
+        run: node scripts/panel-render.mjs
+
+      # The one that matters most for "is this really installable and callable":
+      # it registers the plugin the way the host does, then actually executes a tool handler
+      # and asserts the result — loadability alone is not enough.
+      - name: host-smoke — register the plugin, then really execute a tool handler
+        run: node scripts/host-smoke.mjs
+
+      # scripts/selftest.mjs and scripts/harness.mjs are NOT run here: they need a real DSH
+      # session log plus a real memory store (they exit 2 without one). They run locally with:
+      #   node scripts/selftest.mjs <session.v4.jsonl.zstd>
+      #   node scripts/harness.mjs  <session.v4.jsonl.zstd> <tmp-dir>
