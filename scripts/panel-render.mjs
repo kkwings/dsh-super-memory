@@ -1424,20 +1424,35 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
       `实际渲染：${afterPublishText.slice(0, 120) || '(空)'}（回归：点 ✕ 后立刻长出的那块被吞了）`);
   }
 
-  /* ── 第二条路径：`MissAction` 的"新问题一到就清"（同一句话重复提问）──────────
-   * 旧代码 `if (now !== lastSeenQuery.current)` 拿**提问文本**当轮次判据：用户按 ✕ 的
-   * 文案"直接继续提问即可"再问一遍同一句话时文本不变 → 永远不触发 → 结果块跟着走。
-   * 新代码的判据抽成 `missActionDecide(探测到的提问, 挂载时的提问)`，这里直接钉它：
-   * 文本相同也必须判"新问题已到"（因为**动作栏实例换了一个**，说明又答了一轮）。
-   * ⚠️ 为什么不整条渲染出来测：桩渲染不会自动重渲染，异步回来的 `ready.lastQuery`
-   * 进不了 effect 的第二次执行（实测：effect 只跑到 `ready` 落地那次）。 */
+  /* ── 第二条路径：**新一轮 `turnTail` 挂载 → 上一轮的 ✕ 结果被清掉**（真正生效的那条）────
+   * 这一段替换原先钉在 `MissAction` 上的判据覆盖。2026-10-12 取证：那条 effect 是**死信号** ——
+   * 它依赖 `ready.lastQuery`，而 `ready` 只被**另一个同样只依赖 `[sessionId]`** 的 effect 写一次
+   *（全文件无轮询、也再无第二次 `/diagnostics`）→ 真机上一次都不执行；它的判据 `missActionDecide`
+   * 只在桩里被直接调用 = **假绿**（已删除）。所以覆盖改成钉**真的会触发**的那条：
+   * 新轮 `turnTail` 挂载 → `noteCurrentTurn` 判"确实往后走了" → `publishMiss(null)`。
+   * ⚠️ 必须走**真实挂载路径**（`renderTailFor` 造新轮 + 真渲染），不能只调纯判据函数——
+   * "只调判据"正是上面那个假绿的成因。 */
   {
     check('✕ 旧写法的判据就是"提问文本变没变"（取证件：源码里不再有那个按文本比较的 ref）',
       !source.includes('lastSeenQuery'),
       '还在用按提问文本比较的 ref —— 陈旧判定仍依赖提问文本');
+    /* 取证件：那条**死信号**（依赖 `ready.lastQuery` 的 effect + 它的判据函数）已删除。
+     * 留着它就是留着"看着有用、真机从不执行"的代码，也是它反复被测试直接调用（假绿）的入口。
+     * ⚠️ 判据只在**去掉注释之后的源码**上做 —— 解释"为什么删掉它""它依赖什么"的注释里会
+     * 自然写出那些名字与依赖数组，把散文也当成残留，会让文档与断言互相打架（本断言前两版
+     * 就是这么假红的：代码已删干净，只剩几句说明它为什么被删的注释）。
+     * 能失败：把那个 effect / 判据函数加回来 → 本条立刻红。 */
+    const codeOnly = source
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^[ \t]*\/\/.*$/gm, '');
+    const deadSignatures = ['const missActionDecide', 'mountedQuery', '[ready?.lastQuery, sessionId]'];
+    check('✕ 死信号已清除：源码里不再有按 `ready.lastQuery` 清结果的 effect 与它的判据函数',
+      deadSignatures.every((n) => !codeOnly.includes(n)),
+      `遗留=${deadSignatures.filter((n) => codeOnly.includes(n)).join('、') || '(无)'}`
+      + ' —— 那条信号的 `ready.lastQuery` 永不变化，真机从不执行；生效的是 `noteCurrentTurn`');
     /* 交互面：真的渲染一次 `MissAction`、真的点一次 ✕ —— 保证"发布结果"这条路径
      * 在加了轮次归属之后**没被修坏**（本轮必须能显示；能失败：把结果块整块吞掉就会红）。
-     * 顺序说明：`missActionDecide` 是在 `MissAction` 渲染时才登记的，所以判据断言放在**后面**。 */
+     * 顺序说明：`noteCurrentTurn` 是在 `MissTail` 渲染时才登记的，所以判据断言放在**后面**。 */
     const originalFetch = globalThis.fetch;
     const session = 'session-q-repeat';
     const reply = (value) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) });
@@ -1507,21 +1522,60 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
         sentBody?.query === '同一句话' && sentBody?.rewrite === true && sentBody?.boost === true,
         `实际请求体=${JSON.stringify(sentBody)}`);
 
-      const decide = globalThis.window?.__dsmTestHooks?.missActionDecide;
-      check('✕ `MissAction` 的陈旧判据已导出（渲染过动作栏之后才登记）', typeof decide === 'function',
-        `hooks=${Object.keys(globalThis.window?.__dsmTestHooks ?? {}).join(',')}（这里是 ${typeof decide}）`);
-      check('✕ 判据：文本**不变**时也算"新问题已到"（同一句话重复提问 = 又答了一轮）',
-        decide?.('同一句话', '同一句话', 2) === true,
-        `decide('同一句话','同一句话',2)=${String(decide?.('同一句话', '同一句话', 2))}（旧写法这里是 false，正是那个回归）`);
-      check('✕ 判据：文本变了 → 清（正常路径不受影响）',
-        decide?.('下一句', '上一句', 1) === true, `decide=${String(decide?.('下一句', '上一句', 1))}`);
-      check('✕ 判据：还没认清"这一轮问的是什么"（挂载时为空）→ 先不动',
-        decide?.('第一句', null, 1) === false, `decide=${String(decide?.('第一句', null, 1))}`);
-      check('✕ 判据：读不到提问（空串）→ 不动（不能凭空调掉用户刚看到的结果）',
-        decide?.('', '上一句', 2) === null, `decide=${String(decide?.('', '上一句', 2))}`);
-      check('✕ 判据：只是同一次探测重复执行（文本不变、次数仍为 1）→ 不误清',
-        decide?.('同一句话', '同一句话', 1) === false,
-        `decide=${String(decide?.('同一句话', '同一句话', 1))}（误清会把刚显示的结果立刻抹掉）`);
+      /* ⭐ 这一段换成钉**真正生效的那条**：新一轮 `turnTail` 挂载（turn 往后走）
+       * → 上一轮的 ✕ 结果被清掉。**走真实挂载路径**（`renderTailFor` 造新轮 + 真渲染），
+       * 不直接调纯判据函数 —— "只调判据"正是先前那次假绿的成因（真机上那条 effect 从不执行）。
+       * 能失败：把 `MissTail` 里 `noteCurrentTurn(...) && … publishMiss(sessionId, null)`
+       * 去掉（或让 `noteCurrentTurn` 永不返回 true）→ 下面带 ⭐ 的几条立刻红。 */
+      const turnCleanSession = `${session}-turn-clean`;
+      hooks.resetMiss?.(turnCleanSession);
+      await renderTailFor(turnCleanSession, 1, 'turnCleanT1');
+      hooks.publishMiss?.(turnCleanSession, { found: true, model: 'turn-clean-marker', excerpt: '第1轮', file: 'E:\\w\\t.md' }, ownerTurnLocation(1));
+      check('✕ 前提：第 1 轮的结果此刻真的在仓库里（否则"被清掉"证明不了什么）',
+        hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(1))?.found === true,
+        `仓库里=${JSON.stringify(hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(1)))}`);
+      // 用户发出下一句 = 第 2 轮开始回答 → 它的 `turnTail` 挂载（真机上必然发生）
+      await renderTailFor(turnCleanSession, 2, 'turnCleanT2');
+      check('✕⭐ 真正生效的清理：新一轮 `turnTail` 挂载（turn 往后走）→ 上一轮的 ✕ 结果被清掉',
+        hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(1)) === null,
+        `第 1 轮仓库里=${JSON.stringify(hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(1)))}`
+        + ' —— 若非 null：用户说的"进行到下一段对话了，上一段后面的提示就该自动关掉"没生效');
+      /* 反向：**同一轮重挂载不算新问题** —— 否则"点完 ✕ 结果立刻消失"。
+       * （同一轮里发布的结果必须还在；`noteCurrentTurn` 对同一轮必须回 false。） */
+      hooks.publishMiss?.(turnCleanSession, { found: true, model: 'same-turn-marker', excerpt: '第2轮', file: 'E:\\w\\s.md' }, ownerTurnLocation(2));
+      const sameTurnIsNew = hooks.noteCurrentTurn?.(turnCleanSession, ownerTurnLocation(2));
+      check('✕⭐ 负向：同一轮重挂载（重渲染 / 虚拟滚动）**不算**新问题、不误清本轮刚发布的那块',
+        sameTurnIsNew === false && hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(2)) !== null,
+        `同一轮重挂载返回 ${String(sameTurnIsNew)}；第 2 轮仓库里=${JSON.stringify(hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(2)))}`
+        + ' —— 返回 true 就是"点完 ✕ 结果立刻消失"');
+      /* 形态 2：**同一句话重复提问**也必须清。这正是当初改动的目的（✕ 的文案就叫用户
+       * "直接继续提问即可"），而本段的桩里 `/diagnostics` 回的 `lastQuery` **恒为同一句话**
+       * —— 靠"提问文本变没变"永远触发不了，只有真轮次往后走才清得掉。 */
+      await renderTailFor(turnCleanSession, 3, 'turnCleanT3');
+      check('✕⭐ 同一句话重复提问（文本不变、只有轮次往后走）也必须清掉上一轮那块',
+        hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(2)) === null,
+        `第 2 轮仓库里=${JSON.stringify(hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(2)))}`
+        + ' —— 若仍非 null：重复同一句话时结果块会一直跟着（用户实测踩到过的洞）');
+      /* 形态 3：**往回走**（历史重放 / 虚拟滚动把更早的轮次后挂载）不算新问题，
+       * 也**不得**清掉自己这一轮刚显示的结果。
+       * ⚠️ 必须**先**把"当前轮次"推到第 6 轮（模拟第 6 轮真的挂载过），**再**让更早的第 5 轮
+       * 后挂载 —— `publishMiss` 只给结果盖章、**不改写**"当前轮次"。若跳过这一步，基线仍停在
+       * 上面第 3 轮挂载时的值，第 5 轮会被算成"往前走"，测到的根本不是"往回走"。
+       * （本断言第一版就是这么错的：把"发布过第 6 轮的结果"误当成"当前轮次已是第 6 轮"。） */
+      const forwardToSix = hooks.noteCurrentTurn?.(turnCleanSession, ownerTurnLocation(6));
+      hooks.publishMiss?.(turnCleanSession, { found: true, model: 'back-marker', excerpt: '第6轮', file: 'E:\\w\\b.md' }, ownerTurnLocation(6));
+      const backwardIsNew = hooks.noteCurrentTurn?.(turnCleanSession, ownerTurnLocation(5));
+      check('✕⭐ 负向：往回走（更早的轮次后挂载）**不算**新问题、不误清自己这一轮刚发布的那块',
+        forwardToSix === true && backwardIsNew === false && hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(6)) !== null,
+        `先到第 6 轮=${String(forwardToSix)}（应为 true）；往回走返回 ${String(backwardIsNew)}（应为 false）；第 6 轮仓库里=${JSON.stringify(hooks.missResultFor?.(turnCleanSession, ownerTurnLocation(6)))}`
+        + ' —— 返回 true 会把刚显示的结果立刻抹掉');
+      check('✕⭐ 正向：确实往后走到新一轮**必须**判为"新问题到达"（否则上一轮那块永远不消失）',
+        hooks.noteCurrentTurn?.(turnCleanSession, ownerTurnLocation(7)) === true,
+        '往后走没被认出来 → 新问题到达时上一轮那块不会自动关掉');
+      hooks.resetMiss?.(turnCleanSession);
+      check('✕ 死信号已撤：`missActionDecide` 不在测试钩子上了（它只服务于那条永不执行的 effect）',
+        globalThis.window?.__dsmTestHooks?.missActionDecide === undefined,
+        `hooks=${Object.keys(globalThis.window?.__dsmTestHooks ?? {}).join(',')}`);
       hooks.resetMiss?.(session);
     } finally {
       globalThis.fetch = originalFetch;
