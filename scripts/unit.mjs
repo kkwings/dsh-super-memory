@@ -18,19 +18,20 @@ import { fileURLToPath } from 'node:url';
 
 import { DEFAULTS, EDITABLE_FIELDS, INTEGER_BOUNDS, INTEGER_FIELDS, KNOWN_WORKSPACES_MAX, SettingsStore, normalizeSettings, validatePatch, resolveDataHome, dataHomeInfo, shortHash } from '../lib/config.js';
 import {
-  MARKER, MARKER_END, TIME_REFERENCE_TERMS, containment, estimateTokens, extractTitle, neutralizeHeaderText,
+  MARKER, MARKER_END, TIME_INTENTS, TIME_INTENT_SHAPES, TIME_REFERENCE_TERMS, containment, estimateTokens,
+  extractTitle, neutralizeHeaderText, timeIntentShapeOf,
   tokenize,
   sanitizeForStorage, stripMarkerSegments, textFromBlocks, tokenSet, jaccard,
-  hasTimeReference, splitQuerySegments, timeReferenceWindows,
+  hasTimeReference, splitQuerySegments, timeReferenceShapeOf, timeReferenceWindows,
 } from '../lib/text.js';
 import { conversationTurns, rawRecords, summaryRecords, clampToolText, toolRecordText, toolRecords, toolBodyOf, selfSourcePath } from '../lib/ingest.js';
-import { MemoryIndex, MATCHABLE_TOP_K, TIME_REFERENCE_BOOST, localTopScore, matchedTermsFloor, retrieveSegmented, retrieveTwoTier } from '../lib/retrieval.js';
+import { MemoryIndex, MATCHABLE_TOP_K, TIME_REFERENCE_BOOST, localTopScore, matchedTermsFloor, rankByTimeIntent, rankQualifiedByTime, retrieveSegmented, retrieveTwoTier, timeCoefficient, timeRankParams } from '../lib/retrieval.js';
 import { buildRecap } from '../lib/recap.js';
 import {
   NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, queryForMessage, questionTextOf, queryTextOf, selectFreshHits,
 } from '../lib/recall.js';
 import {
-  buildPage, formatPage, buildPagePrompt, focusedRewriteSystem, keywordConcentration, pagePickSystem, parseFocusedRewrite, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
+  buildPage, formatPage, buildPagePrompt, focusedRewriteSystem, keywordConcentration, normalizeTimeIntent, pagePickSystem, parseFocusedRewrite, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
 } from '../lib/diagnose.js';
 import { mergeUsage, createLlmGateway } from '../lib/llm.js';
 import { STRONG_HIT_RATIO, RateLimiter, makeRoutes, rewriteRateLimits, sessionLogSizeHint, spawnDetached, strongHitScore } from '../lib/routes.js';
@@ -1150,6 +1151,118 @@ console.log('\n=== 20. /diagnose 的改写：限流 + 模型档位闸门 ===');{
       body: { workspace, session: session3, query: UNRELATED, rewrite: true, boost: true },
     });
     eq('两条路由的限流键互不挤占（键含路径）', rewriteEnvelope?.value?.rewriteThrottled ?? null, null);
+  }
+
+  /* ── 20.1 **✕ 的时间意图不改变"资格"**（2026-10-12 新增；§35 只测了纯函数那一层）────
+   * §35 用 `rankByTimeIntent`（纯函数）钉住"只重排、不改成员"。这一段把同一件事放到**真实
+   * 路由**上再钉一次，因为"资格"在这条路径上有两个额外的落点，纯函数测不到：
+   *   ① **`strong` 的取回**（`found` / `boosting` / `material`）—— 模型挑了谁、要不要保留
+   *      本地结果，都在**时间重排之外**决定；
+   *   ② **`skippedRewrite`**（本地已强命中 → 连改写都不花钱）—— 也就是"意图只能来自
+   *      既有的那一次调用，**不许为了拿到意图而多调一次**"。
+   *
+   * 夹具为什么让 `selectPages` **失败**（`ok: false`）：那是**唯一**能同时满足下面两条的
+   * 分支 ——"改写真的跑过（所以有 intent）"且"注入资料有多条（所以顺序看得出变化）"：
+   *   · 改写要跑 → 本地**不能**强命中（`localBest < skipScore`）。所以这里把 `minScore` 抬到
+   *     **3**（`skipScore = strongHitScore(3) = 4.5`，而这三块同文的 BM25 分只有 1.x）——
+   *     判据是实测出来的：`minScore: 0.9` 时 `localBest` 仍 ≥ 1.35，改写会被整段跳过
+   *     （`rewriteSkipped === true`、`calls === 0`），那三条断言就全红了；
+   *   · 而 `selectPages` 失败那条分支 `strong = orderedFallback`（本地粗筛，最多 3 条，
+   *     **不看** `localTopForQuery`）—— 资料非空，而且**顺序就是重排后的顺序**。
+   *     这正是要观测的东西。
+   *
+   * 能失败（实测过）：
+   *   · 把 `intentShape` 掺进 `found` / `boosting` / `strong` 的**取舍**（例如"意图强就给资料"）
+   *     → 第 2/3 条红；
+   *   · 让"拿意图"单独触发一次 `rewriteQuery`（例如在 `skippedRewrite` 分支里也去问一次）
+   *     → 第 1 条（calls 计数）红；
+   *   · 把 `orderedFallback` 换回 `localFallback`（= 不重排）→ 第 4 条红（`both_ends` 与
+   *     `none` 的顺序不再不同）。 */
+  {
+    const intentWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-intent-'));
+    const intentRoot = storeRoot(intentWorkspace, '.dsh-compaction-memory');
+    const intentSession = `session-intent-${Date.now()}`;
+    const INTENT_TEXT = '结论：单轮注入上限从 500 提到 700，两条满额中文块才装得下。';
+    /* 三块**正文完全相同**（于是字面分相同）、只有 `at` 不同 → 顺序差异**只可能**来自时间系数。
+     * `fp` 显式覆盖：正文相同会让 `MemoryIndex` 的去重把它们并成一块。 */
+    const markIntent = (title, at, fp) => {
+      const record = makeRecord({ layer: 'summary', session: intentSession, at, title, compactionId: `it-${fp}`, text: INTENT_TEXT });
+      record.fp = fp;
+      return record;
+    };
+    appendRecords(intentRoot, intentSession, [
+      markIntent('最早那条', '2026-10-01T00:00:00.000Z', 'unit-intent-early'),
+      markIntent('中间那条', '2026-10-05T00:00:00.000Z', 'unit-intent-mid'),
+      markIntent('最新那条', '2026-10-09T00:00:00.000Z', 'unit-intent-late'),
+    ]);
+    const INTENT_Q = '单轮注入上限从 500 提到 700 这件事我们是怎么定的，两条满额中文块真的装得下吗';
+    /* 假网关把同一个意图灌进**每一次**改写调用，并记录调用次数 ——
+     * 次数是"✕ 的模型调用次数不增加"这条硬约束的唯一判据。 */
+    const runIntent = async (intent) => {
+      const count = { calls: 0 };
+      const routes = makeRoutes({
+        settings: { get: () => ({ settings: { ...DEFAULTS, minScore: 3, protectRecentDays: 0, storeDir: '.dsh-compaction-memory', llmMode: 'custom', llmAssistEnabled: true, llmRecallRewrite: true } }) },
+        diag: { write: () => {} },
+        states: new Map(),
+        knownWorkspaces: () => [intentWorkspace],
+        build: 'test',
+        llm: {
+          rewriteQuery: async () => { count.calls += 1; return { ok: true, terms: [], point: '', intent, cached: false }; },
+          // 失败分支：`strong` 退回本地粗筛（多条）→ 注入资料的**顺序**就是重排后的顺序。
+          selectPages: async () => ({ ok: false, code: 'TIMEOUT', hint: '假模型超时', asked: 1, page: 1 }),
+          status: () => ({ enabled: true }),
+        },
+        dataHome: intentWorkspace,
+        findSession: (id) => (id === intentSession ? { id, header: { cwd: intentWorkspace }, snapshotEvents: () => [] } : null),
+        boostFor: () => true,
+      });
+      const out = [];
+      const req = {
+        url: '/api/dsh-super-memory/diagnose',
+        method: 'POST',
+        headers: { 'x-dsh-super-memory': '1', 'content-type': 'application/json' },
+        async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ workspace: intentWorkspace, session: intentSession, query: INTENT_Q, rewrite: true, boost: true }), 'utf8'); },
+      };
+      await routes.handler(req, { status: 0, writeHead: () => {}, end: (text) => out.push(JSON.parse(text)) });
+      return { value: out[0]?.value ?? {}, calls: count.calls };
+    };
+    const titlesOf = (material) => String(material ?? '').split('\n\n')
+      .map((para) => (/】(.+)\n/.exec(para) ?? [])[1] ?? '')
+      .filter((title) => title !== '');
+    const none = await runIntent('none');
+    const both = await runIntent('both_ends');
+    const earliest = await runIntent('earliest');
+    /* ① **调用次数不增加**：意图只是**同一个**改写调用里的一个字段 ——
+     *    无论意图是什么（none / both_ends / earliest），都恰好只发生**一次**改写调用。 */
+    eq('（能失败）`none` 意图：改写调用恰好 1 次（意图不新增调用）', none.calls, 1);
+    eq('（能失败）`both_ends` 意图：改写调用**仍然**恰好 1 次（没有为了拿意图多问一次）', both.calls, 1);
+    eq('（能失败）`earliest` 意图：改写调用仍然恰好 1 次', earliest.calls, 1);
+    check('（前提）这条用例确实没走"本地强命中跳过改写"（否则 calls 恒为 0，上面三条会变成空测）',
+      none.value.rewriteSkipped === false, `rewriteSkipped=${JSON.stringify(none.value.rewriteSkipped)}`);
+    check('（前提）注入资料里确实有 ≥2 段（否则"顺序变了"看不出来，下面那条会是空测）',
+      titlesOf(none.value.material).length >= 2, `段=${JSON.stringify(titlesOf(none.value.material))}`);
+    /* ② **资格不变**：`found`（有没有资料）/ `boosting`（排没排进下一轮）只由"模型挑没挑中 /
+     *    本地阈值"决定 —— 三种意图下必须逐位相同。 */
+    eq('（能失败）三种意图下 `found` 完全一致（意图改不了"要不要注入"）',
+      [none.value.found, both.value.found, earliest.value.found],
+      [none.value.found, none.value.found, none.value.found]);
+    eq('（能失败）三种意图下 `boosting` 完全一致（意图改不了"排不排进下一轮"）',
+      [none.value.boosting, both.value.boosting, earliest.value.boosting],
+      [none.value.boosting, none.value.boosting, none.value.boosting]);
+    /* ③ **成员不变、只有顺序变**：资料里的**段集合**三种意图下逐字相同（意图不会让任何一段
+     *    凭空出现或消失），而 `both_ends` 的**顺序**必须与 `none` 不同（否则功能等于没接上）。 */
+    eq('（能失败）三种意图下注入资料的**段集合**逐字一致（意图只改顺序、不改成员）',
+      [titlesOf(both.value.material).slice().sort(), titlesOf(earliest.value.material).slice().sort()],
+      [titlesOf(none.value.material).slice().sort(), titlesOf(none.value.material).slice().sort()]);
+    check('（能失败）`both_ends` 意图**真的改了顺序**（与 `none` 的顺序不同 —— 功能接上了）',
+      titlesOf(both.value.material).join('|') !== titlesOf(none.value.material).join('|'),
+      `none=${titlesOf(none.value.material).join(' > ')} both=${titlesOf(both.value.material).join(' > ')}`);
+    /* ④ 回执如实带出意图（排障要能看出"模型这次判的是哪一段时间"）——
+     *    判空：这一条钉住"意图真的从网关一路传到了回执、并真的被用来选形状"。 */
+    eq('（能失败）回执里带出模型给的时间意图（`both_ends` 一路传到回执）',
+      both.value.assist?.rewrite?.intent, 'both_ends');
+    eq('（能失败）`none` 也如实带出（不是 `undefined`）', none.value.assist?.rewrite?.intent, 'none');
+    fs.rmSync(intentWorkspace, { recursive: true, force: true });
   }
   fs.rmSync(workspace, { recursive: true, force: true });
 }
@@ -2670,12 +2783,23 @@ console.log('\n=== 34. 分段检索 + 合并：多话题不丢，单段退化为
     `实际=${JSON.stringify(splitQuerySegments('行。那事先放着。'))}`);
 }
 
-console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 条） ===');
+console.log('\n=== 35. 时间指代词：句级窗口 + 三形状重排 + 多类冲突不重排（只改排序、永不改资格） ===');
 {
-  /* 能失败的验证（三层都要能红）：
-   *   · 把 `timeReferenceWindows` 的窗口去掉（返回 []）→ 第 3 条（候选级翻转）红；
-   *   · 把 `hasTimeReference` 改成恒 true → 第 4 条（不含指代词时逐位不变）红；
-   *   · 把 `orderHits` 的 `preferEarlier` 分支删掉 → 第 5 条（同分优先较早）红。 */
+  /* 能失败的验证（每一层都要能红，逐条列出**改坏什么会红**）：
+   *   · 把 `timeReferenceWindows` 改回"±60 字符 + 丢掉 ≈全文"→「短消息必须产出窗口」红；
+   *   · 把旧的 `.filter(end - start < s.length)` 加回来 →「整条只有一句时允许出窗口」红；
+   *   · 把 `rankQualifiedByTime` 的调用挪到 `decideTier` **之前**（或让 `pick` 拿乘过系数
+   *     的分去过 `minScore`）→「加权不改资格」那两条红；
+   *   · 把 `timeCoefficient` 的 `'new'`/'old' 两分支对调 →「方向相反」红；
+   *   · 把 `timeBellPeakShare` 挪到 0 或 1 →「中间偏新最高、两端更低」红；
+   *   · 把 `timeCoefficient` 的返回值去掉 `[min,max]` 夹紧 →「参数越界被夹紧」红；
+   *   · 把 `rankQualifiedByTime` 的 `shape === null` 早返回删掉 →「不含指代词时逐位不变」红；
+   *   · **把"多类冲突 → null"改回"最左出现取一个类"（旧的固定优先级）** →
+   *     §35.1 那两条红（`shape` 会从 `null` 变成 `'new'`，且排序与关掉时间重排时不同）；
+   *   · 把 `timeCoefficient` 的 `'both_ends'` 分支删掉（或把 `4p(1-p)` 写成常数）→
+   *     §35.2「两端高于中间」红；
+   *   · 把 `rankByTimeIntent` 的 `shape === null` 早返回删掉 → §35.2「none 原样返回」红；
+   *   · 把 `timeIntentShapeOf` 改成"表外取值也认"（例如 `startsWith`）→ §36 的「未知取值 → none」红。 */
   const EARLY = '2026-10-01T00:00:00.000Z';
   const LATE = '2026-10-09T00:00:00.000Z';
   const TARGET = makeRecord({ layer: 'raw', at: EARLY, title: '撤掉参考块的代价', compactionId: 'h1', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省，命中过的参考块一直挂着更好。' });
@@ -2685,29 +2809,76 @@ console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 
     makeRecord({ layer: 'raw', at: LATE, title: '水果与菜', compactionId: 'h3', text: '今天水果买多了，晚饭做番茄炒蛋，番茄炒蛋要不要放糖一直在纠结。' }),
   ]);
 
-  // ── 识别口径：**最终词表逐字列在这里**（表变了就必须同步改这一行，改不动就是遗漏）──
-  /* 2026-10-10 缺陷 B：旧表**没有"第一次"**，于是 `hasTimeReference('我们第一次聊到…')` 返回 false
-   * —— 而"第一次"正是最口语的时间指代词。现在按**包含式（子串）**匹配，
-   * "第一次提到 / 第一次聊到" 也都算。 */
-  const ZH_TERMS = ['第一次', '最早', '原先', '原来', '上次', '上回', '之前', '先前', '早先', '当初', '刚才', '刚刚', '前面', '上面', '以前', '曾', '那时', '当时', '最初', '初次', '首度'];
-  const EN_TERMS = ['before', 'earlier', 'last time', 'previously', 'originally', 'used to'];
-  eq('（能失败）时间指代词词表与 README/注释一致（表一变这条就红）',
-    [...TIME_REFERENCE_TERMS], [...ZH_TERMS, ...EN_TERMS]);
+  // ── 识别口径：**三类逐字列在这里**（表变了就必须同步改这几行，改不动就是遗漏）──────
+  /* 2026-10-12 按用户要求分成 近 / 中 / 远 三类，各自对应一种时间形状：
+   *   near → 'new'（单调偏新）· mid → 'bell'（钟形、波峰偏新）· far → 'old'（单调偏旧）。
+   * 旧表的 21 个中文词与 6 个英文词**一个都没丢**，只是被分进了三类。
+   * ⚠️ 同日按用户实测判定**摘掉 `这就` / `这才`**（它们在中文里绝大多数是"这就是/这才对"，
+   *   指当前这件事，与"翻更早的记录"无关）→ 见下面那条"不再被误判"的断言。 */
+  const CLASSES = {
+    near: ['刚刚', '刚才', '刚', 'just now', 'recently'],
+    mid: ['之前', '上次', '上回', '原来', '原先', '先前', '早先', '当初', '以前', '前面', '上面', '曾', '那时', '当时',
+      'before', 'earlier', 'last time', 'previously', 'originally', 'used to'],
+    far: ['最早', '最初', '第一次', '初次', '首度', '首次', 'first time', 'earliest'],
+  };
+  const ZH_TERMS = ['第一次', '最早', '原先', '原来', '上次', '上回', '之前', '先前', '早先', '当初', '刚才',
+    '刚刚', '刚', '前面', '上面', '以前', '曾', '那时', '当时', '最初', '初次', '首度', '首次'];
+  const EN_TERMS = ['before', 'earlier', 'last time', 'previously', 'originally', 'used to', 'just now', 'recently', 'first time', 'earliest'];
+  eq('（能失败）三类拍平后与注释里那张表逐字一致（near → mid → far 固定顺序）',
+    [...TIME_REFERENCE_TERMS], [...CLASSES.near, ...CLASSES.mid, ...CLASSES.far]);
   for (const term of ZH_TERMS) {
     check(`（能失败）中文指代词「${term}」被认出来`, hasTimeReference(`随便写点东西，${term}我们聊过这件事。`), term);
   }
   for (const term of EN_TERMS) {
     check(`（能失败）英文指代词「${term}」被认出来`, hasTimeReference(`please check ${term} we discussed it`), term);
   }
+  /* 旧表的词**一个都不许丢**：这条单独钉住"改成分三类时把某个词漏掉了"这种回归。 */
+  const LEGACY_ZH = ['第一次', '最早', '原先', '原来', '上次', '上回', '之前', '先前', '早先', '当初', '刚才', '刚刚', '前面', '上面', '以前', '曾', '那时', '当时', '最初', '初次', '首度'];
+  const LEGACY_EN = ['before', 'earlier', 'last time', 'previously', 'originally', 'used to'];
+  check('（能失败）2026-10-10 那版词表里的词一个都没丢（分三类时不许漏词）',
+    [...LEGACY_ZH, ...LEGACY_EN].every((term) => TIME_REFERENCE_TERMS.includes(term)),
+    `缺=${[...LEGACY_ZH, ...LEGACY_EN].filter((term) => !TIME_REFERENCE_TERMS.includes(term)).join(',') || '(无)'}`);
+  /* 2026-10-12 用户实测判定：`这就` / `这才` 与"翻更早的记录"无关（是"这就是/这才对"），
+   * 已摘掉。这条钉住"不许再把它们加回来"——真实库里有 2 条提问会被它们误判成近指代。 */
+  check('（能失败）已摘掉 `这就`：不再把"这就是我的疑惑"误判成时间指代',
+    !hasTimeReference('对呀，这就是我的疑惑，我们还是没搞清楚。'));
+  check('（能失败）已摘掉 `这才`：不再把"这才是关键"误判成时间指代',
+    !hasTimeReference('这才是关键，别搞错了。'));
+  check('（能失败）`这就`/`这才` 都不在词表里',
+    !TIME_REFERENCE_TERMS.includes('这就') && !TIME_REFERENCE_TERMS.includes('这才'));
   check('（能失败·缺陷B1）「第一次」在**真实用例**里被认出来（旧表漏掉的就是它）',
     hasTimeReference('我们第一次聊到控制面板的时候是怎么说的？'));
   check('（能失败·缺陷B1）中文是**包含式**匹配：「第一次提到」也算',
     hasTimeReference('我们第一次提到这件事是在哪一轮？'));
   check('（能失败·缺陷B1）英文大小写不敏感', hasTimeReference('We used to discuss this.') && hasTimeReference('AS DISCUSSED BEFORE'));
   check('对照：不含任何指代词时判 false', !hasTimeReference('我看了文档也问了别人，目前定过的东西现在想确认一下。'));
-  /* ⚠️ 位置通用性必须用**足够长**的问题测：短消息里 ±60 字符会覆盖全文，
-   * `timeReferenceWindows` 会按设计返回空（那是"没有集中"，见上面的常量注释）。
-   * 所以这里用 200+ 字符的长问题，验证"不管指代词放在哪一段，都能扫到并产出窗口"。 */
+  /* ── ② 窗口：**句级**（用户 2026-10-12 明确要求；旧口径 ±60 的病见 `text.js` 注释）────
+   * 修的是用户实测的那条：`刚刚那个问题是测试…`（41 字）在旧口径下产出 **0 窗口**
+   * （±60 合并成近全文 → 被 `end - start < s.length` 丢掉）。 */
+  const SHORT_Q = '刚刚那个问题是测试，点了X之后弹出个“还没有本会话的提问记录”小窗，并且还关不掉。';
+  const shortWin = timeReferenceWindows(SHORT_Q);
+  check('（能失败·问题1）短消息（41 字）必须产出 1 个窗口（旧口径 ±60 合并成近全文后被丢弃 → 0）',
+    shortWin.length === 1, `实际=${JSON.stringify(shortWin)}`);
+  check('（能失败·问题1）该窗口严格小于全文（不是"整条查询"的副本）且覆盖正文',
+    shortWin.length === 1 && shortWin[0].end - shortWin[0].start < SHORT_Q.length
+    && shortWin[0].end - shortWin[0].start >= SHORT_Q.length - 2,
+    `窗口=${shortWin[0] ? shortWin[0].end - shortWin[0].start : '无'} / 全文=${SHORT_Q.length}`);
+  /* **旧的"整条都在窗口里就不产出"口径已经删除**：窗口不再参与打分，它只定"形状作用域"，
+   * 所以"窗口 == 整条"不再等于"把门槛降 1/1.35"。这条断言钉的是**新口径**（能失败：
+   * 把旧的 `.filter(end - start < s.length)` 加回来 → 立刻红）。 */
+  check('（能失败·新口径）整条只有一句时**允许**产出窗口（旧口径会返回空数组）',
+    timeReferenceWindows('之前这样行吗').length === 1, JSON.stringify(timeReferenceWindows('之前这样行吗')));
+  /* 句级化：两句里只有一句含指代词 → 窗口只覆盖那一句（不是"指代词前后 60 字"）。 */
+  const TWO = '第一句先说点别的，今天天气不错。第二句还说了之前那件事。';
+  const twoWin = timeReferenceWindows(TWO);
+  check('（能失败）窗口是**指代词所在的那一句**，不是"前后 60 字符"',
+    twoWin.length === 1 && TWO.slice(twoWin[0].start, twoWin[0].end) === '第二句还说了之前那件事',
+    `实际=${JSON.stringify(twoWin.map((w) => TWO.slice(w.start, w.end)))}`);
+  check('（能失败）同一句里多个指代词只产出 **1** 个窗口（不重复、不切碎）',
+    timeReferenceWindows('之前那次和刚才那次都聊过同一件事。').length === 1,
+    JSON.stringify(timeReferenceWindows('之前那次和刚才那次都聊过同一件事。')));
+  check('对照：不含指代词时窗口为空（这一路整段不生效）',
+    timeReferenceWindows('今天天气不错，出门散步。').length === 0);
   const PAD_HEAD = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
     + '有些细节当时写下来觉得清楚，过一段时间再看就模糊了，所以想再确认一下，顺便也把发布流程再走一遍。';
   const PAD_TAIL = '另外顺带说点别的：今天水果买多了，晚饭打算做番茄炒蛋，番茄炒蛋要不要放糖我一直在纠结，'
@@ -2722,77 +2893,358 @@ console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 
       hasTimeReference(q) && timeReferenceWindows(q).length > 0 && q.length > 200,
       `${where} len=${q.length} 窗口=${JSON.stringify(timeReferenceWindows(q))}`);
   }
-  check('（能失败）整条消息都落在窗口里时不产出窗口（那是"降阈值"不是"集中"）',
-    timeReferenceWindows('之前这样行吗').length === 0, JSON.stringify(timeReferenceWindows('之前这样行吗')));
+  check('（能失败）位置无关：指代词在句首/句末/中段都能扫到，并产出**该句**窗口',
+    (() => {
+      const probes = [['句首', `之前${CORE_Q}${PAD_TAIL}`], ['句末', `${CORE_Q}${PAD_TAIL}之前`], ['中段', `${CORE_Q.replace('我想确认', '之前我想确认')}${PAD_TAIL}`]];
+      const bad = probes.filter(([, q]) => !hasTimeReference(q) || timeReferenceWindows(q).length === 0);
+      return bad.length === 0;
+    })(), '');
+  /* ⚠️ 这一段是**旧口径的断言，已删除**：旧实现要求"短消息里 ±60 覆盖全文 → 不产出窗口"。
+   * 那是问题 1 的病根本身，新口径下窗口允许等于整句（见上面两条）。 */
 
-  // ── 判定性用例：窗口**只做附加证据**（缺陷 B 收敛后的核心性质）────────────────
-  /* 旧行为（已修）：窗口单独成一路，**能把任何一段都没命中的块拉进候选**；
-   * 实测后果是"恰好含『最早』二字但不相关"的块被抬上来（真实库上 20/59 条含指代词提问发生过）。
-   * 新规则：候选集合完全由各段决定；窗口命中只把**已有候选**的分数乘 `TIME_REFERENCE_BOOST`。
-   * 下面两组断言分别钉住新规则的两个方向（**都能失败**）：
-   *   ① 只被窗口命中的块 → **不许进候选**（把 `boostExisting` 改回 `merge` 立刻红）；
-   *   ② 已经是候选的块 → 窗口命中后**分数必须更高**（把窗口那一步删掉立刻红）。 */
+  /* ── ③ 时间形状：三类 ↔ 三形状（用户 2026-10-12 两轮定稿）─────────────────────────
+   * 用**同一个夹具**（同一批块、同一份字面分，只换指代词）比较**名次** ——
+   * 这才是"三类真的产生了不同排序"的证据（只断言系数不同是不够的）。 */
+  const SHARED = '撤掉参考块要付多少 token，参考块撤掉之后快照会怎么样，这个事我们定过。';
+  /* ⚠️ 三块**正文完全相同** → `makeRecord` 算出的 `fp` 也相同 → `MemoryIndex` 会把它们
+   * **去重成一块**（那是它的防御性去重）。所以这里像"同分（早/晚）"那组一样，
+   * **显式覆盖 `fp`**，让三块真的同时进索引。 */
+  const MARK = (label, at, fp) => {
+    const record = makeRecord({ layer: 'raw', at, title: label, compactionId: `t-${label}`, text: SHARED });
+    record.fp = fp;
+    return record;
+  };
+  const OLDEST = MARK('最早那块', EARLY, 'unit-shape-oldest');
+  const MIDDLE = MARK('中间那块', '2026-10-04T00:00:00.000Z', 'unit-shape-middle');
+  const NEWEST = MARK('最新那块', LATE, 'unit-shape-newest');
+  const shapeIdx = new MemoryIndex([OLDEST, MIDDLE, NEWEST]);
+  const orderOf = (query) => {
+    const hits = shapeIdx.search(query, { layers: ['raw'], limit: 10, minMatchedTerms: 0 });
+    const ranked = rankQualifiedByTime(hits, { shape: timeReferenceShapeOf(query), params: timeRankParams(), pool: shapeIdx.records });
+    return ranked.slice().sort((a, b) => b.score - a.score).map((hit) => hit.record.title);
+  };
+  /* 三条查询**逐字只差指代词那一处**（其余字符完全相同）—— 这样"排序差异"只可能来自指代词，
+   * 不可能来自别处的用词变化。 */
+  const Q_NEAR = `刚刚说过的：${SHARED}`;
+  const Q_MID = `之前说过的：${SHARED}`;
+  const Q_FAR = `最早说过的：${SHARED}`;
+  check('（前提）三条查询的字面部分完全相同（只有指代词不同）',
+    Q_NEAR.replace('刚刚', 'X') === Q_MID.replace('之前', 'X') && Q_MID.replace('之前', 'X') === Q_FAR.replace('最早', 'X'),
+    `${Q_NEAR} / ${Q_MID} / ${Q_FAR}`);
+  check('（前提）三块确实都进了索引（正文相同、只有 fp 不同，否则会被去重成一块）',
+    shapeIdx.size === 3, `实际=${shapeIdx.size}`);
+  eq('（能失败）**恰好只命中一个类**时各自判出正确的形状名', [Q_NEAR, Q_MID, Q_FAR].map((q) => timeReferenceShapeOf(q)),
+    ['new', 'bell', 'old']);
+  const NEAR_ORDER = orderOf(Q_NEAR);
+  const FAR_ORDER = orderOf(Q_FAR);
+  const MID_ORDER = orderOf(Q_MID);
+  console.log(`    刚刚 → ${NEAR_ORDER.join(' > ')}`);
+  console.log(`    之前 → ${MID_ORDER.join(' > ')}`);
+  console.log(`    最早 → ${FAR_ORDER.join(' > ')}`);
+  check('（能失败）「刚刚」类：**最新**的块排第一（单调偏新）',
+    NEAR_ORDER[0] === '最新那块', `实际=${NEAR_ORDER.join(' > ')}`);
+  check('（能失败）「最早」类：**最早**的块排第一（单调偏旧）',
+    FAR_ORDER[0] === '最早那块', `实际=${FAR_ORDER.join(' > ')}`);
+  check('（能失败）「刚刚」与「最早」的排序**方向相反**（同一批候选、同一份字面分）',
+    NEAR_ORDER[0] === FAR_ORDER[FAR_ORDER.length - 1] && FAR_ORDER[0] === NEAR_ORDER[NEAR_ORDER.length - 1],
+    `刚刚=${NEAR_ORDER.join('>')} 最早=${FAR_ORDER.join('>')}`);
+  check('（能失败）「之前/上次」类：**中间偏新**的块排最高、两端更低（钟形，无硬界）',
+    MID_ORDER[0] === '中间那块' && MID_ORDER[1] === '最新那块' && MID_ORDER[2] === '最早那块',
+    `实际=${MID_ORDER.join(' > ')}（期望 中间 > 最新 > 最早）`);
+  /* "无硬界"的判据：两端也**不是 0**（系数有下界）。旧写法（窗口外归零）会让两端贴着 0。 */
+  const bellCurve = [0, 0.25, 0.5, 0.75, 1].map((p) => Number(timeCoefficient('bell', p, timeRankParams()).toFixed(6)));
+  check('（能失败）钟形两端只是"更低"而不是 0（无硬界：处处非零、且有下界）',
+    bellCurve.every((c) => c > 0) && bellCurve[0] < bellCurve[2] && bellCurve[4] < bellCurve[2],
+    `曲线=${JSON.stringify(bellCurve)}`);
+  const monotone = (shape, sign) => {
+    const values = [0, 0.2, 0.4, 0.6, 0.8, 1].map((p) => timeCoefficient(shape, p, timeRankParams()));
+    for (let i = 1; i < values.length; i += 1) if (sign * (values[i] - values[i - 1]) <= 0) return false;
+    return true;
+  };
+  check('（能失败）「刚刚」类是**严格单调递增**（越新越高，处处如此）', monotone('new', 1), '');
+  check('（能失败）「最早」类是**严格单调递减**（越早越高，处处如此）', monotone('old', -1), '');
+  check('（能失败）时间未知（拿不到 at/seq/序号）→ 系数恒为 1（不猜时间）',
+    timeCoefficient('new', null, timeRankParams()) === 1 && timeCoefficient('bell', null, timeRankParams()) === 1, '');
+  check('对照：不含指代词（shape=null）→ 系数恒为 1', timeCoefficient(null, 0.9, timeRankParams()) === 1);
+
+  /* ── ③.1 **多类冲突 → 本次不做任何时间重排**（2026-10-12 用户明确要求）───────────
+   * 用户的例句：`我们刚刚说的那个最早提过的设想` —— 同时命中 near（刚刚）与 far（最早）。
+   * 用户要的是**两端高**（最早一遍 + 刚刚一遍，现在问的是第三遍），而**自动检索这条路上
+   * 没有模型可用**，猜不出"两头"，所以口径是**宁可不用，也不用错**：
+   *   · 恰好命中一个类 → 用该类形状；
+   *   · 命中 ≥2 个不同类 → `null`（= 与"不含指代词"同一条路径，逐位不变）。
+   * **被删掉的那条规则**：旧实现取**最左出现**的指代词所属的类 —— 在这条例句上它必然选
+   * "刚刚"（→ `'new'`，单调偏新，**丢掉最早那一遍**），是固定优先级必然选错一边的典型。
+   *
+   * 能失败（实测过）：
+   *   · 把"多类 → null"改回"最左出现取一个类" → 第 1 条（期望 null、实际 'new'）红，
+   *     第 2 条（排序与关掉时间重排不一致）也红；
+   *   · 反过来，把"只命中一个类"也一刀切成 null → 上面刚钉住的 `['new','bell','old']` 红。 */
+  const CONFLICT_Q = `我们刚刚说的那个最早提过的设想：${SHARED}`;
+  check('（前提）这条例句**同时**命中两个类（刚刚 → near、最早 → far）',
+    timeReferenceWindows(CONFLICT_Q).length > 0
+    && hasTimeReference(CONFLICT_Q)
+    && CONFLICT_Q.includes('刚刚') && CONFLICT_Q.includes('最早'),
+    CONFLICT_Q);
+  eq('（能失败）多类冲突 → `shape === null`（不再取"最左出现"那一个类）',
+    timeReferenceShapeOf(CONFLICT_Q), null);
+  check('（对照·防一刀切）只命中一个类的三条例句**仍然照常判出形状**（没有把整条规则关掉）',
+    [Q_NEAR, Q_MID, Q_FAR].every((q) => timeReferenceShapeOf(q) !== null)
+    && timeReferenceShapeOf(Q_NEAR) === 'new' && timeReferenceShapeOf(Q_MID) === 'bell' && timeReferenceShapeOf(Q_FAR) === 'old',
+    JSON.stringify([Q_NEAR, Q_MID, Q_FAR].map((q) => timeReferenceShapeOf(q))));
+  /* **逐位不变**：`shape === null` 时 `rankQualifiedByTime` 原样返回，所以"含多类指代词"
+   * 的那条查询，与"完全不含指代词"的那条查询，在**同一批候选**上必须得到逐位相同的排序。
+   * 判据用**同一批 hits、同一份 pool**：唯一变量就是 `shape`。 */
+  {
+    const rawHits = shapeIdx.search(CONFLICT_Q, { layers: ['raw'], limit: 10, minMatchedTerms: 0 });
+    const withConflict = rankQualifiedByTime(rawHits, { shape: timeReferenceShapeOf(CONFLICT_Q), params: timeRankParams(), pool: shapeIdx.records });
+    const withOff = rankQualifiedByTime(rawHits, { shape: null, params: timeRankParams(), pool: shapeIdx.records });
+    const key = (list) => list.map((hit) => `${hit.record.fp}:${Number(hit.score).toFixed(9)}`).join(',');
+    check('（能失败）多类冲突时的重排结果与"关掉时间重排"**逐位相同**（分数一分不差）',
+      withConflict.length > 0 && key(withConflict) === key(withOff),
+      `冲突=${key(withConflict).slice(0, 90)} 关掉=${key(withOff).slice(0, 90)}`);
+    check('（对照）这条断言不是空转：把形状换成 `new` 后同一批候选**确实会变**',
+      key(rankQualifiedByTime(rawHits, { shape: 'new', params: timeRankParams(), pool: shapeIdx.records })) !== key(withOff),
+      '');
+  }
+  /* 更贴近用户原话的一条：**两端高、中间低**要由 ✕ 路径的模型意图给（`both_ends`），
+   * 自动检索这一路只能"不重排" —— 这里钉住"它没有偷偷替模型猜一个方向"。 */
+  check('（能失败）自动检索这条路**不会**替模型猜"两头"（它只会给 null，`both_ends` 留给 ✕）',
+    timeReferenceShapeOf(CONFLICT_Q) !== 'both_ends'
+    && timeReferenceShapeOf('刚刚说的和最早说的都算') === null,
+    `实际=${JSON.stringify([timeReferenceShapeOf(CONFLICT_Q), timeReferenceShapeOf('刚刚说的和最早说的都算')])}`);
+  /* **跨类的"间接"冲突也算冲突**（不止 near+far）：`之前/当时`（mid）与 `第一次/最早`（far）
+   * 同时出现同样判不出来。这条用例取自 harness 真实库回归里那条现场提问（含「当时」+「第一次」
+   * +「最早」）—— 它在旧口径下靠"最左取 mid"才走时间重排，**新口径下不重排**（行为变更已
+   * 如实写进交付说明）。 */
+  const MIXED_Q = '顺便说点别的，控制面板那几个开关分别是什么意思。最早提到设置面板的时候，'
+    + '我当时的原话到底是什么，第一次是怎么定的？';
+  eq('（能失败）mid + far 混在一条消息里 → 同样判不出（返回 null）',
+    timeReferenceShapeOf(MIXED_Q), null);
+  check('（前提）这条混类用例的每一半**单独**都能判出形状（否则上面那条是空测）',
+    timeReferenceShapeOf('当时我们聊过') === 'bell'
+    && timeReferenceShapeOf('第一次提到这件事') === 'old'
+    && timeReferenceShapeOf('最早提到这件事') === 'old',
+    JSON.stringify([timeReferenceShapeOf('当时我们聊过'), timeReferenceShapeOf('第一次提到这件事'), timeReferenceShapeOf('最早提到这件事')]));
+  /* ⚠️ **"一条消息"是整条消息，不是"第一句"**：两类指代词分别落在**不同句子**里时，
+   * 仍然要判成"分不清"。这条钉的是 `retrieveSegmented` 的作用域 —— 早先它拿
+   * `windows[0]`（第一句含指代词的话）去判形状，于是"第 1 句『刚刚』+ 第 2 句『最早』"
+   * 会被判成 `'new'`，等于**换了个地方继续做那条被否决的固定优先级**。
+   * 能失败：把 `timeReferenceShapeOf(query)` 改回 `timeReferenceShapeOf(scope)`
+   * （scope = `query.slice(windows[0]…)`）→ 下面第 1 条红（`timeShape` 会变成 `'new'`）。 */
+  {
+    const SPLIT_Q = `刚刚说过的：${SHARED} 最早说过的：${SHARED}`;
+    const splitWindows = timeReferenceWindows(SPLIT_Q);
+    check('（前提）两处指代词确实落在**两个不同的窗口**里（否则这条与上面那条没有区别）',
+      splitWindows.length === 2
+      && SPLIT_Q.slice(splitWindows[0].start, splitWindows[0].end).includes('刚刚')
+      && SPLIT_Q.slice(splitWindows[1].start, splitWindows[1].end).includes('最早'),
+      `窗口=${JSON.stringify(splitWindows.map((w) => SPLIT_Q.slice(w.start, w.end).slice(0, 12)))}`);
+    /* 第一句单独判是 `'new'` —— 这正是"只看第一句"会得到的错误答案。 */
+    eq('（前提）**只看第一句**会判成 `new`（这就是"只看第一句"的错法）',
+      timeReferenceShapeOf(SPLIT_Q.slice(splitWindows[0].start, splitWindows[0].end)), 'new');
+    eq('（能失败）跨句子的多类冲突 → `retrieveSegmented` 的 `timeShape` 也是 `null`（整条消息判）',
+      retrieveSegmented(shapeIdx, SPLIT_Q, { minScore: 0.28, maxItems: 2 }).timeShape, null);
+    eq('（对照·防一刀切）只保留第一句时 `timeShape` 就是 `new`（说明上面那条是"判出来的"）',
+      retrieveSegmented(shapeIdx, `刚刚说过的：${SHARED}`, { minScore: 0.28, maxItems: 2 }).timeShape, 'new');
+  }
+
+  /* ── ③.2 **`both_ends`（两端高、中间低）与"✕ 的时间意图"**（2026-10-12 新增）────────
+   * 只用于 ✕ 路径：形状由辅助模型的 `时间意图: both_ends` 驱动（`timeIntentShapeOf`）。
+   * 能失败（实测过）：
+   *   · 把 `timeCoefficient` 的 `'both_ends'` 分支删掉 → 第 1/2 条红（系数恒为 1）；
+   *   · 把 `4p(1-p)` 写成常数（例如恒为 0）→ 第 2 条红（两端与中间一样高，不再"中间低"）；
+   *   · 把 `rankByTimeIntent` 的 `shape === null` 早返回删掉 → 第 4 条红（none 也会被重排）。 */
+  {
+    const params = timeRankParams();
+    const curve = [0, 0.25, 0.5, 0.75, 1].map((p) => Number(timeCoefficient('both_ends', p, params).toFixed(6)));
+    check('（能失败）`both_ends`：**两端高于中间**（0/1 高于 0.5）',
+      curve[0] > curve[2] && curve[4] > curve[2],
+      `曲线=${JSON.stringify(curve)}`);
+    /* 用户要的是"中间**次要**"，不是"中间不要"：中间必须明显高于下界（= 仍然是一个有效加成），
+     * 且两端严格高于中间（形状真的存在），并且**两端相等**（不分谁更重 —— "最早一次与最近一次
+     * 都相关"这句话里没有说哪个更重要）。 */
+    check('（能失败）`both_ends`：两端**严格相等**、中间**不塌到下界**（"次要"≠"不要"）',
+      curve[0] === curve[4] && curve[2] > params.min && curve[2] < curve[0],
+      `曲线=${JSON.stringify(curve)} 区间=[${params.min},${params.max}]`);
+    check('（能失败）`both_ends` 也是**对称**的（p 与 1-p 同值）',
+      [0, 0.2, 0.35].every((p) => timeCoefficient('both_ends', p, params) === timeCoefficient('both_ends', 1 - p, params)),
+      '');
+    /* 端到端：同一批候选（早 / 中 / 晚三块、字面分相同），`both_ends` 下**两端都在中间之前**。 */
+    const intentHits = shapeIdx.search(SHARED, { layers: ['raw'], limit: 10, minMatchedTerms: 0 });
+    const bothRanked = rankByTimeIntent(
+      intentHits.map((hit) => ({ record: hit.record, lexicalScore: hit.score })),
+      { shape: 'both_ends', params, pool: shapeIdx.records },
+    );
+    const top2 = bothRanked.ranked.slice(0, 2).map((item) => item.record.title).sort();
+    check('（能失败）`both_ends` 端到端：排在最前的两条就是**两端**那两块（中间那块排最后）',
+      bothRanked.ranked.length === 3 && top2.join('|') === ['最早那块', '最新那块'].sort().join('|')
+      && bothRanked.ranked[2].record.title === '中间那块',
+      `实际=${bothRanked.ranked.map((item) => item.record.title).join(' > ')}`);
+    check('（前提）这条端到端用例确实发生了重排（否则上面那条可能恒真）',
+      bothRanked.moved > 0, `moved=${bothRanked.moved}`);
+    /* `none`（含表外取值）→ `shape === null` → **原样返回**（逐位不变）。 */
+    const noneRanked = rankByTimeIntent(
+      intentHits.map((hit) => ({ record: hit.record, lexicalScore: hit.score })),
+      { shape: timeIntentShapeOf('none'), params, pool: shapeIdx.records },
+    );
+    check('（能失败）`none`（或不认识的意图）→ **原样返回**，一条都不动',
+      noneRanked.shape === null && noneRanked.moved === 0
+      && noneRanked.ranked.map((item) => item.record.fp).join() === intentHits.map((hit) => hit.record.fp).join(),
+      `shape=${JSON.stringify(noneRanked.shape)} moved=${noneRanked.moved}`);
+    check('（能失败）`rankByTimeIntent` **只重排、不改成员**（元素集合与入参逐位相同）',
+      bothRanked.ranked.length === intentHits.length
+      && bothRanked.ranked.map((item) => item.record.fp).sort().join() === intentHits.map((hit) => hit.record.fp).sort().join(),
+      `${bothRanked.ranked.length} vs ${intentHits.length}`);
+    /* 中间凹陷深度是**可调**的：`dip = 0` → 各位置一样高（形状不存在，合法）；`dip = 1` → 中间贴下界。 */
+    check('（能失败）`both_ends` 的"中间凹陷深度"可调：`dip=0` 全部一样高、`dip=1` 中间贴下界',
+      timeCoefficient('both_ends', 0.5, timeRankParams({ timeBothEndsDip: 0 })) === timeCoefficient('both_ends', 0, timeRankParams({ timeBothEndsDip: 0 }))
+      && Math.abs(timeCoefficient('both_ends', 0.5, timeRankParams({ timeBothEndsDip: 1 })) - timeRankParams({ timeBothEndsDip: 1 }).min) < 1e-9,
+      `dip0=${timeCoefficient('both_ends', 0.5, timeRankParams({ timeBothEndsDip: 0 }))} dip1=${timeCoefficient('both_ends', 0.5, timeRankParams({ timeBothEndsDip: 1 }))}`);
+  }
+
+  /* ── ④ **加权不改资格**（问题 2 的落点，本节的中心）─────────────────────────────
+   * 两组用例，分别对应两个方向，**都能失败**：
+   *   ① 字面分**不够**、但"时间系数极大"的块 → **依然不被注入**；
+   *   ② 字面分**够**、但"时间系数极小"的块 → **依然注入**（只是排名/分数变了）。 */
+  const QUAL = makeRecord({ layer: 'raw', at: EARLY, title: '够格的块', compactionId: 'q1', text: '撤掉参考块要付多少 token，参考块撤掉之后快照会怎么样。' });
+  /* 不够格那块：要让它在 `QUAL_Q` 下**过得了证据门**（命中 ≥ 4 个 token）、
+   * 但**纯词法分明显低于**垫块 —— 这正好是"字面分不够、靠时间系数才够"的形态。
+   * 实测这一段的数字（`matched=6` / `score≈0.2367`，垫块 ≈0.85 / 0.63）：
+   * 词法分低于由它算出的 `minScore≈0.4734`，而乘上最大系数 ×3 之后（≈0.7101）就会越线 ——
+   * 所以"把时间系数挪到资格判定之前"必定让它被注入，这条断言才真的能失败。 */
+  const UNDER = makeRecord({ layer: 'raw', at: LATE, title: '不够格的块', compactionId: 'q2', text: '撤掉之后快照会怎么样这件事我一直没算清楚，水果买多了晚饭做番茄炒蛋要不要放糖，天气不错出门散步挺舒服的，顺便把水果也买了。' });
+  const qualIdx = new MemoryIndex([QUAL, UNDER]);
+  const QUAL_Q = '撤掉参考块要付多少 token，参考块撤掉之后快照会怎么样。';
+  {
+    /* ① **字面分不够、但时间系数极大** → 依然不许被注入。
+     *
+     * 夹具设计（为了这条断言**真的能失败**）：`UNDER` 必须**过得了证据门**（`matched ≥ 4`），
+     * 只是它的纯词法分**低于 `minScore`**。`minScore` 不写死，而是由实测的词法分算出来：
+     * `minScore = (lexical + lexical × 3) / 2`，也就是"词法分过不了、但乘上最大系数 ×3 就能过"。
+     * 这样"把时间系数挪到资格判定之前"（旧病）**必定**让 `UNDER` 越过 `minScore` 被注入 → 红。
+     * 形状用 `'old'`（最早）：最旧那一块拿最大系数，所以把 `UNDER` 放在时间轴最早的位置。 */
+    const maxed = { nearPeak: 1, farPeak: 0, bellPeak: 1, bellWidth: 0.05, min: 3, max: 3 };
+    const PADDING = ['撤掉参考块要付多少 token', '参考块撤掉之后快照会怎么样'];
+    const underIdx = new MemoryIndex([
+      UNDER,
+      ...PADDING.map((text, i) => makeRecord({
+        layer: 'raw', at: '2026-10-08T00:00:00.000Z', title: `垫块${i}`, compactionId: `pad${i}`, text: `${text}，成本上限一般是多少。`,
+      })),
+    ]);
+    const lexical = underIdx.search(QUAL_Q, { layers: ['raw'], limit: 10, minMatchedTerms: 0 })
+      .find((hit) => hit.record === UNDER);
+    check('（前提·问题2①）`UNDER` 过得了证据门（是候选），但纯词法分低于后面那个 `minScore`',
+      lexical !== undefined && lexical.matched >= matchedTermsFloor(QUAL_Q) && lexical.score > 0,
+      `matched=${lexical?.matched}/${matchedTermsFloor(QUAL_Q)} score=${lexical?.score?.toFixed(4)}`);
+    const gate = lexical === undefined ? 0.28 : (lexical.score + lexical.score * maxed.max) / 2;
+    const q = `最早说过的：${QUAL_Q}`;
+    check('（前提·问题2①）形状确实是最旧那一类（`UNDER` 拿到最大系数）',
+      timeReferenceShapeOf(q) === 'old', `形状=${timeReferenceShapeOf(q)}`);
+    const withTime = retrieveSegmented(underIdx, q, { minScore: gate, maxItems: 2, timeParams: maxed });
+    check('（能失败·问题2①）字面分不够（过门但低于 minScore）+ 时间系数拉满（×3）→ **依然不被注入**',
+      withTime.hits.every((hit) => hit.record !== UNDER),
+      `minScore=${gate.toFixed(4)} 词法=${lexical?.score?.toFixed(4)} 注入了 ${JSON.stringify(withTime.hits.map((h) => h.record.title))}`);
+  }
+  {
+    /* ② 把系数压到最小（`min === max === 0.1`）：够格那块**仍然注入**。
+     * 断言的不仅是"还在"，还有"分数确实被压下去了" —— 否则这条会在"加权根本没生效"时也绿。 */
+    const minned = { nearPeak: 1, farPeak: 0, bellPeak: 1, bellWidth: 0.05, min: 0.1, max: 0.1 };
+    const q = `最早说过的：${QUAL_Q}`;
+    const off = retrieveSegmented(qualIdx, q, { minScore: 0.28, maxItems: 2, timeBoost: false });
+    const timed = retrieveSegmented(qualIdx, q, { minScore: 0.28, maxItems: 2, timeParams: minned });
+    check('（前提·问题2②）关掉时间重排时那块本来就是注入的（否则"仍在"这条没有区分力）',
+      off.hits.some((hit) => hit.record === QUAL), `关=${off.hits.length} 条`);
+    check('（能失败·问题2②）字面分够 + 时间系数压到最小（×0.1）→ **依然注入**（资格未被加权剥夺）',
+      timed.hits.some((hit) => hit.record === QUAL),
+      `开=${timed.hits.length} 条 score=${timed.topScore?.toFixed(4)}`);
+    check('（能失败·问题2②）同一用例里系数确实生效了（分数被压低，证明"仍在"不是因为加权没生效）',
+      timed.topScore < off.topScore, `关=${off.topScore?.toFixed(4)} 开=${timed.topScore?.toFixed(4)}`);
+  }
+
+  /* ── ⑤ 参数可调 + 上下界夹紧（用户要求"形状参数必须可调 + 给默认值"）─────────────
+   *   ① 改参数**真的能改变系数/排名**（不然这些旋钮是死的）；
+   *   ② 越界被**夹到边界**（不是"悄悄变回默认值"，也不是原样收下）。 */
+  {
+    const flat = timeRankParams({ timeBoostMin: 1, timeBoostMax: 1 });
+    check('（前提）把幅度区间夹成 [1,1] 后，时间系数恒为 1（这条用例才干净）',
+      [0, 0.3, 0.7, 1].every((p) => timeCoefficient('new', p, flat) === 1), '');
+    const strong = timeRankParams({ timeBoostMin: 0.5, timeBoostMax: 3 });
+    check('（能失败）改参数能改变系数（0.5–3 与默认 0.7–1.35 不同）',
+      Math.abs(timeCoefficient('new', 1, strong) - 3) < 1e-9
+      && Math.abs(timeCoefficient('new', 1, timeRankParams()) - DEFAULTS.timeBoostMax) < 1e-9,
+      `强=${timeCoefficient('new', 1, strong)} 默认=${timeCoefficient('new', 1, timeRankParams())}`);
+    const outOfRange = normalizeSettings({
+      timeBellWidth: 1e21, timeBoostMax: 1e9, timeBoostMin: -5, timeNearPeakShare: 42, timeBellPeakShare: -1,
+    }, DEFAULTS);
+    eq('（能失败）越界的 `timeBellWidth` 被夹到上界 2', outOfRange.timeBellWidth, 2);
+    eq('（能失败）越界的 `timeBoostMax` 被夹到上界 3', outOfRange.timeBoostMax, 3);
+    eq('（能失败）负的 `timeBoostMin` 被夹到下限 0.1', outOfRange.timeBoostMin, 0.1);
+    eq('（能失败）越界的 `timeNearPeakShare` 被夹到上界 1', outOfRange.timeNearPeakShare, 1);
+    eq('（能失败）负的 `timeBellPeakShare` 被夹到下限 0.5', outOfRange.timeBellPeakShare, 0.5);
+    /* `both_ends` 的"中间凹陷深度"（2026-10-12 新增键）同样要夹：`-5` → 0（形状不反转）、
+     * `1e9` → 1（中间贴下界，不会把曲线压成负数）。 */
+    eq('（能失败）越界的 `timeBothEndsDip` 被夹到上界 1', normalizeSettings({ timeBothEndsDip: 1e9 }, DEFAULTS).timeBothEndsDip, 1);
+    eq('（能失败）负的 `timeBothEndsDip` 被夹到下限 0（凹陷不许反转）', normalizeSettings({ timeBothEndsDip: -5 }, DEFAULTS).timeBothEndsDip, 0);
+    /* `min`/`max` 的上下界**结构上**保证了 `min ≤ 1 ≤ max`（16 个数的夹紧见上面），
+     * 所以"写反"这种输入根本到不了 `timeCoefficient` —— 这条断言钉的就是那个结构性保证。 */
+    const bounds = { timeBoostMin: [0.1, 1], timeBoostMax: [1, 3] };
+    check('（能失败）幅度两个字段的上下界使 `min ≤ 1 ≤ max` 结构上恒成立（写反不可能）',
+      bounds.timeBoostMin[0] <= bounds.timeBoostMin[1] && bounds.timeBoostMin[1] <= bounds.timeBoostMax[0]
+      && bounds.timeBoostMax[0] <= bounds.timeBoostMax[1],
+      JSON.stringify(bounds));
+    check('（能失败）`min === max` 是合法取值且被原样保留（幅度为零 = 用户关掉时间调整）',
+      normalizeSettings({ timeBoostMin: 1, timeBoostMax: 1 }, DEFAULTS).timeBoostMin === 1
+      && normalizeSettings({ timeBoostMin: 1, timeBoostMax: 1 }, DEFAULTS).timeBoostMax === 1,
+      '');
+    check('（能失败）七个时间形状参数**都在 `DEFAULTS` 里、都不在 `EDITABLE_FIELDS` 里**（面板不暴露，理由见 DEFAULTS 注释）',
+      ['timeNearPeakShare', 'timeFarPeakShare', 'timeBellPeakShare', 'timeBellWidth', 'timeBothEndsDip', 'timeBoostMin', 'timeBoostMax']
+        .every((key) => key in DEFAULTS && !EDITABLE_FIELDS.includes(key)),
+      '');
+  }
+
+  // ── ⑥ 含指代词时的旧用例：候选集合只由各段决定（缺陷 B 的性质仍要保住）───────
+  /* 旧行为（已修）：窗口单独成一路，**能把任何一段都没命中的块拉进候选**。
+   * 新实现里窗口**完全不参与打分**，这条性质反而是结构性的：候选只来自各段。 */
   const S1 = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
     + '有些细节写下来觉得清楚，过一段时间再看就模糊了，所以我才想再确认一下那份参考块之前。';
   const S2 = '那个 252 到底是多少。';
   const DISTANT = `${S1}${S2}`;
-  const matchedOf = (text) => {
-    const hit = index.search(text, { limit: 50, minMatchedTerms: 0, layers: ['raw'] }).find((h) => h.record === TARGET);
-    return hit === undefined ? 0 : hit.matched;
-  };
-  const windows = timeReferenceWindows(DISTANT);
-  check('（前提）确实产出了指代词邻近窗口', windows.length === 1, JSON.stringify(windows));
-  const winText = DISTANT.slice(windows[0].start, windows[0].end).trim();
-  check('（前提）单独取每一段都过不了证据门，只有"指代词邻近窗口"这一路能过',
-    matchedOf(S1) < matchedTermsFloor(S1) && matchedOf(S2) < matchedTermsFloor(S2)
-    && matchedOf(winText) >= matchedTermsFloor(winText),
-    `段1=${matchedOf(S1)}/${matchedTermsFloor(S1)} 段2=${matchedOf(S2)}/${matchedTermsFloor(S2)} 窗口=${matchedOf(winText)}/${matchedTermsFloor(winText)}`);
   const off = retrieveSegmented(index, DISTANT, { minScore: 0.28, maxItems: 2, timeBoost: false });
   const on = retrieveSegmented(index, DISTANT, { minScore: 0.28, maxItems: 2 });
-  check('（能失败·缺陷B2①）窗口**不能单独把新块拉进候选**：段都过不了门 → 目标块一条都不进（开关都一样）',
+  check('（能失败·缺陷B2①）段都过不了门 → 目标块一条都不进（时间重排开/关都一样，它改不了资格）',
     off.hits.length === 0 && on.hits.length === 0 && on.segments >= 2,
     `关=${off.hits.length} 条 开=${on.hits.length} 条 segments=${on.segments}`);
-  /* 断言"这条用例确实有窗口、而且窗口确实能命中目标块" —— 否则上面那条是空测
-   * （万一哪天窗口不再产出，上面就变成"什么都不测也绿"）。 */
-  check('（前提）窗口这一路确实能命中目标块（否则上一条是空测）',
-    matchedOf(winText) >= matchedTermsFloor(winText), `窗口 matched=${matchedOf(winText)}/${matchedTermsFloor(winText)}`);
+  check('（前提）这条用例确实产出了窗口（否则上面的"改不了资格"没有区分力）',
+    timeReferenceWindows(DISTANT).length > 0, JSON.stringify(timeReferenceWindows(DISTANT)));
+  /* 旧口径的"窗口这一路确实能命中目标块"断言（空测守卫）**随实现一起删除**：
+   * 窗口不再被当作查询去 `search`，那条断言守的东西已经不存在了。 */
 
-  // ② 已经有候选的块：窗口命中 → 加分。合成夹具（单块索引，窗口分 > 段分）。
-  {
-    const BOOST_TARGET = makeRecord({ layer: 'raw', at: EARLY, title: 'T', compactionId: 'b1', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省。' });
-    const boostIdx = new MemoryIndex([BOOST_TARGET]);
-    const BOOST_Q = '这两天我一直在整理这个插件的文档，顺手把面板说明也重新读了一遍，感觉信息量还是挺大的，'
-      + '有些细节写下来觉得清楚，过一段时间再看就模糊了。'
-      + '所以我之前确认过那份参考块要付多少。'
-      + '那个到底是多少。';
-    const bOff = retrieveSegmented(boostIdx, BOOST_Q, { minScore: 0.28, maxItems: 2, timeBoost: false });
-    const bOn = retrieveSegmented(boostIdx, BOOST_Q, { minScore: 0.28, maxItems: 2 });
-    check('（前提）这条夹具里目标块本来就是候选（否则"加成"无从谈起）',
-      bOff.hits.length === 1 && bOff.hits[0].record === BOOST_TARGET, `关=${bOff.hits.length} 条`);
-    check('（能失败·缺陷B2②）窗口命中已有候选 → 分数必须被抬高（×TIME_REFERENCE_BOOST 的量级）',
-      bOn.hits.length === 1 && bOn.topScore > bOff.topScore
-      && Math.abs(bOn.topScore - bOff.topScore * TIME_REFERENCE_BOOST) < 1e-9,
-      `关=${bOff.topScore?.toFixed(4)} 开=${bOn.topScore?.toFixed(4)} 系数=${TIME_REFERENCE_BOOST}`);
-  }
-
-  /* ③ 反例："恰好含『最早』二字但不相关"的块 —— 不许仅因窗口进入候选。
-   * 夹具：不相关块里写一句含「最早」的话，窗口落在它上面；段完全不命中它。 */
+  /* ③ 反例："恰好含『最早』二字但不相关"的块 —— 不许进入候选（判据是**证据门**，
+   * 与窗口无关；这条钉的是"窗口/时间都不许充当证据"这个性质）。 */
   {
     const NOISE = makeRecord({ layer: 'raw', at: LATE, title: '相机的事', compactionId: 'n1', text: '镜头和相机一直放在柜子里没有用过，二手店大概会给个什么价钱，周末打算去问问。' });
     const T2 = makeRecord({ layer: 'raw', at: EARLY, title: '撤掉参考块的代价', compactionId: 'n2', text: '问：撤掉参考块要付多少 token？答：252 token。参考块挂住不放反而更省。' });
     const noiseIdx = new MemoryIndex([NOISE, T2]);
-    const NOISE_Q = '最近整理文档的时候我翻到最早那台相机，想问问现在还能卖多少钱，顺便把柜子清一清，'
-      + '相机是很多年前买的，镜头也一直在柜子里放着，二手店大概会给个什么价钱呢，'
-      + '撤掉参考块要付多少 token 这件事我确认一下。';
+    const NOISE_Q = '原话是怎么说的？撤掉参考块要付多少 token，参考块挂住不放反而更省，这条我确认一下。';
     const nOff = retrieveSegmented(noiseIdx, NOISE_Q, { minScore: 0.28, maxItems: 2, timeBoost: false });
     const nOn = retrieveSegmented(noiseIdx, NOISE_Q, { minScore: 0.28, maxItems: 2 });
-    check('（前提）这条反例里"相机"那段自己就能命中（所以"它进候选"不是窗口造成的）',
-      nOff.hits.some((h) => h.record === NOISE), `关=${JSON.stringify(nOff.hits.map((h) => h.record.title))}`);
-    check('（前提）这条反例里确实产出了窗口（否则上一条是空测）',
-      timeReferenceWindows(NOISE_Q).length > 0, JSON.stringify(timeReferenceWindows(NOISE_Q)));
-    check('（前提）打开/关闭窗口加成，候选集合必须完全一致（窗口只加分、不加块）',
+    check('（前提）"相机"那块确实过不了证据门（它只与旧那版噪声查询沾边）',
+      nOff.hits.every((h) => h.record !== NOISE), `关=${JSON.stringify(nOff.hits.map((h) => h.record.title))}`);
+    check('（能失败）打开/关闭时间重排，候选**集合**必须完全一致（时间只重排、不改资格）',
       nOn.hits.map((h) => h.record.fp).join() === nOff.hits.map((h) => h.record.fp).join(),
       `开=${nOn.hits.length} 关=${nOff.hits.length}`);
+    /* 换成一条**旧噪声查询**（"最早"+相机），窗口就落在"相机"那一句上 ——
+     * 这时窗口命中它、时间也可能偏它，但它字面分**依旧不够**，所以两条路径都不许把它拉进来。
+     * 这是"窗口与时间都不许充当证据"的正面用例。 */
+    const CAMERA_Q = '最近整理文档的时候我翻到最早那台相机，想问问现在还能卖多少钱，顺便把柜子清一清。';
+    check('（前提）这条查询里"相机"那块的字面分也过不了门（窗口落在它身上也没用）',
+      noiseIdx.search(CAMERA_Q, { layers: ['raw'], limit: 10 }).every((hit) => hit.record !== NOISE)
+      && timeReferenceWindows(CAMERA_Q).length > 0,
+      `窗口=${JSON.stringify(timeReferenceWindows(CAMERA_Q))}`);
+    const camOn = retrieveSegmented(noiseIdx, CAMERA_Q, { minScore: 0.28, maxItems: 2 });
+    check('（能失败）窗口正落在"最早那台相机"那一句上 + 时间偏旧 → 那块**依然进不来**（无资格就是无资格）',
+      camOn.hits.every((h) => h.record !== NOISE), `注入了 ${JSON.stringify(camOn.hits.map((h) => h.record.title))}`);
   }
 
   // ── 不含指代词 → 行为**逐位不变** ──
@@ -2810,29 +3262,49 @@ console.log('\n=== 35. 时间指代词加权 + 同分优先较早（用户第 5 
     `开=${nOn.topScore} 关=${nOff.topScore}`);
 
   // ── 同分优先较早：只改平手，不碰分数不同的 ──
+  /* ⚠️ 2026-10-12 起时间重排在 `orderHits` **之前**，所以这条要用**两组**夹具分别钉：
+   *   ① 两块时间键**完全相同**（同 at、同 seq、同序号不可能 —— 序号不同！）——
+   *      序号不同会让系数微差，所以"同分"在真实库上其实很难出现。
+   *      因此这里改用**幅度区间夹成 [1,1]**（`timeBoostMin = timeBoostMax = 1`）把时间系数
+   *      中和掉，再验证"带指代词时同分 → 较早者在前"这条**规则本身**还在。
+   *   ② 不含指代词时保持既有排序（新者优先），这条不变。 */
   const tieEarly = makeRecord({ layer: 'raw', at: EARLY, title: '同分（早）', compactionId: 'h4', text: '之前定过注入上限，参考块撤掉要付 252 token，命中过的参考块一直挂着更省。' });
   const tieLate = makeRecord({ layer: 'raw', at: LATE, title: '同分（晚）', compactionId: 'h5', text: tieEarly.text });
   tieEarly.fp = 'unit-tie-early'; tieLate.fp = 'unit-tie-late';   // 同 text → 同 fp，会被索引去重
   const tieIdx = new MemoryIndex([tieEarly, tieLate]);
   const TIE_Q = '我们之前定的注入上限，参考块撤掉要付 252 token 吗，参考块撤掉要付 token 这件事你还记得吗';
-  const tieOn = retrieveSegmented(tieIdx, TIE_Q, { minScore: 0.28, maxItems: 2 });
   const tieOff = retrieveSegmented(tieIdx, TIE_Q, { minScore: 0.28, maxItems: 2, timeBoost: false });
-  check('（前提）确实造出了同分（否则这条断言无效）',
-    tieOn.hits.length === 2 && tieOn.hits[0].score === tieOn.hits[1].score,
-    `条数=${tieOn.hits.length} 分=${tieOn.hits.map((h) => h.score).join(' / ')}`);
-  check('（能失败）有问题带指代词时，同分下较早的块排在前', tieOn.hits.length > 0 && tieOn.hits[0].record.at === EARLY,
-    `第一条 at=${tieOn.hits[0]?.record?.at}`);
-  check('（能失败）不含指代词时保持既有排序（新者优先，不启用 preferEarlier）',
+  check('（能失败）不含指代词（timeBoost:false）时保持既有排序（新者优先，不启用 preferEarlier）',
     tieOff.hits.length > 0 && tieOff.hits[0].record.at === LATE, `第一条 at=${tieOff.hits[0]?.record?.at}`);
+  /* 把时间系数**中和**（区间 [1,1]）：这时两块分数完全相同（同 text、同长度），
+   * `orderHits` 的 `preferEarlier` 分支才有机会说话。 */
+  const neutral = { timeBoostMin: 1, timeBoostMax: 1 };
+  const tieNeutral = retrieveSegmented(tieIdx, TIE_Q, { minScore: 0.28, maxItems: 2, timeParams: neutral });
+  check('（前提）系数中和后确实造出了同分（否则下面那条断言无效）',
+    tieNeutral.hits.length === 2 && tieNeutral.hits[0].score === tieNeutral.hits[1].score,
+    `条数=${tieNeutral.hits.length} 分=${tieNeutral.hits.map((h) => h.score).join(' / ')}`);
+  check('（能失败）有问题带指代词时，同分下**较早**的块排在前（`preferEarlier` 规则仍在）',
+    tieNeutral.hits.length > 0 && tieNeutral.hits[0].record.at === EARLY,
+    `第一条 at=${tieNeutral.hits[0]?.record?.at}`);
+  /* 「之前」→ `'bell'`：EARLY 在位置 0、LATE 在位置 1，钟形在 0.7 最高 →
+   * LATE 那一块的系数更高，这正是"波峰偏新"的方向。 */
+  const tieOn = retrieveSegmented(tieIdx, TIE_Q, { minScore: 0.28, maxItems: 2 });
+  check('（前提）这条查询确实含指代词（否则"偏新"这半条没有区分力）',
+    timeReferenceShapeOf(TIE_Q) === 'bell', `形状=${timeReferenceShapeOf(TIE_Q)}`);
+  check('（能失败）默认参数下「之前」类（钟形偏新）让位置更新那一块在前（同字面分，差异只来自时间系数）',
+    tieOn.hits.length > 0 && tieOn.hits[0].record.at === LATE,
+    `第一条 at=${tieOn.hits[0]?.record?.at} 系数=${tieOn.hits[0]?.timeCoefficient}`);
 }
 
-console.log('\n=== 36. ✕ 关键词集中：结构化输出 + 兼容旧数组 + 集中度指标 ===');
+console.log('\n=== 36. ✕ 关键词集中：结构化输出 + 兼容旧数组 + 集中度指标 + 时间意图 ===');
 {
   /* 用户第 4 条：长问题要让辅助模型**先指出最关键的问题点**，再只在该处提炼关键词。
+   * 2026-10-12 追加：同一次调用里**顺带**输出"时间意图"（不新增调用）。
    * 能失败的验证：
    *   · 把 `parseFocusedRewrite` 改成"直接把所有字符串都当地关键词"→ 第 1 条（只取 `关键词` 字段）红；
    *   · 把旧数组兼容分支删掉 → 第 3 条红；
-   *   · 把 `keywordConcentration` 的 `spanRatio` 改成不做归一化 → 第 4 条红。 */
+   *   · 把 `keywordConcentration` 的 `spanRatio` 改成不做归一化 → 第 4 条红；
+   *   · 把"未知意图 → none"改成"原样返回" → §36.1 的未知取值那条红（详见那一节）。 */
   const focused = '{"点":"撤掉参考块要付多少 token","关键词":["撤掉参考块","252 token","快照重发"]}';
   const parsed = parseFocusedRewrite(focused);
   eq('（能失败）结构化输出的 `关键词` 被取出来', parsed?.terms, ['撤掉参考块', '252 token', '快照重发']);
@@ -2845,6 +3317,60 @@ console.log('\n=== 36. ✕ 关键词集中：结构化输出 + 兼容旧数组 +
   eq('（能失败）兼容 markdown 包裹（```json … ```）', parseFocusedRewrite('```json\n{"关键词":["成本账"]}\n```')?.terms, ['成本账']);
   eq('（能失败）既不是对象也不是数组 → null（调用方回 BAD_OUTPUT，不硬凑）', parseFocusedRewrite('抱歉我不能这么做'), null);
   eq('（能失败）对象里没有关键词字段 → null（不是"把值都当词"）', parseFocusedRewrite('{"点":"某个点"}'), null);
+
+  /* ── 36.1 **时间意图**（2026-10-12 新增字段；四个合法值 + 表外一律 none）─────────────
+   * 能失败（实测过）：
+   *   · 把 `timeIntentShapeOf` 改成"表外也认"（例如 `startsWith('earl')`）→「未知取值 → none」红；
+   *   · 把"缺字段 → none"改成 `null` 或抛错 →「缺字段 → none 且不报错」红；
+   *   · 把纯数组兼容分支里的 `intent: 'none'` 删掉（返回 `undefined`）→「纯数组 → none」红；
+   *   · 把 `TIME_INTENT_SHAPES` 里 `both_ends` → `'both_ends'` 改成别的形状名 →
+   *     §35.2 的曲线断言红（`timeCoefficient` 认不出那个名字 → 系数恒为 1）。 */
+  eq('（能失败）四个合法意图取值**逐字**列在 `TIME_INTENTS` 里（表变了必须同步改这里）',
+    [...TIME_INTENTS], ['earliest', 'recent', 'both_ends', 'none']);
+  eq('（能失败）意图 → 形状的映射（earliest→old / recent→new / both_ends→both_ends / none→null）',
+    TIME_INTENTS.map((intent) => timeIntentShapeOf(intent)), ['old', 'new', 'both_ends', null]);
+  check('（能失败）大小写与空白不敏感（模型写成 ` Both_Ends ` 也认）',
+    timeIntentShapeOf(' Both_Ends ') === 'both_ends' && timeIntentShapeOf('EARLIEST') === 'old',
+    JSON.stringify([timeIntentShapeOf(' Both_Ends '), timeIntentShapeOf('EARLIEST')]));
+  check('（能失败）**不认识的取值一律 none**（不硬凑、不猜方向）',
+    ['earliest_first', 'both', '两头', '', '  ', 'RECENTLY', 42, null, undefined, {}, []]
+      .every((value) => timeIntentShapeOf(value) === null),
+    JSON.stringify(['earliest_first', 'both', '两头', ''].map((v) => timeIntentShapeOf(v))));
+  /* 解析：新口径带 `时间意图`；四个合法值各测一遍。 */
+  eq('（能失败）解析出 `earliest`',
+    parseFocusedRewrite('{"点":"x","关键词":["成本账"],"时间意图":"earliest"}')?.intent, 'earliest');
+  eq('（能失败）解析出 `recent`',
+    parseFocusedRewrite('{"点":"x","关键词":["成本账"],"时间意图":"recent"}')?.intent, 'recent');
+  eq('（能失败）解析出 `both_ends`（用户要的"两头"）',
+    parseFocusedRewrite('{"点":"x","关键词":["成本账"],"时间意图":"both_ends"}')?.intent, 'both_ends');
+  eq('（能失败）解析出 `none`',
+    parseFocusedRewrite('{"点":"x","关键词":["成本账"],"时间意图":"none"}')?.intent, 'none');
+  eq('（能失败）未知取值 → `none`（**不报错、也不硬凑**，同一次解析仍然给出关键词）',
+    parseFocusedRewrite('{"关键词":["成本账"],"时间意图":"sometimes"}')?.intent, 'none');
+  eq('（能失败）字段缺失（只有 点 + 关键词）→ `none`，且**不报错**',
+    parseFocusedRewrite('{"点":"x","关键词":["成本账"]}')?.intent, 'none');
+  eq('（能失败）旧口径**纯数组** → `none`，且**不报错**（升级不许丢已算好的结果）',
+    parseFocusedRewrite('["撤掉参考块","252 token"]')?.intent, 'none');
+  eq('（能失败）旧缓存里的非法值读回来也被规范成 `none`（`normalizeTimeIntent` 对任意值安全）',
+    [normalizeTimeIntent(42), normalizeTimeIntent(undefined), normalizeTimeIntent('EARLIEST'), normalizeTimeIntent('both_ends')],
+    ['none', 'none', 'earliest', 'both_ends']);
+  /* 提示词的**固定文本**性质（与 `pagePickSystem` 同一条既有口径）：新增了整段"时间意图"
+   * 说明文字之后，仍然**不许**含任何查询词；另配一条自指，证明判据不是恒真。 */
+  {
+    const rewriteSystem = focusedRewriteSystem();
+    const probeQuery = '菠萝蜜与量子纠缠的第十七号备注';
+    const probeTokens = [...new Set(tokenize(probeQuery))].filter((token) => token.length >= 2);
+    check('（前提）探测查询确实有 ≥4 个 token（否则这条可能是空转）', probeTokens.length >= 4, `tokens=${JSON.stringify(probeTokens)}`);
+    eq('（能失败）改写提示词（含新增的"时间意图"整段）里不含查询里的任何 token',
+      probeTokens.filter((token) => rewriteSystem.includes(token)), []);
+    check('（自指）把查询词拼进改写提示词 → 同一条判据会红',
+      probeTokens.some((token) => `${rewriteSystem} ${probeQuery}`.includes(token)), '');
+    /* 四个取值必须**真的写进了提示词**（否则模型无从知道该输出什么）—— 这同时钉住
+     * "提示词与 `TIME_INTENTS` 不许各写一份"。 */
+    check('（能失败）四个合法取值都出现在提示词里（模型有依据可循）',
+      TIME_INTENTS.every((intent) => rewriteSystem.includes(intent)),
+      `缺=${TIME_INTENTS.filter((intent) => !rewriteSystem.includes(intent)).join(',') || '(无)'}`);
+  }
 
   // ── 集中度指标：1,000+ 字、话题散落的长问题 ──
   // ⚠️ 必须**真的**超过 1000 字：短问题测不出"散落"（首尾距离天然就小）。

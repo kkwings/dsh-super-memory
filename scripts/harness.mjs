@@ -1624,16 +1624,107 @@ console.log('\n=== ⑥ 验收补充（对应交接报告 §6 的 18 / 16 / 21）
      * 它同时钉住"`hasTimeReference` 认得出这条提问"——把"第一次"从词表里删掉，
      * 这条提问就不再被当作"问了时间指代词"，`timeBoost` 那一路整段不生效，分数逐位相同 → 红。
      * 这比前面那条 #21/#51 的 top-1 断言更严：只断言"命中哪一块"时，#51 靠"控制面板"三个字
-     * 也能命中，删掉词表照样绿（实测过：那条断言在词表被破坏时仍通过）。 */
+     * 也能命中，删掉词表照样绿（实测过：那条断言在词表被破坏时仍通过）。
+     *
+     * ⚠️ **2026-10-12 改（多类冲突 → 不重排）**：这条提问同时含 `当时`（mid）与
+     * `第一次`/`最早`（far）→ 新口径判"分不清"→ `shape === null` → **这一轮不做时间重排**，
+     * 所以"关掉后分数不同"这条**对新口径不再成立**（两侧都是纯词法分，逐位相同）。
+     * 期望值随之改成**新意图**（不改判据、不放宽）：两侧必须**逐位相同** —— 它守的正是
+     * "分不清就不重排"这条新规则；另配一条**同库单类提问**证明"重排整体没坏"（下一条）。 */
     const nOff = retrieveSegmented(index, q4, {
       minScore: DEFAULTS.minScore, maxItems: DEFAULTS.maxItems,
       preferSummaryChunks: DEFAULTS.preferSummaryChunks, timeBoost: false,
     });
     const scoreKey = (result) => result.hits.map((hit) => `${indexOf.get(hit.record)}:${Number(hit.score).toFixed(4)}`).join(',');
-    expectReal('（能失败·缺陷B）这条提问含「第一次」→ 指代词加权必须真的生效（关掉后分数/结果逐位不同）',
-      nOff.hits.length > 0 && scoreKey(nOff) !== scoreKey(r4),
+    expectReal('（能失败·新意图）多类冲突的提问（含「当时」+「第一次」/「最早」）→ 开/关时间重排**逐位相同**（分不清就不重排）',
+      nOff.hits.length > 0 && scoreKey(nOff) === scoreKey(r4),
       `关=${scoreKey(nOff)} 开=${scoreKey(r4)}`);
+    /* 对照（防"一刀切把重排关掉"）：**同一条提问只留一个类**（把 mid 的「当时…」整段删掉、
+     * 只留 far 的「第一次 / 最早」）→ 时间重排必须**真的生效**（关掉后分数不同）。
+     * 它证明"不重排"是**判出来的**，不是"整条功能被关掉了"。 */
+    const { timeReferenceShapeOf: shapeOfReal } = await import('../lib/text.js');
+    const q4Far = q4.replace(/有些细节当时以为很清楚，过一段时间再看就模糊了，/g, '');
+    const shapeFar = shapeOfReal(q4Far);
+    const r4Far = ask(q4Far);
+    const nOffFar = retrieveSegmented(index, q4Far, {
+      minScore: DEFAULTS.minScore, maxItems: DEFAULTS.maxItems,
+      preferSummaryChunks: DEFAULTS.preferSummaryChunks, timeBoost: false,
+    });
+    expectReal('（前提·新意图）对照用例确实只剩一个类（far）—— 否则它和上面那条没有区别',
+      shapeFar === 'old', `形状=${shapeFar}`);
+    expectReal('（能失败·新意图对照）只命中一个类的提问 → 时间重排**仍然生效**（关掉后分数不同）',
+      nOffFar.hits.length > 0 && scoreKey(nOffFar) !== scoreKey(r4Far),
+      `关=${scoreKey(nOffFar)} 开=${scoreKey(r4Far)}`);
     console.log(`  永久回归 ⓐ 段累计：通过若干，失败 ${dRealFailed} 条。`);
+
+    /* ⑤ **真实库全量提问**上的"不含指代词 → 逐位不变"回归（用户要求的那条：
+     *    "用真实库 108 条无关指代词提问或等价夹具"钉住"加权不改任何没问指代词的那一轮"）。
+     *
+     * 口径：拿**真实会话日志里全部真实提问**逐条跑 `retrieveSegmented`，比较 `timeBoost` 开/关：
+     *   · **不含指代词**的提问 → `topScore` / `tier` / 注入块的 fp 序列**必须逐位相同**；
+     *   · **含指代词**的提问 → 分数与**取哪 ≤2 条**都可以变（那正是排序该起的作用），
+     *     但 `candidates`（= **过了证据门与 minScore 的那一批**，见 `retrieveSegmented` 的
+     *     `candidatePool` 注释）**必须逐位相同** —— 那才是"资格"。
+     *     ⚠️ **不要**拿 `hits` 的 fp 序列当资格判据：`hits` 是"从候选里取 ≤maxItems 条"，
+     *     时间重排改了顺序 → 取走的那 2 条当然可能换人。实测真实库 65 条含指代词提问里有
+     *     **24 条**的 `hits` 会变，而 `candidates` 是 **0 条**变 —— 这两件事必须分开断言，
+     *     混在一起就会把"排序生效"误报成"加权越权"（本轮实测踩过这个假红）。
+     *
+     * 为什么这条只能放在这里：`unit.mjs` 是零 I/O 的合成夹具，它拿不到"真实库里真实提问"
+     * 这种规模与分布。用真实库 + 真实提问才能覆盖"同一 at 的几十块挤在一起"这类真实形态。
+     *
+     * 能失败（实测过）：把 `rankQualifiedByTime` 的 `shape === null` 早返回删掉（让不含指代词的
+     * 那一轮也乘系数）→ 第一条立刻红；把 `retrieveSegmented` 的资格判定挪到时间重排之后
+     * → 第二条立刻红（`candidates` 会跟着变）。 */
+    const TERMS_FOR_REAL = ['第一次', '最早', '原先', '原来', '上次', '上回', '之前', '先前', '早先', '当初', '刚才',
+      '刚刚', '刚', '前面', '上面', '以前', '曾', '那时', '当时', '最初', '初次', '首度', '首次'];
+    const hasTerm = (text) => TERMS_FOR_REAL.some((term) => text.includes(term));
+    const realQuestions = events
+      .filter((event) => event.type === 'user/message')
+      .map((event) => questionTextOf(event.data))
+      .filter((text) => text !== '');
+    const uniqQuestions = [...new Set(realQuestions)];
+    let plainChecked = 0;
+    let plainBroken = 0;
+    let termChecked = 0;
+    let termQualifiedBroken = 0;
+    let termHitsMoved = 0;
+    let scoreMoved = 0;
+    for (const question of uniqQuestions) {
+      const opts = { minScore: DEFAULTS.minScore, maxItems: DEFAULTS.maxItems, preferSummaryChunks: DEFAULTS.preferSummaryChunks };
+      const withTime = retrieveSegmented(index, question, opts);
+      const without = retrieveSegmented(index, question, { ...opts, timeBoost: false });
+      const ids = (result) => result.hits.map((hit) => String(hit.record?.fp ?? '')).join(',');
+      const qualifiedIds = (result) => (result.candidates ?? []).map((item) => String(item.record?.fp ?? '')).join(',');
+      if (!hasTerm(question)) {
+        plainChecked += 1;
+        if (withTime.topScore !== without.topScore || withTime.tier !== without.tier || ids(withTime) !== ids(without)) {
+          plainBroken += 1;
+          if (plainBroken <= 3) console.log(`      ⚠ 不含指代词却变了：${question.slice(0, 40)}`);
+        }
+        continue;
+      }
+      termChecked += 1;
+      /* ① **资格**：过了门的候选集合（fp 序列 + 每条的纯词法分）必须逐位相同。 */
+      const onQualified = (withTime.candidates ?? []).map((item) => `${item.record?.fp}:${Number(item.lexicalScore).toFixed(6)}`).join(',');
+      const offQualified = (without.candidates ?? []).map((item) => `${item.record?.fp}:${Number(item.lexicalScore).toFixed(6)}`).join(',');
+      if (onQualified !== offQualified || withTime.tier !== without.tier) {
+        termQualifiedBroken += 1;
+        if (termQualifiedBroken <= 3) console.log(`      ⚠ 含指代词但**资格集合**变了（加权越权）：${question.slice(0, 40)}`);
+      }
+      /* ② **排序确实在干活**：`hits`（取走的 ≤2 条）会变，那是允许的、也是要证明的。 */
+      if (ids(withTime) !== ids(without)) termHitsMoved += 1;
+      if (withTime.topScore !== without.topScore) scoreMoved += 1;
+    }
+    expectReal('（e2e·能失败）真实提问全量：**不含指代词**的每一轮，开/关时间重排逐位相同',
+      plainChecked >= 50 && plainBroken === 0,
+      `检查 ${plainChecked} 条不含指代词的提问，变了 ${plainBroken} 条（唯一提问总数 ${uniqQuestions.length}）`);
+    expectReal('（e2e·能失败）真实提问全量：**含指代词**的提问，时间重排不碰**资格**（过门候选集合与纯词法分逐位相同）',
+      termChecked >= 20 && termQualifiedBroken === 0,
+      `检查 ${termChecked} 条含指代词的提问，资格集合变了 ${termQualifiedBroken} 条`);
+    expectReal('（前提·能失败）时间重排**确实在真实库上生效**（否则上面那条"资格没变"是空测）',
+      scoreMoved >= 5 && termHitsMoved >= 1,
+      `含指代词提问里：分数被改变的 ${scoreMoved} 条、取走的 ≤2 条发生变化的 ${termHitsMoved} 条`);
   }
 }
 

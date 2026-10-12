@@ -33,14 +33,30 @@ This section exists because it genuinely **cannot recall things "the way a perso
 2. **It matches words, not meaning.**
    If your wording differs from the original, it may miss. We tried adding a local embedding model (turn text into vectors and compare): it was **not better** than word matching on our real store, and would have cost several hundred MB — so it is not shipped. Re-phrasings still depend on the optional auxiliary model (§7).
 
-3. **"Earliest / first time / last time" is recognised now, but not reasoned about.**
-   Since 0.2.5 those time-reference words are detected, the words near them are weighted up, and earlier records win ties — but the plugin **cannot decide on its own** which stretch of time to search. That step belongs to **the model you are talking to**.
+3. **"Earliest / first time / last time / just now" is recognised now, in three shape classes.**
+   Since 0.2.6 those time-reference words are detected, and **weighting only re-orders, it never changes who is eligible for injection** (eligibility is decided purely by lexical score + evidence gate).
+   Three classes, three time shapes: **just now / 刚刚** → newer is higher; **earliest / 第一次 / 最初** → older is higher;
+   **之前 / 上次 / 原来 (previously, last time, originally)** → a bell peaking just behind the present, both ends lower but never zeroed.
+   **When one message hits two different classes at once** (e.g. "the idea you mentioned just now and brought up earliest") → **no time re-ordering happens this round**:
+   what that sentence really wants is **both ends** (the earliest pass plus the most recent pass; this is the third time you ask), and the
+   automatic retrieval path has **no model available** to figure that out — so the rule is "**better to do nothing than to do it wrong**"
+   (a fixed priority would necessarily pick one side).
+   The amplitude is bounded (default 0.7×–1.35×, tunable in the settings file via `timeBoostMin` / `timeBoostMax` and five more keys).
+   **"Both ends" is the job of the ✕ path**: the helper model judges a *time intent* (`earliest` / `recent` / `both_ends` / `none`)
+   **within the rewrite call it already makes**, and `both_ends` selects the **both-ends-high, middle-low** shape. That intent
+   **only re-orders, never changes eligibility**, and adds **no extra model call** (§7).
+   It still **cannot decide on its own** which stretch of time to search. That step belongs to **the model you are talking to**.
 
 4. **It cannot think for you, and cannot send messages.**
    All it can do is put a few passages **in front of the model**. Platform limit: a plugin cannot insert a message into the session or make the model answer again — so what ✕ finds arrives in your **next** turn (§4).
 
 5. **It does not guarantee a hit — but it says so.**
    When nothing is found it prints "no strongly related content" instead of padding. A miss costs zero tokens.
+
+5.5 **It can locate a block, not the turn inside it.**
+   One block typically holds **several question/answer turns** (blocks are cut by character count: target 900, cap 1500). So what it gives you is "**this passage appeared somewhere in these turns**", not "**it was said in turn N**".
+   Measured cost: **every block written by the same compaction carries the identical timestamp** (223 blocks in the reference store share only **5 distinct timestamps**) and there is no turn field — so time ordering is only approximate *within* one compaction, using file order (**exact across compactions, approximate inside one**).
+   A finer order would require writing the turn or an intra-block offset at ingest time, which means **rebuilding the store** — not done this round (cost outweighs the benefit).
 
 6. **One line: it is a car, not a turnstile.**
    It is good at "**the thing you are asking about has a distinctive wording and was compacted**", and bad at "**you ask the way you'd talk to a person**". The latter needs the **model to understand your intent first and then drive it** — e.g. when you ask "how did we originally decide the control panel thing", the correct move is to first realise this means "find the earliest one", then drive the search with "control panel"; tapping it like a card reader fails.
