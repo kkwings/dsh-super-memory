@@ -31,7 +31,7 @@ import {
   NEAR_DUPLICATE_SIMILARITY, formatRecall, itemText, queryForMessage, questionTextOf, queryTextOf, selectFreshHits,
 } from '../lib/recall.js';
 import {
-  buildPage, formatPage, buildPagePrompt, focusedRewriteSystem, keywordConcentration, normalizeTimeIntent, pagePickSystem, parseFocusedRewrite, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
+  buildPage, formatPage, buildPagePrompt, focusedRewriteSystem, keywordConcentration, normalizeTimeIntent, pageIntentHint, pagePickSystem, parseFocusedRewrite, parsePageIntent, parsePagePick, pickAcrossPages, snippetOf, timeLabelOf,
 } from '../lib/diagnose.js';
 import { mergeUsage, createLlmGateway } from '../lib/llm.js';
 import { STRONG_HIT_RATIO, RateLimiter, makeRoutes, rewriteRateLimits, sessionLogSizeHint, spawnDetached, strongHitScore } from '../lib/routes.js';
@@ -2343,6 +2343,244 @@ console.log('\n=== 27. ✕：提问归属（messageId → 该轮提问）+ 候�
       queryForMessage(hostTask, 'msg-task').reason, 'no-question');
   }
 
+  /* ── 27.7 **时间意图从改写里解耦**（2026-10-12 第二次回归修复，用户 A 项）────────────
+   * 盲区：本地强命中时改写**整段被跳过**（真实日志 `rewrite-skipped
+   * reason=local-strong-hit best=0.8007`）→ 恰恰在用户点 ✕ 的主场景里时间意图从没跑过。
+   * 修法：让**本来就要发生的**分页判读（`selectPages` / `pagePickSystem`）顺带把意图带回来，
+   * **一次模型调用都不增加**。
+   *
+   * 能失败（实测过）：
+   *   · 把 `parsePageIntent` 改成"前缀匹配"（`startsWith`）→「earliest_first 不认」红；
+   *   · 把 `pickAcrossPages` 里 `if (asked === 1)` 去掉（每页都解析）→「只认第一页」红；
+   *   · 让 `selectPages` 为了拿意图**多问一次** → 下面第 4 条（调用次数）红。 */
+  {
+    /* 解析：识别 + 边界。 */
+    eq('（能失败）`7 earliest` → 解析出 earliest（编号与意图同一条回答）', parsePageIntent('7 earliest'), 'earliest');
+    eq('（能失败）`NONE both_ends` → 也解析得出来（本页没有≠没有意图）', parsePageIntent('NONE both_ends'), 'both_ends');
+    eq('（能失败）大小写与空白不敏感', parsePageIntent('  7   BOTH_ENDS \n'), 'both_ends');
+    eq('（能失败）只回编号（模型没理那一问）→ null（**不猜**）', parsePageIntent('7'), null);
+    eq('（能失败）表外取值一律 null（不许前缀匹配）', parsePageIntent('7 earliest_first'), null);
+    eq('（能失败）出现多个合法词（模型在解释选项）→ null（替它选一个等于编意图）',
+      parsePageIntent('7 earliest 但有时 recent'), null);
+    eq('（能失败）同一词重复出现仍然认（去重后只有一个）', parsePageIntent('7 both_ends both_ends'), 'both_ends');
+    eq('（能失败）空/非字符串输入安全', [parsePageIntent(''), parsePageIntent(42), parsePageIntent(null)].join(','), ',,');
+    eq('（能失败）四个合法取值逐字都能解析（与 `TIME_INTENTS` 同一张表）',
+      TIME_INTENTS.map((intent) => parsePageIntent(`3 ${intent}`)), [...TIME_INTENTS]);
+    /* ⚠️ `NONE` 哨兵与意图取值 `none` **同名**（都是 `none`）：哨兵先被摘掉，
+     * 所以 `NONE`（= 本页没有）**不会**被误当成"意图 = none"，也不会与另一个词冲突。
+     * 能失败：把 `withoutSentinel` 换回 `raw` → 第一条红（`NONE both_ends` 被读成两个词）。 */
+    eq('（能失败）`NONE both_ends` 里那个 `NONE` 哨兵**不算**一个意图词', parsePageIntent('NONE both_ends'), 'both_ends');
+    eq('（能失败）单独一个 `NONE`（模型没理那一问）→ null（摘掉哨兵后没有意图词）', parsePageIntent('NONE'), null);
+
+    /* 提示词：意图那一问**只加在第一页**，且**不写进系统提示词**（`pagePickSystem` 有一条
+     * 既有断言"系统提示词里不出现'最早'这类语义词"）。 */
+    const intentPage = buildPage([makeRecord({ layer: 'summary', title: '甲', compactionId: 'i1', text: '甲的正文。' })], 0, { pageSize: 30 });
+    const withIntent = buildPagePrompt('某问题', intentPage, { intent: true });
+    const withoutIntent = buildPagePrompt('某问题', intentPage);
+    check('（能失败）加了那一问之后，四个合法取值都出现在**用户消息**里（模型有依据可循）',
+      TIME_INTENTS.every((intent) => withIntent.includes(intent)),
+      `缺=${TIME_INTENTS.filter((intent) => !withIntent.includes(intent)).join(',') || '(无)'}`);
+    check('（能失败）不加那一问时，用户消息里**没有**任何意图取值（否则等于每页都在问）',
+      !TIME_INTENTS.some((intent) => withoutIntent.includes(intent)),
+      '第二页起不该再问');
+    check('（能失败）那一问**明说"不要因此改变你挑的那一条"**（判读只该做一件事，顺带问不许干扰它）',
+      withIntent.includes('不要因此改变你挑的那一条'), withIntent.slice(-120));
+    eq('（能失败）意图那一问**不写进系统提示词**（系统提示词仍是固定文本、无语义词）',
+      TIME_INTENTS.filter((intent) => pagePickSystem().includes(intent)), []);
+
+    /* 端到端：**只认第一次发出去的那一页**的意图 + **调用次数不增加**。 */
+    const mkIntent = (n, prefix) => Array.from({ length: n }, (_, i) => makeRecord({
+      layer: 'summary', title: `${prefix}${i + 1}`, compactionId: `${prefix}-${i}`, text: `${prefix} 第 ${i + 1} 条的正文。`,
+    }));
+    /* ⚠️ 两页必须来自**同一个池**：`buildPage(records, offset)` 是在 `records` 里从
+     * `offset` 开始取的，拿"只有 30 条的 B 批 + offset=30"去造第二页会得到**空页**
+     * （`offset` 正好等于长度）→ 翻页循环把它当空页跳过，第二页永远不会被问到。 */
+    const iPool = [...mkIntent(30, 'A'), ...mkIntent(30, 'B')];
+    const iPages = [
+      buildPage(iPool, 0, { pageSize: 30 }),
+      buildPage(iPool, 30, { pageSize: 30 }),
+    ];
+    eq('（前提）两页各自 30 条（第二页不是空页，否则下面的翻页断言是空测）',
+      `${iPages[0].items.length}/${iPages[1].items.length}`, '30/30');
+    const askedPages = [];
+    const spanned = await pickAcrossPages({
+      pages: iPages,
+      pageLimit: 4,
+      ask: async (page) => {
+        askedPages.push(page.page);
+        // 第一页回 NONE + 意图；第二页才命中，且**乱给**一个意图（不该被采信）
+        return page.page === 0 ? { ok: true, text: 'NONE both_ends' } : { ok: true, text: '4 earliest' };
+      },
+    });
+    eq('（能失败）翻了两页（前提：意图有机会被第二页覆盖）', askedPages, [0, 1]);
+    eq('（能失败）意图取**第一次发出去的那一页**的（第二页乱给的那个不算）', spanned.intent, 'both_ends');
+    eq('（能失败）翻页与命中的既有行为一个字没变（命中第 2 页第 4 条）',
+      `${spanned.page}/${spanned.index}/${spanned.found}`, '2/4/true');
+    /* 全页 NONE：意图照旧带出（它是"提问的性质"，与"这批有没有命中"无关）。 */
+    const allNone = await pickAcrossPages({
+      pages: iPages,
+      pageLimit: 4,
+      ask: async () => ({ ok: true, text: 'NONE none' }),
+    });
+    eq('（能失败）全页都没命中时意图仍然带出（`none` 也是一个明确的判断）', allNone.intent, 'none');
+    eq('（能失败）没命中就是没命中（不许因为拿了意图就硬凑一条）', allNone.record, null);
+    /* 调用失败：不阻断，意图是那一页的回答里能解析到什么就是什么。 */
+    const failed = await pickAcrossPages({
+      pages: iPages,
+      pageLimit: 4,
+      ask: async () => ({ ok: false, code: 'TIMEOUT', text: '' }),
+    });
+    eq('（能失败）调用失败时意图为 null（不报错、不硬凑）', failed.intent, null);
+    eq('（能失败）调用失败的既有行为没变（立刻停、带稳定 code）', failed.stopped, 'TIMEOUT');
+  }
+
+  /* ── 27.8 端到端：**改写被跳过时，意图由分页判读顺带给出**（A 项的核心）────────────
+   * 这一段量的是"本地强命中 → 改写一次都不调用"那条路上，意图**还跑不跑**。
+   * 判据是**两个计数**：`rewriteQuery` = 0（改写确实没发生）而 `pick` ≥ 1
+   * （判读发生了，意图就从它那里来）—— 也就是"**不新增任何模型调用**"的证据。
+   *
+   * 能失败（实测过）：把 `lib/routes.js` 里 `applyPickIntent(judged?.intent)` 删掉
+   * （= 意图只看改写）→ 第 3 条红（`timeIntent.value` 退化成 `none`）。 */
+  {
+    const intentWs = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-pickintent-'));
+    const intentRoot = storeRoot(intentWs, '.dsh-compaction-memory');
+    const intentSid = `session-pickintent-${Date.now()}`;
+    const SHARED = '结论：单轮注入上限从 500 提到 700，两条满额中文块才装得下。';
+    /* 三块同正文（字面分相同）、只有 `at` 不同 → 顺序差异只可能来自时间系数。 */
+    const markIt = (title, at, fp) => {
+      const record = makeRecord({ layer: 'summary', session: intentSid, at, title, compactionId: `pi-${fp}`, text: SHARED });
+      record.fp = fp;
+      return record;
+    };
+    appendRecords(intentRoot, intentSid, [
+      markIt('最早那条', '2026-10-01T00:00:00.000Z', 'unit-pi-early'),
+      markIt('中间那条', '2026-10-05T00:00:00.000Z', 'unit-pi-mid'),
+      markIt('最新那条', '2026-10-09T00:00:00.000Z', 'unit-pi-late'),
+    ]);
+    const PICK_Q = '单轮注入上限从 500 提到 700 这件事我们是怎么定的，两条满额中文块真的装得下吗';
+    /* 假网关：**改写与判读都计数**。
+     *   · `rewriteQuery` 这次**不该被调用**（本地强命中 → 跳过改写，见 `skippedRewrite`）；
+     *   · `selectPages` 会被调用（判读照常），并顺带给出 `both_ends` 意图；
+     *   · 判读**失败**（`ok:false`）→ `strong` 退回本地粗筛（多条）→ 注入资料的**顺序**
+     *     就是重排后的顺序，于是"意图真的生效了"看得出来。 */
+    const runSkipped = async (pickIntent) => {
+      const count = { rewrite: 0, pick: 0 };
+      const routes = makeRoutes({
+        settings: { get: () => ({ settings: { ...DEFAULTS, minScore: 0.01, protectRecentDays: 0, storeDir: '.dsh-compaction-memory', llmMode: 'custom', llmAssistEnabled: true, llmRecallRewrite: true } }) },
+        diag: { write: () => {} },
+        states: new Map(),
+        knownWorkspaces: () => [intentWs],
+        build: 'test',
+        llm: {
+          rewriteQuery: async () => { count.rewrite += 1; return { ok: true, terms: [], intent: 'none', cached: false }; },
+          selectPages: async () => { count.pick += 1; return { ok: false, code: 'TIMEOUT', hint: '假模型超时', asked: 1, page: 1, intent: pickIntent }; },
+          status: () => ({ enabled: true }),
+        },
+        dataHome: intentWs,
+        findSession: (id) => (id === intentSid ? { id, header: { cwd: intentWs }, snapshotEvents: () => [] } : null),
+        boostFor: () => true,
+      });
+      const out = [];
+      const req = {
+        url: '/api/dsh-super-memory/diagnose',
+        method: 'POST',
+        headers: { 'x-dsh-super-memory': '1', 'content-type': 'application/json' },
+        async *[Symbol.asyncIterator]() { yield Buffer.from(JSON.stringify({ workspace: intentWs, session: intentSid, query: PICK_Q, rewrite: true, boost: true }), 'utf8'); },
+      };
+      await routes.handler(req, { status: 0, writeHead: () => {}, end: (text) => out.push(JSON.parse(text)) });
+      const value = out[0]?.value ?? {};
+      const titles = String(value.material ?? '').split('\n\n')
+        .map((para) => (/】(.+)\n/.exec(para) ?? [])[1] ?? '')
+        .filter((title) => title !== '');
+      return { value, count, titles };
+    };
+    const off = await runSkipped(null);
+    const on = await runSkipped('both_ends');
+    check('（前提）这条用例确实走了"本地强命中 → 跳过改写"（否则下面量的是另一条路）',
+      off.value.rewriteSkipped === true, `rewriteSkipped=${JSON.stringify(off.value.rewriteSkipped)}`);
+    /* ① **改写一次都没发生**（既有铁律：本地强命中就不为改写花钱）。 */
+    eq('（能失败）本地强命中 → 改写调用 0 次（这条省钱路径没被这次改动破坏）', off.count.rewrite, 0);
+    /* ② **判读照常发生** —— 意图就是从这**本来就要花的**一次调用里顺带拿到的。 */
+    check('（前提）判读发生了（意图的来源就是它，不是新调用）', off.count.pick >= 1, `pick=${off.count.pick}`);
+    /* ③ 意图真的接上了（改写没给，判读给了）。
+     *    ⚠️ 只认**最后一个** `miss-time-intent` 诊断事件的内容不方便（这里 diag 是桩），
+     *    所以直接看回执：`timeIntent.via === 'pageread'` 就是"由判读顺带给出"的铁证。 */
+    eq('（能失败）改写被跳过时，意图**由分页判读顺带给出**（`via=pageread`）',
+      off.value.timeIntent?.value, 'none');
+    eq('（能失败）没给意图时如实记为 `none`（不重排，行为与改动前逐位相同）',
+      off.value.timeIntent?.via, 'none');
+    eq('（能失败）判读给出可用意图时，回执带出它并注明来源',
+      [on.value.timeIntent?.value, on.value.timeIntent?.via], ['both_ends', 'pageread']);
+    /* ④ **顺序真的变了、成员一个不多不少**（既有铁律：只重排、不改资格）。 */
+    check('（前提）两次注入的段数都 ≥2（否则"顺序变了"看不出来，下面那条是空测）',
+      off.titles.length >= 2 && on.titles.length >= 2, `off=${JSON.stringify(off.titles)} on=${JSON.stringify(on.titles)}`);
+    eq('（能失败）意图只改顺序、不改成员（两次的段集合逐字相同）',
+      on.titles.slice().sort(), off.titles.slice().sort());
+    check('（能失败）`both_ends` 意图**真的改了顺序**（与"没意图"的顺序不同 —— 功能接上了）',
+      on.titles.join('|') !== off.titles.join('|'),
+      `none=${off.titles.join(' > ')} both_ends=${on.titles.join(' > ')}`);
+    /* ⑤ 资格不变：found / boosting 与有没有意图无关。 */
+    eq('（能失败）`found` 与意图无关（意图改不了"要不要注入"）',
+      [on.value.found, off.value.found], [off.value.found, off.value.found]);
+    eq('（能失败）`boosting` 与意图无关（意图改不了"排不排进下一轮"）',
+      [on.value.boosting, off.value.boosting], [off.value.boosting, off.value.boosting]);
+    /* ⑥ **不新增调用**的总账：判读次数在"有意图/没意图"两次之间不变。 */
+    eq('（能失败）拿意图**没有多花一次判读**（两次的判读次数相同）', on.count.pick, off.count.pick);
+    fs.rmSync(intentWs, { recursive: true, force: true });
+  }
+
+  /* ── 27.9 真实网关那一层：意图那一问**只加在第一页**、且**一次调用都没多**（A 项）────
+   * 上面 27.7/27.8 量的是纯函数与路由；这里把**真的 `selectPages`**（`lib/llm.js`）跑一遍，
+   * 因为"第一页"这件事只有它知道（`firstAsked` 在 `ask` 回调里翻转）。
+   * 判据两条：
+   *   · 每页送出去的**用户消息**里，只有第 1 页含"时间意图"那一问（逐页核对，不是抽样）；
+   *   · **模型调用次数 = 翻的页数**（拿意图没有让任何一页被多问一次）。
+   * 能失败（实测过）：把 `{ intent: firstAsked }` 改成 `{ intent: true }` → 第 1 条红。 */
+  {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-pagesintent-'));
+    const settings = { ...DEFAULTS, llmMode: 'custom', llmProvider: 'p', llmModel: 'm', llmDailyCallCap: 0 };
+    const prompts = [];
+    let picks = 0;
+    const mk30 = (prefix) => Array.from({ length: 30 }, (_, i) => makeRecord({
+      layer: 'summary', title: `${prefix}${i + 1}`, compactionId: `${prefix}-${i}`, text: `${prefix} 第 ${i + 1} 条的正文。`,
+    }));
+    const gateway = createLlmGateway({
+      getLlm: () => ({
+        async *stream(input) {
+          picks += 1;
+          prompts.push(String(input?.messages?.[0]?.content?.[0]?.text ?? ''));
+          // 每页都回 NONE（一路翻到底），最后一页才命中 —— 这样"每一页都被问过"。
+          const pageNo = prompts.length;
+          yield { type: 'text-delta', text: pageNo >= 3 ? `${pageNo} earliest` : 'NONE recent' };
+          yield { type: 'finish', kind: 'stop' };
+        },
+        listProviders: async () => [],
+      }),
+      getSettings: () => settings,
+      diag: { write: () => {} },
+      usagePath: path.join(dir, 'usage.json'),
+      cachePath: path.join(dir, 'cache.json'),
+    });
+    const pool = [
+      ...mk30('P'), ...mk30('Q'), ...mk30('R'),
+    ];
+    const pages = [0, 30, 60].map((offset) => buildPage(pool, offset, { pageSize: 30 }));
+    const picked = await gateway.selectPages({ session: null, query: '菠萝蜜与量子纠缠的第十七号备注', pages, pageLimit: 4 });
+    eq('（前提）三页都被问了（否则"只有第一页带那一问"这条是空测）', prompts.length, 3);
+    const reask = prompts.filter((text) => text.includes('顺手')).length;
+    eq('（能失败）**只有第一页**的用户消息带"顺手判时间意图"那一问', reask, 1);
+    check('（能失败）那一问不在第 2/3 页（逐页核对，不是只看第一页）',
+      prompts.slice(1).every((text) => !text.includes('顺手')),
+      `第 2/3 页命中=${prompts.slice(1).filter((t) => t.includes('顺手')).length} 处`);
+    /* **一次调用都没多**：3 页 = 3 次调用（意图是搭车的那个字段，不是新的一次）。 */
+    eq('（能失败）拿意图**没有多花一次调用**（3 页 = 3 次，与改动前的调用次数相同）', picks, 3);
+    /* 意图取**第一次发出去那一页**的（第 1 页回的是 `recent`，第 3 页的 `earliest` 不算）。 */
+    eq('（能失败）意图取第一次发出去那一页给的（第 3 页那个不算）', picked.intent, 'recent');
+    eq('（能失败）命中落在第 3 页第 3 条（翻页与命中的既有行为没变）',
+      `${picked.page}/${picked.index}`, '3/3');
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+
   // ── 27.6 端到端：用户的真实例子（✕ 必须查到第 1 条，不是后一条）───────────
   {
     const workspace2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dsm-unit-missbind-'));
@@ -2435,6 +2673,29 @@ console.log('\n=== 27. ✕：提问归属（messageId → 该轮提问）+ 候�
     // ② 老宿主没传 messageId：退回请求体里的提问（旧行为），并如实标出来源
     const fallback = await callDiagnose({ workspace: workspace2, session: session2, query: qB, limit: 8, rewrite: true, boost: true });
     eq('没传 messageId 时如实标出来源（body）', fallback?.value?.query?.via, 'body');
+
+    /* ②b **真实 messageId → `queryForMessage` 真的命中**（2026-10-12 核实"绑定轮次"生效）────
+     * 这条专门钉住"`inject` 没透传宿主 props → `body.messageId` 恒空 → 那套绑定等于没生效"
+     * 那个失效：面板侧的 `messageId` 是否真的到达宿主，最终要看**宿主这条路**能不能解析出来。
+     * 判据用回执里的 `via`/`turn`/`reason` 三个字段（面板与诊断都读它们）。
+     * ⚠️ **能失败**：把路由里 `messageId` 那段删掉（或让面板传空串）→ `via` 变 'body'，
+     *    下面第 1、2 条立刻红 —— 这就是"绑定没生效"的可观测症状。 */
+    check('✕绑定·真实 id：回执 `via=message`（说明 messageId 一路到了 `queryForMessage`）',
+      boundValue.query?.via === 'message', `via=${JSON.stringify(boundValue.query?.via)}`);
+    check('✕绑定·真实 id：解析出的轮次与日志一致（第 1 轮回答 → 第 1 轮）',
+      boundValue.query?.turn === 1, `turn=${JSON.stringify(boundValue.query?.turn)}`);
+    check('✕绑定·真实 id：成功解析时不带失败原因（`reason=null`）',
+      boundValue.query?.reason === null, `reason=${JSON.stringify(boundValue.query?.reason)}`);
+
+    /* ②c **假 messageId → 如实 `via=fallback` + `reason=message-not-found`**（绝不猜）────
+     * 这一条守住"解析失败必须如实上报、并退回旧口径"，而不是静默拿一条错的提问去检索。 */
+    const bogus = await callDiagnose({ workspace: workspace2, session: session2, messageId: 'msg-does-not-exist', query: qB, limit: 8, rewrite: true, boost: true });
+    const bogusValue = bogus?.value ?? {};
+    eq('✕绑定·假 id：如实标出来源为 fallback（不谎报 message）', bogusValue.query?.via, 'fallback');
+    eq('✕绑定·假 id：带出失败原因（message-not-found）', bogusValue.query?.reason, 'message-not-found');
+    eq('✕绑定·假 id：没解析出轮次（turn=null，不瞎猜）', bogusValue.query?.turn, null);
+    check('✕绑定·假 id：仍然有结果（退回请求体提问，不能让用户点了没反应）',
+      bogusValue.found !== undefined, JSON.stringify(bogusValue).slice(0, 120));
 
     // ③ 模型说"本页都没有"，但**本地已经强命中** → 保留本地结果（不许静默变空）
     {

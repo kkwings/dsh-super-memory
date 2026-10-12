@@ -275,6 +275,8 @@ let renderPanel = null;
 let renderMiss = null;
 let renderMissTail = null;
 const registered = [];
+/** 各槽位注册时的 options（**含 `inject`**）—— 桩要按官方的 props 合并路径构造组件入参。 */
+const slotOptions = {};
 const ctx = {
   effect: (fn) => { try { fn(); } catch { /* 忽略 */ } return () => {}; },
   slots: {
@@ -284,11 +286,74 @@ const ctx = {
       if (slot?.name === 'settings.section') renderPanel = render;
       else if (slot?.name === 'conversation.chat.assistant-actions') renderMiss = render;
       else if (slot?.name === 'conversation.chat.turnTail') renderMissTail = render;
+      if (typeof slot?.name === 'string') slotOptions[slot.name] = slot;
       return () => {};
     },
   },
 };
 moduleExports.apply(ctx);
+
+/* ── 宿主桩：**按官方 `renderSlot` 的真实实参**挂载槽位组件 ──────────────────────
+ *
+ * 2026-10-12：这一段是本次修复的**教训本体**。旧桩直接给组件传"自己编的 props"
+ * （`renderMissTail({ sessionId, turn, seq })`），于是"按轮次取结果"那套断言全绿，
+ * 而真机上完全不是那回事 —— 典型的**假绿**。
+ *
+ * 官方的两处实参（逐字取自 `app.asar` 的 `@deepseek-ai/dsh-client-ui-chat`，
+ * `TurnTailNodeView` 内）：
+ *   · `renderSlot("conversation.chat.turnTail", { turn, seq, openFile })`
+ *     —— `turn` 是 `TurnLocation` **对象**（`contract/conversation.d.ts`：
+ *        `interface TurnLocation { readonly turn: number; … }`），**不是数字**；
+ *   · `renderSlot("conversation.chat.assistant-actions", { messageId })`
+ *     —— 只有 `messageId` 一个键。
+ *
+ * props 的最终合成（`@deepseek-ai/dsh-client-ui-renderer/lib/client.js` 的 `renderEntry`）：
+ *   jsx(Comp, { ...kit, ...injected, ...slotInjected.props, ...ownerProps })
+ * ⚠️ **`ownerProps` 在最后** → 宿主 props 一定到得了组件，且覆盖 inject 的同名键。
+ * 所以"注册时 `inject` 没返回宿主 props"**不等于**组件拿不到 —— 桩必须照这个顺序合成，
+ * 否则会把"宿主本来就给"的 props 记成"插件丢了"。
+ */
+function ownerTurnLocation(n) {
+  return { turn: n, start: undefined, end: undefined, status: 'closed', steps: [], data: new Map() };
+}
+/**
+ * 按官方 `renderEntry` 的顺序合成组件 props。
+ * @param {string} slotName - 槽位名（据此取注册时的 `inject`）。
+ * @param {object} ownerProps - 宿主在 `renderSlot` 调用点给的那一份**仅有的** props。
+ * @param {string} [sessionId] - 传给 `inject` 的会话 id（strict session 槽由框架解析）。
+ * @returns {object} 组件真正收到的 props。
+ */
+function officialProps(slotName, ownerProps, sessionId = 'session-host-stub') {
+  const options = slotOptions[slotName] ?? {};
+  // `inject(...)` 的实参由声明推导：session 槽给 sessionId（本插件未声明 store → 无 actions）
+  const injected = typeof options.inject === 'function' ? (options.inject(sessionId) ?? {}) : {};
+  // 官方顺序：kit → injected → slotInjected.props → ownerProps（owner 最后，owner 赢）
+  return { ...injected, ...ownerProps };
+}
+/**
+ * 真机形状的 `turnTail` props：`renderSlot("conversation.chat.turnTail", { turn, seq, openFile })`
+ * —— `turn` 是 `TurnLocation` **对象**（不是数字），`openFile` 是打开原文的回调。
+ * @param {string} sessionId - 会话 id。
+ * @param {number} n - 轮次号（内部包成真机形状）。
+ * @returns {object} 组件真正收到的 props。
+ */
+function tailPropsFor(sessionId, n) {
+  return officialProps(
+    'conversation.chat.turnTail',
+    { turn: ownerTurnLocation(n), seq: n, openFile: () => {} },
+    sessionId,
+  );
+}
+/**
+ * 真机形状的 `assistant-actions` props：`renderSlot(…, { messageId })` —— **只有**这一个键。
+ * @param {string} sessionId - 会话 id。
+ * @param {string} messageId - 该轮最后一条助手消息 id。
+ * @returns {object} 组件真正收到的 props。
+ */
+function actionPropsFor(sessionId, messageId) {
+  return officialProps('conversation.chat.assistant-actions', { messageId }, sessionId);
+}
+
 check('注册了 settings.section 槽位', registered.includes('settings.section'));
 check('注册了 conversation.chat.assistant-actions 槽位', registered.includes('conversation.chat.assistant-actions'));
 check('拿到了面板渲染函数', typeof renderPanel === 'function');
@@ -1019,14 +1084,118 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
    * 所以进这一段先清掉它，走 `/llm/providers` 的正常路径。
    */
   seedProviders = null;
-  const renderTailFor = async (sessionId, turn, key) => {
+  /**
+   * 渲染一次 `turnTail` 那一块（每次都从干净槽位开始，等价于"新一轮挂载"）。
+   *
+   * ⚠️ **props 必须按官方 `renderSlot` 的实参 + 官方 `renderEntry` 的合并顺序构造**
+   *（`{ turn, seq, openFile }`，`turn` 是 `TurnLocation` **对象**）——
+   * 旧桩直接编 `{ sessionId, turn, seq }` 且 `turn` 是数字，于是"按轮次取结果"全绿，
+   * 而真机上 `turn` 是对象、`String()` 比较恒等 → 每一轮都显示。这是**假绿**的来源。
+   * @param {number} turnNo - 轮次号（内部包成真机形状的 `TurnLocation`）。
+   * @param {string} key - 组件路径（一个 key = 一个槽位实例）。
+   * @param {'official'|'dropped'} [mode] - `official` 走官方合并（owner 覆盖）；
+   *   `dropped` 只给 `inject` 的返回值（模拟"宿主 props 被丢掉"的那种注册写法）。
+   */
+  const renderTailFor = async (sessionId, turnNo, key, mode = 'official') => {
     hookIndex = 0;
     currentComponent = key;
-    const out = withComponent(key, () => renderMissTail({ sessionId, turn, seq: turn }));
+    const ownerProps = { turn: ownerTurnLocation(turnNo), seq: turnNo, openFile: () => {} };
+    const props = mode === 'official'
+      ? officialProps('conversation.chat.turnTail', ownerProps, sessionId)
+      : { ...(slotOptions['conversation.chat.turnTail']?.inject?.(sessionId) ?? {}) };
+    const out = withComponent(key, () => renderMissTail(props));
     await new Promise((resolve) => setTimeout(resolve, 0));
-    return { text: textOf(out), tree: out };
+    return { text: textOf(out), tree: out, props };
   };
   const renderTail = (turn, key) => renderTailFor(missSession, turn, key);
+  /* ── 透传取证件：组件**真的收到了**宿主给的 `turn`/`seq`/`openFile` ──────────────
+   * 这是本次修复的核心：老代码注释说"槽位把 openFile 给了我们"，但组件签名里根本没解构
+   * 它（`function MissTail({ sessionId, turn, seq })`）→ 真机上「打开原文」永远走不到
+   * `openFile`，只会展开一段机器格式原文。同时确认 `turn` 到得了组件。 */
+  {
+    const probe = await renderTailFor(missSession, 1, 'missTransmit');
+    check('✕ 透传：组件拿到了宿主给的 `turn`（真机形状 = `TurnLocation` 对象）',
+      probe.props.turn !== undefined && typeof probe.props.turn === 'object' && probe.props.turn.turn === 1,
+      `props.turn=${JSON.stringify(probe.props.turn)}`);
+    check('✕ 透传：组件拿到了宿主给的 `seq`/`openFile`',
+      typeof probe.props.seq === 'number' && typeof probe.props.openFile === 'function',
+      `seq=${JSON.stringify(probe.props.seq)} openFile=${typeof probe.props.openFile}`);
+    check('✕ 透传：`sessionId` 由本插件 `inject` 补上（官方 ownerProps 里并没有它）',
+      typeof probe.props.sessionId === 'string' && probe.props.sessionId !== '',
+      `sessionId=${JSON.stringify(probe.props.sessionId)}`);
+    // 官方 `renderEntry` 里 `ownerProps` 在**最后** → 同名的宿主键必须覆盖 inject 的同名键
+    const clash = officialProps('conversation.chat.turnTail', { seq: 99 });
+    check('✕ 透传：官方合并顺序是 owner 最后（宿主同名键覆盖 inject）',
+      clash.seq === 99, `合并后 seq=${JSON.stringify(clash.seq)}（应为宿主给的 99）`);
+  }
+  /* ── ⭐ **"透传"本身的自证 + 防第四次复发的锁**（2026-10-12）────────────────────────
+   *
+   * 教训：这个 bug 复发过三次，每次都不是"判据写错"，而是**桩比真机更宽松** ——
+   * 旧桩手写 `renderMissTail({ sessionId, turn, seq })`，于是"宿主的 props 到不了组件"
+   * 这类 bug 在桩里**永远绿**。所以这里不只断言"组件收到了什么"，还要断言**桩自己
+   * 是不是照官方实参造的**：桩一旦退回手写 props，下面两条立刻红。
+   *
+   * 官方的两条通路必须分清（逐字取自 `app.asar` 的 `ui-renderer`）：
+   *   · `inject(sessionId, actions)` —— 实参**只有** sessionId（本插件无 store → 无 actions），
+   *     返回值是"业务 props 份额"，**它不可能携带也不可能丢弃宿主 props**；
+   *   · 宿主 props 走 `renderSlot(key, owner)` → `ownerProps`，在 `renderEntry` 里**最后**展开。
+   * 所以真正要断言的是：**即使 `inject` 只回 `{ sessionId }`（也就是现在的写法），
+   * 组件照样拿得到 `turn`/`seq`/`openFile` 与 `messageId`** —— 这才是"透传"的含义。 */
+  {
+    // ① `turnTail`：按官方实参 `{ turn, seq, openFile }` 造，逐个验收到
+    const tailOfficial = officialProps(
+      'conversation.chat.turnTail',
+      { turn: ownerTurnLocation(1), seq: 11, openFile: () => {} },
+      missSession,
+    );
+    check('✕ 透传自证：`turnTail` 的 `{turn,seq,openFile}` 三个键都到得了组件（官方实参）',
+      tailOfficial.turn?.turn === 1 && tailOfficial.seq === 11 && typeof tailOfficial.openFile === 'function',
+      `turn=${JSON.stringify(tailOfficial.turn)} seq=${JSON.stringify(tailOfficial.seq)} openFile=${typeof tailOfficial.openFile}`);
+    check('✕ 透传自证：`inject` 只回 `{ sessionId }` 时宿主 props **依然**到得了（不靠 inject 携带）',
+      Object.keys(slotOptions['conversation.chat.turnTail']?.inject?.(missSession) ?? {}).join(',') === 'sessionId'
+      && tailOfficial.turn?.turn === 1 && tailOfficial.seq === 11,
+      `inject 回了 ${JSON.stringify(Object.keys(slotOptions['conversation.chat.turnTail']?.inject?.(missSession) ?? {}))}`
+      + '（若这里出现了 turn/seq，说明有人在把宿主 props 塞进 inject —— 那不是官方契约）；'
+      + `props.turn=${JSON.stringify(tailOfficial.turn)}`);
+    // ② `assistant-actions`：官方实参**只有** `{ messageId }`
+    const actionOfficial = officialProps('conversation.chat.assistant-actions', { messageId: 'msg-of-turn-1' }, missSession);
+    check('✕ 透传自证：`assistant-actions` 的 `messageId` 到得了组件（官方实参只有这一个键）',
+      actionOfficial.messageId === 'msg-of-turn-1',
+      `messageId=${JSON.stringify(actionOfficial.messageId)}（真机表现为"点 ✕ 查的是别的问题"）`);
+    check('✕ 透传自证：`assistant-actions` 的 `sessionId` 由本插件 `inject` 补上',
+      typeof actionOfficial.sessionId === 'string' && actionOfficial.sessionId !== '',
+      `sessionId=${JSON.stringify(actionOfficial.sessionId)}`);
+    /* ③ **锁**：桩必须真的走官方合并路径 —— 若有人把桩改回"手写 props"（不经
+     * `officialProps`），或把 `officialProps` 的合并顺序改成 owner 在前，
+     * 这两条立刻红。判据：`officialProps(...)` 与"只拿 inject 返回值"必须**不同**
+     * （前者带宿主 props，后者不带），且必须**恰好**等于官方那次调用的实参。 */
+    const injectOnlyTail = { ...(slotOptions['conversation.chat.turnTail']?.inject?.(missSession) ?? {}) };
+    check('✕ 锁：桩走的确实是官方合并路径（`officialProps` 结果 ≠ 只有 inject 的返回值）',
+      tailOfficial.turn !== undefined && injectOnlyTail.turn === undefined,
+      `officialProps.turn=${JSON.stringify(tailOfficial.turn)} / inject-only.turn=${JSON.stringify(injectOnlyTail.turn)}`
+      + ' —— 相等说明桩没把宿主 props 合并进来（"丢 props"这类 bug 会永远绿）');
+    check('✕ 锁：`officialProps` 合出来的 props **恰好**是官方实参那几个键（不多造、不少给）',
+      tailOfficial.turn?.turn === 1 && tailOfficial.seq === 11
+      && typeof tailOfficial.openFile === 'function' && tailOfficial.sessionId === missSession,
+      `合出来=${JSON.stringify(Object.keys(tailOfficial))}`);
+  }
+  /* ── 轮次键归一化：真机是对象，回执是数字 —— 两把尺子必须对得上 ────────────────
+   * 这是"每轮都跟着"的**真根因**：`String(TurnLocation)` 恒为 '[object Object]'，
+   * 两个不同轮次被判成相等。能失败：把 `turnKeyOf` 改回 `String(turn)` → 下面第 1 条红。 */
+  {
+    const keyOf = hooks.turnKeyOf;
+    check('✕ 轮次键：`turnKeyOf` 已导出（本段前提）', typeof keyOf === 'function', typeof keyOf);
+    check('✕ 轮次键：两个**不同**轮次的对象必须得到**不同**的键（`String()` 会恒等，这就是根因）',
+      keyOf?.(ownerTurnLocation(1)) !== keyOf?.(ownerTurnLocation(2))
+      && keyOf?.(ownerTurnLocation(1)) === '1' && keyOf?.(ownerTurnLocation(2)) === '2',
+      `第1轮=${keyOf?.(ownerTurnLocation(1))} 第2轮=${keyOf?.(ownerTurnLocation(2))}`);
+    check('✕ 轮次键：对象与回执里的**数字**必须归一到同一把尺子（跨来源混用）',
+      keyOf?.(ownerTurnLocation(3)) === keyOf?.(3) && keyOf?.(ownerTurnLocation(3)) === keyOf?.('3'),
+      `对象=${keyOf?.(ownerTurnLocation(3))} 数字=${keyOf?.(3)} 字符串=${keyOf?.('3')}`);
+    check('✕ 轮次键：拿不到轮次身份时返回 `null`（交给序号兜底，不许瞎猜）',
+      keyOf?.(undefined) === null && keyOf?.(null) === null && keyOf?.({}) === null,
+      `undefined=${keyOf?.(undefined)} {} =${keyOf?.({})}`);
+  }
   hooks.resetMiss?.(missSession);
   hooks.publishMiss?.(missSession, { found: true, model: 'stub-model', excerpt: '上一轮找到的资料', file: 'E:\\w\\a.md' }, 1);
   check('✕ 前提：刚发布的结果属于第 1 轮（`missResultFor(session, 1)` 能拿到）',
@@ -1041,6 +1210,44 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   check('✕ 判据本身：同一轮的仓库项取得到（不能把正常显示一起修没）',
     hooks.missResultFor?.(missSession, 1)?.found === true,
     `第 1 轮取到=${JSON.stringify(hooks.missResultFor?.(missSession, 1))}`);
+  /* ⭐ **真机形状的核心判据**：两边都是 `TurnLocation` **对象**（宿主给的），
+   * 两个**不同**轮次的对象取 `String()` 都是 `'[object Object]'` → 老写法判成相等
+   * → 每一轮的尾巴都显示同一条结果。这就是用户实测"每轮都跟着"的**真根因**。
+   * `run()` 从 `MISS_TURNS` 借到的轮次正是这种对象（见 client.js 的 `viewTurn`），
+   * 所以这条路径在真机上一定会走到。能失败：把 `turnKeyOf` 换回 `String(turn)` → 红。 */
+  {
+    hooks.resetMiss?.(missSession);
+    hooks.publishMiss?.(missSession, { found: true, model: 'obj-model-marker', excerpt: '第1轮', file: 'E:\\w\\o.md' }, ownerTurnLocation(1));
+    check('✕ 真机形状：发布时打的是 `TurnLocation` **对象**（前提）',
+      typeof hooks.missResultFor?.(missSession, ownerTurnLocation(1))?.turn === 'object',
+      `stored.turn=${JSON.stringify(hooks.missResultFor?.(missSession, ownerTurnLocation(1))?.turn)}`);
+    check('✕⭐ 真机形状：两个**不同**轮次的 `TurnLocation` 对象必须判为不同（`String()` 会恒等 —— 真根因）',
+      hooks.missResultFor?.(missSession, ownerTurnLocation(2)) === null,
+      `第 2 轮取到=${JSON.stringify(hooks.missResultFor?.(missSession, ownerTurnLocation(2)))}`
+      + '（它明明属于第 1 轮 —— 若这里非 null，`String()` 比较把两轮判成了同一轮）');
+    check('✕⭐ 真机形状：**同一**轮次的对象仍取得到（不能把正常显示一起修没）',
+      hooks.missResultFor?.(missSession, ownerTurnLocation(1))?.found === true,
+      `第 1 轮取到=${JSON.stringify(hooks.missResultFor?.(missSession, ownerTurnLocation(1)))}`);
+    /* ⭐⭐ **真机端到端的真实组合**（最容易漏的一条）：
+     * 结果由 `run()` 发布，而 `ownerTurn = 回执里的 query.turn ?? viewTurn` ——
+     * `lib/routes.js` 回执给的是**数字**（`resolved.turn = hit.turn`），
+     * 槽位给组件的是**对象**（`TurnLocation`）。
+     * 所以仓库里存的是**数字**、渲染时问的是**对象** —— 两边**不同形状**。
+     * 老写法 `String(1) === String({...})` → `'1' !== '[object Object]'` → **本轮自己的结果也不显示**
+     * （把功能整体修没）；归一化后两边都是 `'1'` → 正常显示。
+     * 这条必须能失败：把 `turnKeyOf` 的"对象取 .turn"去掉 → 红。 */
+    hooks.resetMiss?.(missSession);
+    hooks.publishMiss?.(missSession, { found: true, model: 'cross-src-marker', excerpt: '回执轮次', file: 'E:\\w\\c.md' }, 1); // 数字（回执形状）
+    check('✕⭐ 跨来源：仓库里是**数字**（回执给）、渲染时问的是**对象**（槽位给）→ 同一轮必须显示',
+      hooks.missResultFor?.(missSession, ownerTurnLocation(1))?.found === true,
+      `对象问数字=${JSON.stringify(hooks.missResultFor?.(missSession, ownerTurnLocation(1)))}`
+      + '（若 null：两种形状没归一到同一把尺子，本轮自己的结果就显示不出来）');
+    check('✕⭐ 跨来源：换个轮次的对象问 → 取不到（跨轮仍被拦住）',
+      hooks.missResultFor?.(missSession, ownerTurnLocation(2)) === null,
+      `第 2 轮取到=${JSON.stringify(hooks.missResultFor?.(missSession, ownerTurnLocation(2)))}`);
+    hooks.resetMiss?.(missSession);
+    hooks.publishMiss?.(missSession, { found: true, model: 'stub-model', excerpt: '上一轮找到的资料', file: 'E:\\w\\a.md' }, 1);
+  }
   check('✕ 参考点：同一轮（turn=1）**仍然显示**结果块（不能把正常显示一起修没）',
     (await renderTail(1, 'missTurnSame')).text.includes('找到相关内容'),
     '同一轮必须照常显示，否则这条修复等于把功能关掉了');
@@ -1048,8 +1255,37 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   check('✕ 核心回归：上一轮的结果块**不得出现在新一轮**（turn=2 渲染不出上一轮的内容）',
     !nextTurn.text.includes('找到相关内容') && !nextTurn.text.includes('上一轮找到的资料'),
     `新一轮实际渲染：${nextTurn.text.slice(0, 120) || '(空)'}`);
+  /* ── **用户实测症状的逐字复现**（"从点 ✕ 之后每一轮都跟着"）─────────────────────
+   * 用户三次实测：点 ✕ → 结果块出现；之后**每一轮**问答后面都跟着同一个块。
+   * 这里按真机形状（`TurnLocation` **对象**）连渲染第 1…4 轮，逐轮钉住：
+   *   ① 第 1 轮**保留**（它属于那一轮，且「打开原文」要用它）；
+   *   ② 第 2/3/4 轮**一个都不许有**。
+   * 能失败：把 `turnKeyOf` 换回 `String(turn)` → ② 立刻在每一轮都红（正是用户看到的现象）。 */
+  {
+    hooks.resetMiss?.(missSession);
+    hooks.publishMiss?.(missSession, { found: true, model: 'follow-marker', excerpt: '第1轮的块', file: 'E:\\w\\f.md' }, ownerTurnLocation(1));
+    const turn1Kept = await renderTailFor(missSession, 1, 'followT1');
+    check('✕ 症状复现：第 1 轮（点 ✕ 的那一轮）**保留**结果块 —— 「打开原文」还要用它',
+      turn1Kept.text.includes('follow-marker'),
+      `第 1 轮实际渲染：${turn1Kept.text.slice(0, 100) || '(空)'}`);
+    const leaked = [];
+    for (const n of [2, 3, 4]) {
+      const later = await renderTailFor(missSession, n, `followT${n}`);
+      if (later.text.includes('follow-marker')) leaked.push(n);
+    }
+    check('✕ 症状复现：第 2/3/4 轮**全都不出现**那个块（用户实测"每一轮都跟着"必须消失）',
+      leaked.length === 0,
+      `这些轮次仍然带着第 1 轮的块：${leaked.join('、') || '(无)'} —— 这就是用户报的"每一轮都跟着"`);
+    hooks.resetMiss?.(missSession);
+    hooks.publishMiss?.(missSession, { found: true, model: 'stub-model', excerpt: '上一轮找到的资料', file: 'E:\\w\\a.md' }, 1);
+  }
   /* 同一句话重复提问：文本判据永远触发不了，只有轮次判据能拦住 —— 这条专门钉住那个洞。 */
   hooks.resetMiss?.(missSession);
+  /* ⚠️ 顺序必须与真机一致：**这一轮的尾巴先挂载**（用户能看到第 7 轮的回答，才有那个 ✕
+   * 可点），**然后**点 ✕ 发布 pending。
+   * 反过来（先发布、后挂载）在真机上不可能发生，却会撞上"新问题到达 → 清掉上一轮"
+   * 那条判据（挂载时轮次从 4 跳到 7 = 往后走了），把刚发的 pending 清掉 —— 那是**假失败**。 */
+  await renderTailFor(missSession, 7, 'missPendMount');
   hooks.publishMiss?.(missSession, { pending: true, model: 'stub-model' }, 7);
   check('✕ 前提：pending（"检索中"）已发布在第 7 轮',
     hooks.missResultFor?.(missSession, 7)?.pending === true,
@@ -1061,6 +1297,132 @@ async function render(openAdvanced = false, openLlm = true, openDiag = false) {
   check('✕ 上一轮的"检索中"也不得跟到下一轮（pending 与最终结果同等对待）',
     !pendingNext.text.includes('检索中'),
     `新一轮实际渲染：${pendingNext.text.slice(0, 120) || '(空)'}`);
+
+  /* ── ⭐ **用户明确定义的验收场景**（2026-10-12，用户原话为准）──────────────────────
+   * 用户原话要点："新的回答下面不该有它；但旧的那块我认为也应该消失 —— 在新问题我开始
+   * 回答或回答完毕时，上一个问题后面跟着的提示窗口就可以自动关掉了。"
+   *
+   * 三步走，逐条钉住（这就是用户会亲自点的那三步）：
+   *   ① 点 ✕ → 结果出现在**它所属的那一轮**下面 ✓；
+   *   ② 发出下一句（= 新一轮开始回答，它的 `turnTail` 挂载）→ **该块消失** ✓；
+   *   ③ 新一轮下面**没有它** ✓。
+   * 能失败：把 `MissTail` 那条"新问题到达 → `publishMiss(null)`"去掉（或退回只看
+   * `ready.lastQuery` 文本变化的写法）→ 第 ② 条立刻红。
+   *
+   * ⚠️ 为什么必须靠"新一轮挂载"这个信号：`MissAction` 里那条依赖 `ready.lastQuery`
+   * 的 effect 在真机上是**死信号**（`ready` 只由同样只依赖 `[sessionId]` 的 effect 写一次，
+   * 全文件没有轮询）—— 照它写的断言只能直接调判据函数，证明不了"真的会清"。 */
+  {
+    const userSession = 'session-user-acceptance';
+    hooks.resetMiss?.(userSession);
+    // ① 第 1 轮挂载 → 点 ✕ → 结果落在第 1 轮
+    await renderTailFor(userSession, 1, 'userAccT1');
+    hooks.publishMiss?.(userSession, { found: true, model: 'user-acc-marker', excerpt: '第1轮的结果', file: 'E:\\w\\u.md' }, ownerTurnLocation(1));
+    check('用户验收①：点 ✕ 之后，结果出现在**它所属的那一轮**下面',
+      (await renderTailFor(userSession, 1, 'userAccT1b')).text.includes('user-acc-marker'),
+      '第 1 轮必须看得到 —— 否则"点完没反应"，功能等于没做');
+    check('用户验收①前提：结果此刻确实还在仓库里（不是"本来就没有"）',
+      hooks.missResultFor?.(userSession, ownerTurnLocation(1)) !== null,
+      `仓库里=${JSON.stringify(hooks.missResultFor?.(userSession, ownerTurnLocation(1)))}`);
+    // ② 用户发出下一句 → 第 2 轮的尾巴挂载（= "我开始回答下一个问题了"）
+    await renderTailFor(userSession, 2, 'userAccT2');
+    check('用户验收②：发出下一句（新一轮开始回答）→ **上一轮那块自动消失**（用户明确要求）',
+      (hooks.missResultFor?.(userSession, ownerTurnLocation(1))) === null,
+      `第 1 轮仓库里=${JSON.stringify(hooks.missResultFor?.(userSession, ownerTurnLocation(1)))}`
+      + ' —— 若仍非 null：用户说的"进行到下一段对话了，上一段后面的提示就该自动关掉"没生效');
+    check('用户验收②能失败：换成"同一句话重复提问"也必须清（这正是当初改动的目的）',
+      (() => {
+        hooks.resetMiss?.(userSession);
+        hooks.publishMiss?.(userSession, { found: true, model: 'repeat-marker', excerpt: 'x', file: 'E:\\w\\r.md' }, ownerTurnLocation(3));
+        // 同一句提问 = 宿主给的新轮次只会往后走；这里模拟"第 3 轮发布后，第 4 轮挂载"
+        const before = hooks.missResultFor?.(userSession, ownerTurnLocation(3)) !== null;
+        // 用纯判据函数直接问"4 > 3 算不算新问题到达"（渲染会真的清，这里只验判据本身）
+        const isNew = hooks.noteCurrentTurn?.(userSession, ownerTurnLocation(4)) === true;
+        return before && isNew;
+      })(),
+      '同一句话重复提问（文本不变、只有轮次往后走）也必须判为"新问题到达"');
+    // ③ 新一轮下面绝不能出现它
+    check('用户验收③：新一轮的回答下面**没有**上一轮那块（用户："新的回答下面不该有它"）',
+      !(await renderTailFor(userSession, 2, 'userAccT2b')).text.includes('user-acc-marker'),
+      `第 2 轮实际渲染：${(await renderTailFor(userSession, 2, 'userAccT2c')).text.slice(0, 120) || '(空)'}`);
+    hooks.resetMiss?.(userSession);
+  }
+
+  /* ── ⭐ **"澄清未被误清"**：新问题到达只能清**更早**的轮次，绝不能清**本轮刚发布**的那块 ──
+   * 用户验收提到"在新问题我开始回答或回答完毕时"才关 —— 所以**同一轮**（以及历史重放 /
+   * 虚拟滚动导致的"更早的轮次后挂载"）都不许触发清除，否则就是"点完 ✕ 结果立刻消失"。
+   * 能失败：把 `noteCurrentTurn` 的 `to > from` 改成"键不同就算新问题"→ 第 2/3 条红。 */
+  {
+    const sess2 = 'session-no-premature-clear';
+    hooks.resetMiss?.(sess2);
+    check('（能失败）判据：第一次认清轮次**不算**新问题（刚打开页面/刚切会话不能清东西）',
+      hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(2)) === false,
+      `第一次登记返回了 ${String(hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(2)))}`);
+    check('（能失败）判据：同一轮重复登记**不算**（重渲染不是新问题）',
+      hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(2)) === false,
+      '同一轮被当成了新问题 → 会误清本轮刚显示的结果');
+    check('（能失败）判据：更早的轮次后挂载（历史重放/虚拟滚动）**不算**新问题',
+      hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(1)) === false,
+      '往回走被当成了新问题 → 点完 ✕ 的结果会立刻消失');
+    check('（能失败）判据：确实往后走到新一轮 **算** 新问题（用户要求的那条）',
+      hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(3)) === true,
+      '往后走没被认出来 → 上一轮那块永远不消失');
+    /* ⚠️ 登记必须**单调向前**：更早的轮次后挂载不能把"当前轮次"改回去，
+     * 否则它改回 1 之后，"第 2 轮挂载"又会被算成新问题 —— 把第 2 轮自己刚发布的结果清掉。
+     * 能失败：把 `to < from` 那道守卫去掉 → 第 2 条红。 */
+    check('（能失败）判据：更早的轮次后挂载**不改写**"当前轮次"（防止随后的假"新问题"）',
+      hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(1)) === false
+      && hooks.noteCurrentTurn?.(sess2, ownerTurnLocation(3)) === false,
+      '往回走改写了当前轮次 → 紧跟的同一轮会被误判成"新问题到达"，刚显示的结果被清');
+    hooks.resetMiss?.(sess2);
+  }
+
+  /* ── **第二道防线**：`turn` 拿不到时（老宿主 / 注册没透传）也不许每轮都跟着 ──────────
+   *
+   * 这是"四行兜底代码是死代码"那个洞：老写法第 1571 行
+   *   `if (turn === undefined || turn === null) return stored;`
+   * **无条件返回** → 后面的序号兜底永远不可达 → 每一个 turnTail 实例都显示同一条旧结果
+   * → 用户看到的"从点 ✕ 之后每一轮都跟着"。
+   *
+   * 桩用 `mode: 'dropped'` 精确模拟"组件只拿到 `inject` 的返回值"（宿主 props 全丢）
+   * —— 这正是老注册写法在**假设宿主不合并 ownerProps** 时会发生的事，也是
+   * `turn` 缺失的最坏情形。断言：晚挂载的实例**不得**显示挂载前就存在的旧结果。
+   * 能失败：把 `missResultFor` 的兜底改回 `if (turn === undefined) return stored` → 红。
+   */
+  {
+    hooks.resetMiss?.(missSession);
+    // ① 先发布一条结果（`seq` 就是发布序号，后面用它当"挂载时刻"的参照）
+    //    用**模型名**当可见标记：`result.model` 就渲染在那一行文字里（`excerpt` 只在
+    //    展开态才进 `<pre>`，拿它做断言会误判）。
+    hooks.publishMiss?.(missSession, { found: true, model: 'old-model-marker', excerpt: '早于本实例的旧结果', file: 'E:\\w\\old.md' }, 1);
+    const seqAfterPublish = hooks.missSeq?.() ?? 0;
+    /* ⚠️ 判据必须**直接钉在 `missResultFor` 上**，不能只看渲染结果：
+     * `MissTail` 里还有一条独立的 `seqStale` 兜底，会把"无条件返回旧结果"这个 bug
+     * **掩盖掉**（实测踩过：把 `return stored` 改回去，只看渲染的断言仍然全绿 —— 假绿）。
+     * `missResultFor` 是这条判据的唯一权威，直接问它。 */
+    check('✕ 防线二·判据：`turn` 拿不到 + 结果**早于**本实例挂载 → 取不到（这行就是死代码那处）',
+      hooks.missResultFor?.(missSession, undefined, seqAfterPublish) === null,
+      `取到=${JSON.stringify(hooks.missResultFor?.(missSession, undefined, seqAfterPublish))}（mountedSeq=${seqAfterPublish}）`
+      + ' —— 若这里非 null，说明 `turn===undefined` 又变成了无条件返回（序号兜底成死代码）');
+    check('✕ 防线二·判据：`turn` 拿不到 + 结果**晚于**本实例挂载（点 ✕ 后立刻长出）→ 取得到',
+      hooks.missResultFor?.(missSession, undefined, seqAfterPublish - 1)?.found === true,
+      `取到=${JSON.stringify(hooks.missResultFor?.(missSession, undefined, seqAfterPublish - 1))}`
+      + '（不能一律当陈旧，否则点 ✕ 后刚长出的那块会被吞掉）');
+    // ② 渲染层同样要过一遍（真实挂载路径，防"判据对但组件没用它"）
+    const lateText = await renderTailFor(missSession, 1, 'missNoTurnLate', 'dropped');
+    check('✕ 防线二：`turn` 拿不到时，**晚于旧结果挂载**的实例不得显示它（挡住"每轮都跟着"）',
+      !lateText.text.includes('old-model-marker') && !lateText.text.includes('找到相关内容'),
+      `实际渲染：${lateText.text.slice(0, 120) || '(空)'}（mountedSeq=${seqAfterPublish}）`);
+    // ③ 保留既有教训：结果**由本实例挂载之后**发布时，照常要能显示（不能一律当陈旧吞掉）
+    //    点 ✕ 之后立刻长出来的那一块就是这条路（`run()` 在自己的挂载序号之后发布）。
+    hooks.resetMiss?.(missSession);
+    const freshProps = (await renderTailFor(missSession, 1, 'missNoTurnFresh', 'dropped')).props;
+    hooks.publishMiss?.(missSession, { found: true, model: 'fresh-model-marker', excerpt: '本实例挂载之后才发布的', file: 'E:\\w\\new.md' }, 1);
+    const afterPublishText = textOf(withComponent('missNoTurnFresh', () => renderMissTail(freshProps)));
+    check('✕ 防线二：结果在本实例挂载**之后**发布时照常显示（不能一律当陈旧吞掉）',
+      afterPublishText.includes('fresh-model-marker'),
+      `实际渲染：${afterPublishText.slice(0, 120) || '(空)'}（回归：点 ✕ 后立刻长出的那块被吞了）`);
+  }
 
   /* ── 第二条路径：`MissAction` 的"新问题一到就清"（同一句话重复提问）──────────
    * 旧代码 `if (now !== lastSeenQuery.current)` 拿**提问文本**当轮次判据：用户按 ✕ 的
@@ -1376,7 +1738,7 @@ console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
   const tick = async (times = 4) => { for (let i = 0; i < times; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); };
   const renderOne = () => {
     hookIndex = 0; currentComponent = 'missBare';
-    return resolveTree(withComponent('missBare', () => renderMiss({ sessionId: 'session-x' })));
+    return resolveTree(withComponent('missBare', () => renderMiss(actionPropsFor('session-x', 'msg-x'))));
   };
   hookStore.clear();
   let out = renderOne();
@@ -1391,10 +1753,16 @@ console.log(`\n通过 ${passed} 条，失败 ${failures} 条。`);
   };
   await new Promise((resolve) => setTimeout(resolve, 2));
   out = renderOne();
+  /* ⚠️ 真机顺序：`turnTail` 先挂载（它把"当前这一轮"登记进 `MISS_TURNS`），
+   * 然后用户在**这一轮**的 `assistant-actions` 上点 ✕，结果才发布。
+   * 所以这里先渲染一次尾巴（登记第 1 轮），再点 ✕ —— 否则发布出来的结果没轮次归属，
+   * 而"没轮次 + 晚挂载"按设计就**不该**显示（那正是挡住"每轮都跟着"的那条判据）。 */
+  hookIndex = 0; currentComponent = 'missTailMount';
+  withComponent('missTailMount', () => renderMissTail(tailPropsFor('session-x', 1)));
   findClickable(out).find((node) => (textOf(node.props.children) ?? '').includes('✕'))?.props.onClick();
   await tick();
   hookIndex = 0; currentComponent = 'missTailBare';
-  const tailText = textOf(resolveTree(withComponent('missTailBare', () => renderMissTail({ sessionId: 'session-x' }))));
+  const tailText = textOf(resolveTree(withComponent('missTailBare', () => renderMissTail(tailPropsFor('session-x', 1)))));
   check('会话内结果块渲染出来了（前提成立）', tailText.includes('找到相关内容'), `实际=${tailText.slice(0, 80)}`);
   check('结果块里没有裸 `**`（Markdown 不会在文本节点里渲染）',
     !tailText.includes('**'), `实际=${(tailText.match(/.{0,20}\*\*.{0,20}/) ?? ['(没有)'])[0]}`);
@@ -1423,10 +1791,14 @@ if (failures > 0) process.exit(1);
     });
     hookStore.clear();
     hookIndex = 0; currentComponent = 'miss';
-    let out = resolveTree(withComponent('miss', () => renderMiss({ sessionId: 'session-x' })));
+    let out = resolveTree(withComponent('miss', () => renderMiss(officialProps(
+      'conversation.chat.assistant-actions', { messageId: 'msg-x' }, 'session-x',
+    ))));
     await tick();
     hookIndex = 0; currentComponent = 'miss';
-    out = resolveTree(withComponent('miss', () => renderMiss({ sessionId: 'session-x' })));
+    out = resolveTree(withComponent('miss', () => renderMiss(officialProps(
+      'conversation.chat.assistant-actions', { messageId: 'msg-x' }, 'session-x',
+    ))));
     await tick();
     last = out;
     return textOf(out);
@@ -1475,10 +1847,15 @@ if (failures > 0) process.exit(1);
   await new Promise((resolve) => setTimeout(resolve, 3));
   const liveButton = findClickable(last).find((node) => (textOf(node.props.children) ?? '').includes('✕'));
   check('点下去之前能拿到当前的 ✕ 按钮元素', liveButton !== undefined, `按钮数=${findClickable(last).length}`);
+  /* ⚠️ 真机顺序：`turnTail`（第 1 轮）**先**挂载 —— 它就是"回答下面的那一块"，
+   * ✕ 按钮本就是这个节点里的动作栏。挂载时它把"当前这一轮"登记进 `MISS_TURNS`，
+   * 于是后面点 ✕ 发布的结果才带得上正确的轮次归属。 */
+  hookIndex = 0; currentComponent = 'missTailMountPre';
+  withComponent('missTailMountPre', () => renderMissTail(tailPropsFor('session-x', 1)));
   (liveButton ?? clickable[0]).props.onClick();
   check('点下 ✕ 后立刻拿到"检索中"状态', release !== null, 'onClick 没有发起 /diagnose 请求');
   hookIndex = 0; currentComponent = 'missTail';
-  const pendingTree = resolveTree(withComponent('missTail', () => renderMissTail({ sessionId: 'session-x' })));
+  const pendingTree = resolveTree(withComponent('missTail', () => renderMissTail(tailPropsFor('session-x', 1))));
   const pendingText = textOf(pendingTree);
   check('"检索中"显示配置里的模型名', pendingText.includes('glm-5.3-flash（辅助模型）检索中，请稍后…'),
     `实际文本：${pendingText.slice(0, 80)}`);
@@ -1488,12 +1865,138 @@ if (failures > 0) process.exit(1);
   if (release !== null) release();
   await tick();
   hookIndex = 0; currentComponent = 'missTail';
-  const doneTree = resolveTree(withComponent('missTail', () => renderMissTail({ sessionId: 'session-x' })));
+  const doneTree = resolveTree(withComponent('missTail', () => renderMissTail(tailPropsFor('session-x', 1))));
   const doneText = textOf(doneTree);
   check('结果回来后替换成"找到相关内容"', doneText.includes('找到相关内容'), `实际文本：${doneText.slice(0, 80)}`);
   check('找到时保留「打开原文」与「知道了」两个按钮',
     doneText.includes('打开原文') && doneText.includes('知道了'), `实际文本：${doneText.slice(0, 120)}`);
   check('结果显示的模型名与"检索中"一致', doneText.includes('glm-5.3-flash'), `实际文本：${doneText.slice(0, 80)}`);
+}
+
+/* ── 断言：**点 ✕ → 停在 pending → 下一轮挂载 → 结果才回来**（2026-10-12 第二次回归）────
+ * 用户截图实测：结果块显示在**下一个问题**的回答下面（第二次报）。
+ * 根因**不是**"轮次判定写错"，而是"**轮次什么时候盖章**"：`run()` 原先在**发布那一刻**
+ * 才去借"当前渲染中的那一轮"（`MISS_TURNS`）。而点 ✕ 之后模型要跑好几秒
+ * （真实日志：4 页 pick，每页 ≈0.8–1.1 秒），这几秒里用户完全可能发出下一个问题 →
+ * 新一轮的 `turnTail` 已挂载、`MISS_TURNS` 已被改写成新轮次 → 结果回来时盖的是**新轮次**的章。
+ *
+ * 修法：轮次以**回执里的 `query.turn`** 为准（宿主用 `queryForMessage(events, messageId)`
+ * 定位"**这条回答自己所属的那一轮**"，见 `lib/routes.js` 的回执与 `lib/recall.js`）；
+ * `pending`（"检索中"）仍用"点击那一刻"的轮次 —— 那时 `MISS_TURNS` 还没被下一轮覆盖，
+ * 它是**正确**的，而结果还没回来、没有更权威的来源可用。
+ *
+ * 能失败（实测过）：把 `run()` 里 `publishMiss(sessionId, {...}, ownerTurn)` 的
+ * `ownerTurn` 去掉（= 退回"发布时借 `MISS_TURNS`"的旧写法）→ 下面第 1/2/3 条变红。 */
+{
+  const hooks = globalThis.window?.__dsmTestHooks ?? {};
+  const missSessionSeq = 'session-miss-seq';
+  const findClickable = (node, out = []) => {
+    if (node === null || node === undefined || typeof node !== 'object') return out;
+    if (Array.isArray(node)) { for (const item of node) findClickable(item, out); return out; }
+    if (node.type === 'button' && typeof node.props?.onClick === 'function') out.push(node);
+    const children = node.props?.children;
+    for (const child of Array.isArray(children) ? children : [children]) findClickable(child, out);
+    return out;
+  };
+  const tick = async (times = 6) => { for (let i = 0; i < times; i += 1) await new Promise((resolve) => setTimeout(resolve, 0)); };
+  const reply = (value) => ({ ok: true, status: 200, json: async () => ({ ok: true, value }) });
+  /** 渲染一次 `turnTail`（每次一个**新的 key** = 真机上"新挂载了一个槽位实例"）。 */
+  const renderTailAt = (sessionId, turn, key) => {
+    hookIndex = 0;
+    currentComponent = key;
+    const out = withComponent(key, () => renderMissTail({ sessionId, turn, seq: turn }));
+    return { text: textOf(out) };
+  };
+  /** 渲染一次动作栏（两轮，让异步 `ready` 落地）。 */
+  const renderAction = async (sessionId, key) => {
+    let out = null;
+    for (let round = 0; round < 2; round += 1) {
+      hookIndex = 0;
+      currentComponent = key;
+      out = withComponent(key, () => renderMiss({ sessionId, messageId: 'msg-of-the-turn-user-clicked' }));
+      await tick();
+    }
+    return out;
+  };
+  const originalFetch = globalThis.fetch;
+  /** 挂起 `/diagnose`：点 ✕ 之后**停在 pending**，直到我们手动放行。 */
+  let release = null;
+  globalThis.fetch = async (url) => {
+    const target = String(url);
+    if (target.includes('/diagnose') && !target.includes('/diagnostics')) {
+      return new Promise((resolve) => {
+        release = () => resolve({
+          ok: true, status: 200,
+          json: async () => ({
+            ok: true,
+            value: {
+              verdict: 'above-threshold', found: true, boosting: true, chars: 120, model: 'stub-model',
+              material: '【对话】找到的资料', file: 'E:\\w\\a.md',
+              // ⭐ **回执里的轮次** = "这条回答自己所属的那一轮"（真实回执形状，已打印核实）：
+              // `=> {"chars":38,"hash":"b37f1fa6","via":"message","turn":1,"reason":null}`
+              query: { chars: 12, hash: 'abc12345', via: 'message', turn: 1, reason: null },
+              paging: { scanned: 1, pages: 1, pageSize: 30, truncated: false },
+              // 本地强命中 → 这次没花钱改写（B 项新文案要覆盖到的分支）
+              rewriteSkipped: true,
+            },
+          }),
+        });
+      });
+    }
+    if (target.includes('/diagnostics')) {
+      return reply({ runtime: [{ sessionId: missSessionSeq, workspace: 'E:\\w', knownCompactions: 2, hits: 1, misses: 1, lastQuery: '同一个问题' }] });
+    }
+    if (target.includes('/settings')) return settingsPayload;
+    return reply({});
+  };
+  try {
+    hooks.resetMiss?.(missSessionSeq);
+    // ① 第 1 轮的尾巴**先**挂载（真机顺序：`assistant-actions` 是 `turnTail` 的子节点）
+    //    —— 它把"当前这一轮 = 1"登记进 `MISS_TURNS`。
+    renderTailAt(missSessionSeq, 1, 'missSeqTailTurn1');
+    const action = await renderAction(missSessionSeq, 'missSeqAction');
+    const button = findClickable(action).find((node) => (textOf(node.props.children) ?? '').includes('✕')) ?? null;
+    check('✕ 时序前提：拿到了第 1 轮的 ✕ 按钮', button !== null, `可点元素=${findClickable(action).length}`);
+    // ② 点 ✕ → 请求挂起（模型要跑好几秒，这就是用户发出下一个问题的那段窗口）
+    button?.props.onClick();
+    await tick();
+    check('✕ 时序：点下去之后停在"检索中"（第 1 轮看得到）',
+      renderTailAt(missSessionSeq, 1, 'missSeqPendTurn1').text.includes('检索中'),
+      'pending 没落在"点击那一刻"的那一轮上');
+    // ③ **这几秒里用户发出了下一个问题** → 第 2 轮的尾巴挂载、`MISS_TURNS` 被改写成 2。
+    //    （这一步同时会把第 1 轮的 pending 判成陈旧清掉 —— 那是既有行为，不动它。）
+    renderTailAt(missSessionSeq, 2, 'missSeqTailTurn2');
+    // ④ 结果**这时才回来**（回执说它属于第 1 轮）
+    check('✕ 时序前提：/diagnose 请求确实发出去了（否则下面全是空测）', release !== null, 'onClick 没有发起请求');
+    release?.();
+    await tick(30);
+    /* ⑤ 三条判据。第 1 条 = 没把功能修没；第 2/3 条 = 用户实测的那个回归。 */
+    check('（能失败·时序）迟到的结果仍然记在**点 ✕ 的那一轮**（第 1 轮取得到，回执说了算）',
+      hooks.missResultFor?.(missSessionSeq, 1)?.found === true,
+      `第 1 轮取到=${JSON.stringify(hooks.missResultFor?.(missSessionSeq, 1))}`);
+    check('（能失败·时序）迟到的结果**不得**跑到新一轮去（第 2 轮取不到 —— 这就是用户截图那个 bug）',
+      hooks.missResultFor?.(missSessionSeq, 2) === null,
+      `第 2 轮取到=${JSON.stringify(hooks.missResultFor?.(missSessionSeq, 2))}（结果本该属于第 1 轮）`);
+    const nextTurnText = renderTailAt(missSessionSeq, 2, 'missSeqNextView').text;
+    check('（能失败·时序）第 2 轮的尾巴**渲染不出**上一轮的结果块',
+      !nextTurnText.includes('找到相关内容') && !nextTurnText.includes('找到的资料'),
+      `第 2 轮实际渲染：${nextTurnText.slice(0, 120) || '(空)'}`);
+    check('（参考点·时序）第 1 轮的尾巴照常显示结果块（不能把正常显示一起修没）',
+      renderTailAt(missSessionSeq, 1, 'missSeqSameView').text.includes('找到相关内容'),
+      '同一轮必须显示，否则这条修复等于把功能关掉了');
+    /* B 项：跳过改写时的文案必须**说清跳过的是改写、不是判读**（旧的
+     * "这次本地已经直接找到内容，跳过了辅助模型的查询改写"会让人以为插件觉得没问题）。 */
+    const skippedText = renderTailAt(missSessionSeq, 1, 'missSeqWording').text;
+    check('（能失败·文案）跳过改写时点明"省掉的是改写那一步、判读照常做了"',
+      skippedText.includes('省掉了') && skippedText.includes('判读照常做了'),
+      `实际文案：${(skippedText.match(/本地已有强命中[^。]*。[^。]*。/) ?? ['(没渲染)'])[0]}`);
+    check('（能失败·文案）不再说"本地已经直接找到内容"（那会让点 ✕ 的用户以为插件觉得没问题）',
+      !skippedText.includes('已经直接找到内容'),
+      `实际文案：${(skippedText.match(/.{0,24}直接找到内容.{0,24}/) ?? ['(没出现)'])[0]}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    hooks.resetMiss?.(missSessionSeq);
+  }
 }
 
 if (failures > 0) process.exit(1);
